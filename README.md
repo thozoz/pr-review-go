@@ -34,9 +34,10 @@ go build -o bin/pr-review-go ./cmd/pr-review-go
 
 ### 2. Manual CLI Mode
 ```bash
-export GITHUB_TOKEN="ghp_..."
-export LLM_BASE_URL="http://192.168.1.129:4000/v1"
-export LLM_MODEL="openai/agy/claude-sonnet-4-6"
+export GITHUB_TOKEN="ghp_your_github_token_here"
+export LLM_BASE_URL="https://api.openai.com/v1" # or any OpenAI-compatible proxy (LiteLLM, Ollama, etc.)
+export LLM_API_KEY="your_api_key_here"
+export LLM_MODEL="gpt-4o" # or claude-3-5-sonnet, etc.
 
 # Review a pull request directly
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42

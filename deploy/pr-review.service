@@ -14,9 +14,9 @@ RestartSec=5s
 Environment=PORT=3000
 Environment=GITHUB_TOKEN=ghp_your_token_here
 Environment=WEBHOOK_SECRET=your_webhook_secret_here
-Environment=LLM_BASE_URL=http://192.168.1.129:4000/v1
-Environment=LLM_MODEL=openai/agy/claude-sonnet-4-6
-Environment=LLM_API_KEY=sk-4246
+Environment=LLM_BASE_URL=https://api.openai.com/v1
+Environment=LLM_MODEL=gpt-4o
+Environment=LLM_API_KEY=your_api_key_here
 
 # Resource limits (lightweight Go daemon)
 MemoryMax=500M

@@ -35,7 +35,7 @@ func Load() *Config {
 
 	llmBaseURL := os.Getenv("LLM_BASE_URL")
 	if llmBaseURL == "" {
-		llmBaseURL = "http://192.168.1.129:4000/v1" // default local LiteLLM proxy
+		llmBaseURL = "https://api.openai.com/v1"
 	}
 
 	llmAPIKey := os.Getenv("LLM_API_KEY")
@@ -45,7 +45,7 @@ func Load() *Config {
 
 	llmModel := os.Getenv("LLM_MODEL")
 	if llmModel == "" {
-		llmModel = "openai/agy/claude-sonnet-4-6"
+		llmModel = "gpt-4o"
 	}
 
 	return &Config{
