@@ -245,13 +245,21 @@ func (r *Runner) runPythonVerification(ctx context.Context, dir string, report *
 }
 
 func (r *Runner) extractCustomRules(dir string, report *VerificationReport) {
-	// Standard instruction file candidates in priority order
+	// Standard instruction & guidelines file candidates in priority order
 	candidates := []string{
 		".github/copilot-instructions.md",
 		".github/instructions.md",
+		".github/CONTRIBUTING.md",
+		"CONTRIBUTING.md",
+		"contributing.md",
 		"AGENTS.md",
+		"agents.md",
 		"CLAUDE.md",
+		"claude.md",
 		".cursorrules",
+		"DEVELOPMENT.md",
+		"DEVELOPING.md",
+		"STYLEGUIDE.md",
 		"REVIEW_GUIDELINES.md",
 	}
 
