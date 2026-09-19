@@ -8,6 +8,7 @@ import (
 
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/github"
+	"github.com/thozoz/pr-review-go/pkg/labeler"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
 	"github.com/thozoz/pr-review-go/pkg/server"
 )
@@ -18,6 +19,7 @@ func main() {
 	repoFlag := flag.String("repo", "", "Repository in owner/repo format")
 	numFlag := flag.Int("num", 0, "PR Number")
 	postComment := flag.Bool("post", false, "Post the review markdown as a comment on GitHub")
+	onlyLabels := flag.Bool("labels", false, "Generate and apply labels to PR instead of full code review")
 	noSandbox := flag.Bool("no-sandbox", false, "Disable local runner sandbox verification")
 	modelFlag := flag.String("model", "", "LLM model to use")
 	flag.Parse()
@@ -64,11 +66,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx := context.Background()
+
+	if *onlyLabels {
+		fmt.Printf("🏷️ Generating labels for %s/%s #%d...\n", owner, repo, num)
+		lbl := labeler.NewLabeler(cfg)
+		labels, err := lbl.RunAndApply(ctx, owner, repo, num)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Labeling failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("✅ Applied labels: %v\n", labels)
+		return
+	}
+
 	fmt.Printf("🚀 Starting review for %s/%s #%d...\n", owner, repo, num)
 	fmt.Printf("📦 Sandbox Verification: %v | Model: %s\n", cfg.EnableSandbox, cfg.LLMModel)
 
 	engine := reviewer.NewEngine(cfg)
-	ctx := context.Background()
 
 	report, err := engine.ReviewPR(ctx, owner, repo, num)
 	if err != nil {

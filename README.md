@@ -42,6 +42,9 @@ export LLM_MODEL="gpt-4o" # or claude-3-5-sonnet, etc.
 # Review a pull request directly
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42
 
+# Only generate and apply labels (no sandbox needed, instant)
+./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -labels
+
 # Review and post results directly as a comment on the PR
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -post
 ```

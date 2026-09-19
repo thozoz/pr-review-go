@@ -147,3 +147,27 @@ func (c *Client) PostComment(ctx context.Context, owner, repo string, number int
 	})
 	return err
 }
+
+func (c *Client) GetLabels(ctx context.Context, owner, repo string, number int) ([]string, error) {
+	labels, _, err := c.gh.Issues.ListLabelsByIssue(ctx, owner, repo, number, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list labels: %w", err)
+	}
+
+	var names []string
+	for _, l := range labels {
+		names = append(names, l.GetName())
+	}
+	return names, nil
+}
+
+func (c *Client) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	_, _, err := c.gh.Issues.AddLabelsToIssue(ctx, owner, repo, number, labels)
+	if err != nil {
+		return fmt.Errorf("failed to add labels: %w", err)
+	}
+	return nil
+}

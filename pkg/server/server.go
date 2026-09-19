@@ -12,20 +12,23 @@ import (
 	"github.com/google/go-github/v68/github"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
+	"github.com/thozoz/pr-review-go/pkg/labeler"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
 )
 
 type Server struct {
-	cfg    *config.Config
-	engine *reviewer.Engine
-	gh     *ghclient.Client
+	cfg     *config.Config
+	engine  *reviewer.Engine
+	labeler *labeler.Labeler
+	gh      *ghclient.Client
 }
 
 func NewServer(cfg *config.Config) *Server {
 	return &Server{
-		cfg:    cfg,
-		engine: reviewer.NewEngine(cfg),
-		gh:     ghclient.NewClient(cfg.GitHubToken),
+		cfg:     cfg,
+		engine:  reviewer.NewEngine(cfg),
+		labeler: labeler.NewLabeler(cfg),
+		gh:      ghclient.NewClient(cfg.GitHubToken),
 	}
 }
 
@@ -104,6 +107,11 @@ func (s *Server) handlePullRequestEvent(e *github.PullRequestEvent) {
 
 	log.Printf("[webhook] PR %s/%s #%d triggered by action: %s", owner, repo, prNum, action)
 
+	// If freshly opened, automatically generate labels as well
+	if action == "opened" {
+		go s.dispatchLabels(owner, repo, prNum)
+	}
+
 	// Run review asynchronously in background goroutine
 	go s.dispatchReview(owner, repo, prNum)
 }
@@ -119,18 +127,30 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 	}
 
 	body := strings.TrimSpace(e.GetComment().GetBody())
-	if !strings.HasPrefix(body, "/review") {
-		return
-	}
-
 	owner := e.GetRepo().GetOwner().GetLogin()
 	repo := e.GetRepo().GetName()
 	prNum := e.GetIssue().GetNumber()
 
-	log.Printf("[webhook] PR %s/%s #%d triggered by comment: %s", owner, repo, prNum, body)
+	if strings.HasPrefix(body, "/review") {
+		log.Printf("[webhook] PR %s/%s #%d triggered review by comment: %s", owner, repo, prNum, body)
+		go s.dispatchReview(owner, repo, prNum)
+	} else if strings.HasPrefix(body, "/generate_labels") || strings.HasPrefix(body, "/labels") {
+		log.Printf("[webhook] PR %s/%s #%d triggered label generation by comment: %s", owner, repo, prNum, body)
+		go s.dispatchLabels(owner, repo, prNum)
+	}
+}
 
-	// Run review asynchronously in background goroutine
-	go s.dispatchReview(owner, repo, prNum)
+func (s *Server) dispatchLabels(owner, repo string, prNum int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	log.Printf("[labeler] Generating labels for %s/%s #%d...", owner, repo, prNum)
+	applied, err := s.labeler.RunAndApply(ctx, owner, repo, prNum)
+	if err != nil {
+		log.Printf("[labeler] Failed to generate/apply labels for %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+	log.Printf("[labeler] Successfully applied labels to %s/%s #%d: %v", owner, repo, prNum, applied)
 }
 
 func (s *Server) dispatchReview(owner, repo string, prNum int) {
