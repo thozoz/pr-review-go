@@ -9,9 +9,11 @@ import (
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
+	"github.com/thozoz/pr-review-go/pkg/server"
 )
 
 func main() {
+	serverMode := flag.Bool("server", false, "Run in background webhook server daemon mode")
 	prURL := flag.String("pr", "", "Full GitHub PR URL (e.g. https://github.com/owner/repo/pull/12)")
 	repoFlag := flag.String("repo", "", "Repository in owner/repo format")
 	numFlag := flag.Int("num", 0, "PR Number")
@@ -26,6 +28,15 @@ func main() {
 	}
 	if *noSandbox {
 		cfg.EnableSandbox = false
+	}
+
+	if *serverMode || (len(flag.Args()) > 0 && flag.Args()[0] == "server") {
+		srv := server.NewServer(cfg)
+		if err := srv.ListenAndServe(); err != nil {
+			fmt.Fprintf(os.Stderr, "Server failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	var owner, repo string

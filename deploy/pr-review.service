@@ -1,0 +1,26 @@
+[Unit]
+Description=PR Review Go Daemon (GitHub Webhook & Sandbox Reviewer)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pr-review-go
+ExecStart=/opt/pr-review-go/pr-review-go -server
+Restart=always
+RestartSec=5s
+
+# Environment configuration
+Environment=PORT=3000
+Environment=GITHUB_TOKEN=ghp_your_token_here
+Environment=WEBHOOK_SECRET=your_webhook_secret_here
+Environment=LLM_BASE_URL=http://192.168.1.129:4000/v1
+Environment=LLM_MODEL=openai/agy/claude-sonnet-4-6
+Environment=LLM_API_KEY=sk-4246
+
+# Resource limits (lightweight Go daemon)
+MemoryMax=500M
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
