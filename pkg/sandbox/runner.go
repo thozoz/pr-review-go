@@ -245,37 +245,67 @@ func (r *Runner) runPythonVerification(ctx context.Context, dir string, report *
 }
 
 func (r *Runner) extractCustomRules(dir string, report *VerificationReport) {
-	// Standard instruction & guidelines file candidates in priority order
-	candidates := []string{
+	// 1. High priority explicit candidates
+	priorityList := []string{
 		".github/copilot-instructions.md",
 		".github/instructions.md",
 		".github/CONTRIBUTING.md",
-		"CONTRIBUTING.md",
-		"contributing.md",
 		"AGENTS.md",
-		"agents.md",
 		"CLAUDE.md",
-		"claude.md",
+		"CONTRIBUTING.md",
 		".cursorrules",
-		"DEVELOPMENT.md",
-		"DEVELOPING.md",
-		"STYLEGUIDE.md",
-		"REVIEW_GUIDELINES.md",
 	}
 
-	for _, rel := range candidates {
+	for _, rel := range priorityList {
 		target := filepath.Join(dir, rel)
 		data, err := os.ReadFile(target)
 		if err == nil && len(bytes.TrimSpace(data)) > 0 {
-			content := string(data)
-			if len(content) > 15000 {
-				content = content[:15000] + "\n...[instructions truncated]..."
-			}
-			report.CustomRules = content
+			report.CustomRules = truncateString(string(data), 15000)
 			report.RulesSource = rel
 			return
 		}
 	}
+
+	// 2. Generic discovery: scan root directory and .github/ for any guideline/instruction files
+	keywords := []string{"instruct", "guide", "rule", "contribut", "agent", "standard", "convention"}
+	scanDirs := []string{dir, filepath.Join(dir, ".github")}
+
+	for _, scanDir := range scanDirs {
+		entries, err := os.ReadDir(scanDir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			lowerName := strings.ToLower(entry.Name())
+			// Must be markdown or rule file
+			if !strings.HasSuffix(lowerName, ".md") && !strings.HasSuffix(lowerName, "rules") {
+				continue
+			}
+
+			for _, kw := range keywords {
+				if strings.Contains(lowerName, kw) {
+					target := filepath.Join(scanDir, entry.Name())
+					data, err := os.ReadFile(target)
+					if err == nil && len(bytes.TrimSpace(data)) > 0 {
+						rel, _ := filepath.Rel(dir, target)
+						report.CustomRules = truncateString(string(data), 15000)
+						report.RulesSource = rel
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen] + "\n...[instructions truncated]..."
+	}
+	return s
 }
 
 func fileExists(path string) bool {
