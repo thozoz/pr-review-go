@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/thozoz/pr-review-go/pkg/assistant"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/labeler"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
 	"github.com/thozoz/pr-review-go/pkg/server"
+	"github.com/thozoz/pr-review-go/pkg/summarizer"
 )
 
 func main() {
@@ -20,6 +22,8 @@ func main() {
 	numFlag := flag.Int("num", 0, "PR Number")
 	postComment := flag.Bool("post", false, "Post the review markdown as a comment on GitHub")
 	onlyLabels := flag.Bool("labels", false, "Generate and apply labels to PR instead of full code review")
+	onlySummary := flag.Bool("summary", false, "Summarize PR discussions and reviews instead of code review")
+	askQuestion := flag.String("ask", "", "Ask the interactive PR assistant a question or give an execution command")
 	noSandbox := flag.Bool("no-sandbox", false, "Disable local runner sandbox verification")
 	modelFlag := flag.String("model", "", "LLM model to use")
 	flag.Parse()
@@ -84,6 +88,42 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("✅ Applied labels: %v\n", labels)
+		return
+	}
+
+	if *onlySummary {
+		fmt.Printf("📝 Summarizing PR discussions for %s/%s #%d...\n", owner, repo, num)
+		summ := summarizer.NewSummarizer(cfg)
+		var text string
+		var summErr error
+		if *postComment {
+			text, summErr = summ.RunAndPost(ctx, owner, repo, num)
+		} else {
+			text, summErr = summ.SummarizeDiscussions(ctx, owner, repo, num)
+		}
+		if summErr != nil {
+			fmt.Fprintf(os.Stderr, "❌ Summary failed: %v\n", summErr)
+			os.Exit(1)
+		}
+		fmt.Printf("\n%s\n", text)
+		return
+	}
+
+	if *askQuestion != "" {
+		fmt.Printf("🤖 Asking interactive assistant for %s/%s #%d: %s\n", owner, repo, num, *askQuestion)
+		asst := assistant.NewAssistant(cfg)
+		var text string
+		var asstErr error
+		if *postComment {
+			text, asstErr = asst.RunAndReply(ctx, owner, repo, num, *askQuestion)
+		} else {
+			text, asstErr = asst.HandleMention(ctx, owner, repo, num, *askQuestion)
+		}
+		if asstErr != nil {
+			fmt.Fprintf(os.Stderr, "❌ Assistant failed: %v\n", asstErr)
+			os.Exit(1)
+		}
+		fmt.Printf("\n%s\n", text)
 		return
 	}
 

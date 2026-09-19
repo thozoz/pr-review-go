@@ -10,17 +10,21 @@ import (
 	"time"
 
 	"github.com/google/go-github/v68/github"
+	"github.com/thozoz/pr-review-go/pkg/assistant"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/labeler"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
+	"github.com/thozoz/pr-review-go/pkg/summarizer"
 )
 
 type Server struct {
-	cfg     *config.Config
-	engine  *reviewer.Engine
-	labeler *labeler.Labeler
-	gh      *ghclient.Client
+	cfg        *config.Config
+	engine     *reviewer.Engine
+	labeler    *labeler.Labeler
+	summarizer *summarizer.Summarizer
+	assistant  *assistant.Assistant
+	gh         *ghclient.Client
 }
 
 func NewServer(cfg *config.Config) *Server {
@@ -28,10 +32,12 @@ func NewServer(cfg *config.Config) *Server {
 		panic(fmt.Sprintf("invalid config: %v", err))
 	}
 	return &Server{
-		cfg:     cfg,
-		engine:  reviewer.NewEngine(cfg),
-		labeler: labeler.NewLabeler(cfg),
-		gh:      ghclient.NewClient(cfg.GitHubToken),
+		cfg:        cfg,
+		engine:     reviewer.NewEngine(cfg),
+		labeler:    labeler.NewLabeler(cfg),
+		summarizer: summarizer.NewSummarizer(cfg),
+		assistant:  assistant.NewAssistant(cfg),
+		gh:         ghclient.NewClient(cfg.GitHubToken),
 	}
 }
 
@@ -150,7 +156,42 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 	} else if strings.HasPrefix(body, "/generate_labels") || strings.HasPrefix(body, "/labels") {
 		log.Printf("[webhook] PR %s/%s #%d triggered label generation by comment: %s", owner, repo, prNum, body)
 		go s.dispatchLabels(owner, repo, prNum)
+	} else if strings.HasPrefix(body, "/summarize") || strings.HasPrefix(body, "/summary") {
+		log.Printf("[webhook] PR %s/%s #%d triggered discussion summary by comment: %s", owner, repo, prNum, body)
+		go s.dispatchSummary(owner, repo, prNum)
+	} else if strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "@pr-review") || strings.HasPrefix(body, "/ask") {
+		question := strings.TrimSpace(strings.TrimPrefix(body, "@bot"))
+		question = strings.TrimSpace(strings.TrimPrefix(question, "@pr-review"))
+		question = strings.TrimSpace(strings.TrimPrefix(question, "/ask"))
+		log.Printf("[webhook] PR %s/%s #%d triggered interactive assistant: %s", owner, repo, prNum, question)
+		go s.dispatchAssistant(owner, repo, prNum, question)
 	}
+}
+
+func (s *Server) dispatchSummary(owner, repo string, prNum int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	log.Printf("[summarizer] Generating discussion summary for %s/%s #%d...", owner, repo, prNum)
+	_, err := s.summarizer.RunAndPost(ctx, owner, repo, prNum)
+	if err != nil {
+		log.Printf("[summarizer] Failed to generate/post summary for %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+	log.Printf("[summarizer] Successfully posted discussion summary to %s/%s #%d", owner, repo, prNum)
+}
+
+func (s *Server) dispatchAssistant(owner, repo string, prNum int, question string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	log.Printf("[assistant] Running interactive task for %s/%s #%d: %s", owner, repo, prNum, question)
+	_, err := s.assistant.RunAndReply(ctx, owner, repo, prNum, question)
+	if err != nil {
+		log.Printf("[assistant] Failed to run assistant task for %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+	log.Printf("[assistant] Successfully posted assistant reply to %s/%s #%d", owner, repo, prNum)
 }
 
 func (s *Server) dispatchLabels(owner, repo string, prNum int) {
