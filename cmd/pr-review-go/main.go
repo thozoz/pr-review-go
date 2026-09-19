@@ -32,6 +32,13 @@ func main() {
 		cfg.EnableSandbox = false
 	}
 
+	// Validate configuration
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Configuration error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Please set the required environment variables.\n")
+		os.Exit(1)
+	}
+
 	if *serverMode || (len(flag.Args()) > 0 && flag.Args()[0] == "server") {
 		srv := server.NewServer(cfg)
 		if err := srv.ListenAndServe(); err != nil {

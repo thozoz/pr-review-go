@@ -10,7 +10,14 @@ import (
 )
 
 func TestHealthEndpoint(t *testing.T) {
-	cfg := &config.Config{Port: 3000}
+	cfg := &config.Config{
+		Port:          3000,
+		GitHubToken:   "test-token",
+		LLMAPIKey:     "test-key",
+		LLMModel:      "gpt-4o",
+		LLMBaseURL:    "https://api.openai.com/v1",
+		WebhookSecret: "",
+	}
 	srv := NewServer(cfg)
 
 	req := httptest.NewRequest("GET", "/", nil)
@@ -29,7 +36,14 @@ func TestHealthEndpoint(t *testing.T) {
 }
 
 func TestWebhookPing(t *testing.T) {
-	cfg := &config.Config{Port: 3000}
+	cfg := &config.Config{
+		Port:          3000,
+		GitHubToken:   "test-token",
+		LLMAPIKey:     "test-key",
+		LLMModel:      "gpt-4o",
+		LLMBaseURL:    "https://api.openai.com/v1",
+		WebhookSecret: "",
+	}
 	srv := NewServer(cfg)
 
 	req := httptest.NewRequest("POST", "/api/v1/github_webhooks", strings.NewReader(`{"zen":"Keep it logically awesome."}`))

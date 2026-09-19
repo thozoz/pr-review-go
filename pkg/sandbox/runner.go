@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -41,6 +42,13 @@ func NewRunner(timeout time.Duration) *Runner {
 
 // PrepareWorkspace clones the repository and checks out the specific PR commit/branch
 func (r *Runner) PrepareWorkspace(ctx context.Context, cloneURL, headRef, headSHA string) (string, func(), error) {
+	if cloneURL == "" {
+		return "", nil, fmt.Errorf("clone URL is empty")
+	}
+	if headSHA == "" {
+		return "", nil, fmt.Errorf("head SHA is empty")
+	}
+
 	tmpDir, err := os.MkdirTemp("", "pr-review-sandbox-*")
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create sandbox dir: %w", err)
@@ -50,26 +58,53 @@ func (r *Runner) PrepareWorkspace(ctx context.Context, cloneURL, headRef, headSH
 		_ = os.RemoveAll(tmpDir)
 	}
 
-	// Shallow clone branch
-	cloneCmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--branch", headRef, cloneURL, tmpDir)
-	var cloneErr bytes.Buffer
-	cloneCmd.Stderr = &cloneErr
-	if err := cloneCmd.Run(); err != nil {
-		// Fallback: clone without branch and checkout SHA
+	// Try shallow clone with branch first (fastest)
+	if headRef != "" {
+		cloneCmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--branch", headRef, cloneURL, tmpDir)
+		var cloneErr bytes.Buffer
+		cloneCmd.Stderr = &cloneErr
+		if err := cloneCmd.Run(); err == nil {
+			// Verify we have the correct commit
+			verifyCmd := exec.CommandContext(ctx, "git", "-C", tmpDir, "rev-parse", "HEAD")
+			var verifyOut bytes.Buffer
+			verifyCmd.Stdout = &verifyOut
+			if err := verifyCmd.Run(); err == nil {
+				currentSHA := strings.TrimSpace(verifyOut.String())
+				if strings.HasPrefix(headSHA, currentSHA) || strings.HasPrefix(currentSHA, headSHA) {
+					return tmpDir, cleanup, nil
+				}
+			}
+		}
+		// Fall through to fallback
 		_ = os.RemoveAll(tmpDir)
 		_ = os.MkdirAll(tmpDir, 0755)
+	}
 
-		initCmd := exec.CommandContext(ctx, "git", "clone", "--depth", "50", cloneURL, tmpDir)
-		if err := initCmd.Run(); err != nil {
-			cleanup()
-			return "", nil, fmt.Errorf("git clone failed: %v, stderr: %s", err, cloneErr.String())
-		}
+	// Fallback: clone with more depth and checkout specific SHA
+	// Use --depth 100 to get enough history for the SHA
+	initCmd := exec.CommandContext(ctx, "git", "clone", "--depth", "100", cloneURL, tmpDir)
+	var initErr bytes.Buffer
+	initCmd.Stderr = &initErr
+	if err := initCmd.Run(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("git clone failed: %v, stderr: %s", err, initErr.String())
+	}
 
-		coCmd := exec.CommandContext(ctx, "git", "-C", tmpDir, "checkout", headSHA)
-		if err := coCmd.Run(); err != nil {
-			cleanup()
-			return "", nil, fmt.Errorf("failed to checkout %s: %w", headSHA, err)
+	// Try to checkout the specific commit
+	coCmd := exec.CommandContext(ctx, "git", "-C", tmpDir, "checkout", headSHA)
+	var coErr bytes.Buffer
+	coCmd.Stderr = &coErr
+	if err := coCmd.Run(); err != nil {
+		// If checkout fails, try fetching more history
+		fetchCmd := exec.CommandContext(ctx, "git", "-C", tmpDir, "fetch", "--depth=1000", "origin", headSHA)
+		if fetchErr := fetchCmd.Run(); fetchErr == nil {
+			retryCoCmd := exec.CommandContext(ctx, "git", "-C", tmpDir, "checkout", headSHA)
+			if retryErr := retryCoCmd.Run(); retryErr == nil {
+				return tmpDir, cleanup, nil
+			}
 		}
+		cleanup()
+		return "", nil, fmt.Errorf("failed to checkout %s: %w, stderr: %s", headSHA, err, coErr.String())
 	}
 
 	return tmpDir, cleanup, nil
@@ -125,15 +160,29 @@ func (r *Runner) executeCommand(ctx context.Context, dir, name string, args ...s
 		passed = false
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
+		} else if cmdCtx.Err() == context.DeadlineExceeded {
+			exitCode = 124
+			stderr.WriteString("\n[ERROR] Command timed out after " + r.Timeout.String())
 		} else {
 			exitCode = 1
 		}
 	}
 
+	// Limit output size to prevent memory issues with large test outputs
+	const maxOutputSize = 100 * 1024 // 100 KB
+	stdoutStr := stdout.String()
+	stderrStr := stderr.String()
+	if len(stdoutStr) > maxOutputSize {
+		stdoutStr = stdoutStr[:maxOutputSize] + "\n... [stdout truncated, exceeded " + fmt.Sprintf("%d KB", maxOutputSize/1024) + "] ..."
+	}
+	if len(stderrStr) > maxOutputSize {
+		stderrStr = stderrStr[:maxOutputSize] + "\n... [stderr truncated, exceeded " + fmt.Sprintf("%d KB", maxOutputSize/1024) + "] ..."
+	}
+
 	return ExecutionResult{
 		Command:  fmt.Sprintf("%s %v", name, args),
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
+		Stdout:   stdoutStr,
+		Stderr:   stderrStr,
 		ExitCode: exitCode,
 		Duration: duration,
 		Passed:   passed,

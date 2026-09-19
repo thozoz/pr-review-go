@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 )
@@ -13,6 +14,23 @@ type Config struct {
 	LLMAPIKey     string
 	LLMModel      string
 	EnableSandbox bool
+}
+
+// Validate checks if required configuration is present
+func (c *Config) Validate() error {
+	if c.GitHubToken == "" {
+		return fmt.Errorf("GITHUB_TOKEN or GH_TOKEN is required")
+	}
+	if c.LLMAPIKey == "" {
+		return fmt.Errorf("LLM_API_KEY or OPENAI_API_KEY is required")
+	}
+	if c.LLMModel == "" {
+		return fmt.Errorf("LLM_MODEL is required")
+	}
+	if c.LLMBaseURL == "" {
+		return fmt.Errorf("LLM_BASE_URL is required")
+	}
+	return nil
 }
 
 func Load() *Config {

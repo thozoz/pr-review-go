@@ -24,6 +24,9 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config) *Server {
+	if err := cfg.Validate(); err != nil {
+		panic(fmt.Sprintf("invalid config: %v", err))
+	}
 	return &Server{
 		cfg:     cfg,
 		engine:  reviewer.NewEngine(cfg),
@@ -88,6 +91,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.handleIssueCommentEvent(e)
 	default:
 		// Other events ignored silently
+		log.Printf("[webhook] Ignoring event type: %s", github.WebHookType(r))
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -104,6 +108,11 @@ func (s *Server) handlePullRequestEvent(e *github.PullRequestEvent) {
 	owner := e.GetRepo().GetOwner().GetLogin()
 	repo := e.GetRepo().GetName()
 	prNum := e.GetPullRequest().GetNumber()
+
+	if owner == "" || repo == "" {
+		log.Printf("[webhook] Invalid owner/repo in PR event")
+		return
+	}
 
 	log.Printf("[webhook] PR %s/%s #%d triggered by action: %s", owner, repo, prNum, action)
 
@@ -130,6 +139,10 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 	owner := e.GetRepo().GetOwner().GetLogin()
 	repo := e.GetRepo().GetName()
 	prNum := e.GetIssue().GetNumber()
+
+	if owner == "" || repo == "" {
+		return
+	}
 
 	if strings.HasPrefix(body, "/review") {
 		log.Printf("[webhook] PR %s/%s #%d triggered review by comment: %s", owner, repo, prNum, body)
