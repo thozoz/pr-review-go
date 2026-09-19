@@ -1,0 +1,149 @@
+package github
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/google/go-github/v68/github"
+	"golang.org/x/oauth2"
+)
+
+type Client struct {
+	gh *github.Client
+}
+
+func NewClient(token string) *Client {
+	ctx := context.Background()
+	var httpClient = oauth2.NewClient(ctx, oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: token},
+	))
+	return &Client{
+		gh: github.NewClient(httpClient),
+	}
+}
+
+// ParseRepoOwner splits "owner/repo" into [owner, repo]
+func ParseRepoOwner(repoFlag string) []string {
+	parts := strings.Split(strings.TrimSpace(repoFlag), "/")
+	if len(parts) != 2 {
+		return nil
+	}
+	return parts
+}
+
+// ParsePRURL extracts owner, repo, and PR number from a standard GitHub PR URL
+func ParsePRURL(prURL string) (owner string, repo string, number int, err error) {
+	// Example: https://github.com/thozoz/pr-review-go/pull/1
+	trimmed := strings.TrimPrefix(prURL, "https://github.com/")
+	trimmed = strings.TrimPrefix(trimmed, "http://github.com/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) < 4 || parts[2] != "pull" {
+		return "", "", 0, fmt.Errorf("invalid PR URL format: %s", prURL)
+	}
+
+	owner = parts[0]
+	repo = parts[1]
+	_, err = fmt.Sscanf(parts[3], "%d", &number)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("failed to parse PR number: %w", err)
+	}
+
+	return owner, repo, number, nil
+}
+
+func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PRDetails, error) {
+	pr, _, err := c.gh.PullRequests.Get(ctx, owner, repo, number)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pull request: %w", err)
+	}
+
+	return &PRDetails{
+		Owner:     owner,
+		Repo:      repo,
+		Number:    number,
+		Title:     pr.GetTitle(),
+		Body:      pr.GetBody(),
+		Author:    pr.GetUser().GetLogin(),
+		BaseRef:   pr.GetBase().GetRef(),
+		HeadRef:   pr.GetHead().GetRef(),
+		HeadSHA:   pr.GetHead().GetSHA(),
+		CloneURL:  pr.GetHead().GetRepo().GetCloneURL(),
+		CreatedAt: pr.GetCreatedAt().Time,
+	}, nil
+}
+
+func (c *Client) GetRawDiff(ctx context.Context, owner, repo string, number int) (string, error) {
+	diff, _, err := c.gh.PullRequests.GetRaw(ctx, owner, repo, number, github.RawOptions{
+		Type: github.Diff,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get raw diff: %w", err)
+	}
+	return diff, nil
+}
+
+func (c *Client) GetComments(ctx context.Context, owner, repo string, number int) ([]Comment, []DiscussionThread, error) {
+	// 1. Fetch general issue comments
+	issueComments, _, err := c.gh.Issues.ListComments(ctx, owner, repo, number, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get issue comments: %w", err)
+	}
+
+	var generalComments []Comment
+	for _, ic := range issueComments {
+		generalComments = append(generalComments, Comment{
+			ID:        ic.GetID(),
+			User:      ic.GetUser().GetLogin(),
+			Body:      ic.GetBody(),
+			CreatedAt: ic.GetCreatedAt().Time,
+		})
+	}
+
+	// 2. Fetch inline review comments
+	reviewComments, _, err := c.gh.PullRequests.ListComments(ctx, owner, repo, number, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get review comments: %w", err)
+	}
+
+	// Group inline comments into threads by root comment or file+line
+	threadMap := make(map[string]*DiscussionThread)
+	for _, rc := range reviewComments {
+		comm := Comment{
+			ID:          rc.GetID(),
+			User:        rc.GetUser().GetLogin(),
+			Body:        rc.GetBody(),
+			CreatedAt:   rc.GetCreatedAt().Time,
+			Path:        rc.GetPath(),
+			Line:        rc.GetLine(),
+			DiffHunk:    rc.GetDiffHunk(),
+			InReplyToID: rc.GetInReplyTo(),
+		}
+
+		key := fmt.Sprintf("%s:%d", comm.Path, comm.Line)
+		if thread, exists := threadMap[key]; exists {
+			thread.Comments = append(thread.Comments, comm)
+		} else {
+			threadMap[key] = &DiscussionThread{
+				Path:     comm.Path,
+				Line:     comm.Line,
+				DiffHunk: comm.DiffHunk,
+				Comments: []Comment{comm},
+			}
+		}
+	}
+
+	var threads []DiscussionThread
+	for _, thread := range threadMap {
+		threads = append(threads, *thread)
+	}
+
+	return generalComments, threads, nil
+}
+
+func (c *Client) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
+	_, _, err := c.gh.Issues.CreateComment(ctx, owner, repo, number, &github.IssueComment{
+		Body: github.Ptr(body),
+	})
+	return err
+}
