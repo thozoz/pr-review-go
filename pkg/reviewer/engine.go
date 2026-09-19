@@ -20,6 +20,9 @@ type Engine struct {
 }
 
 func NewEngine(cfg *config.Config) *Engine {
+	if err := cfg.Validate(); err != nil {
+		panic(fmt.Sprintf("invalid config: %v", err))
+	}
 	return &Engine{
 		cfg:     cfg,
 		gh:      github.NewClient(cfg.GitHubToken),
@@ -35,10 +38,16 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 		return nil, fmt.Errorf("failed to fetch PR: %w", err)
 	}
 
-	// 2. Fetch Raw Diff
+	// 2. Fetch Raw Diff with size limit
 	diff, err := e.gh.GetRawDiff(ctx, owner, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch diff: %w", err)
+	}
+
+	// Limit diff size to prevent token overflow
+	const maxDiffSize = 120000 // ~120KB, roughly 30k tokens
+	if len(diff) > maxDiffSize {
+		diff = diff[:maxDiffSize] + "\n\n... [diff truncated, exceeded size limit] ..."
 	}
 
 	// 3. Fetch Comments & Discussions
@@ -175,24 +184,41 @@ func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Commen
 
 func extractJSONOutput(raw string) (*LLMReviewOutput, error) {
 	trimmed := strings.TrimSpace(raw)
-	// Strip markdown codeblocks if model included them
-	if strings.HasPrefix(trimmed, "```") {
-		lines := strings.Split(trimmed, "\n")
-		if len(lines) >= 2 {
-			if strings.HasPrefix(lines[0], "```") {
-				lines = lines[1:]
-			}
-			if len(lines) > 0 && strings.HasPrefix(lines[len(lines)-1], "```") {
-				lines = lines[:len(lines)-1]
-			}
-			trimmed = strings.Join(lines, "\n")
-		}
+	
+	// Try to find JSON in the response (handle markdown codeblocks and extra text)
+	jsonStart := strings.Index(trimmed, "{")
+	jsonEnd := strings.LastIndex(trimmed, "}")
+	
+	if jsonStart >= 0 && jsonEnd > jsonStart {
+		trimmed = trimmed[jsonStart : jsonEnd+1]
 	}
 
 	var output LLMReviewOutput
 	if err := json.Unmarshal([]byte(trimmed), &output); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("JSON unmarshal failed: %w", err)
 	}
+	
+	// Validate score range
+	if output.Score < 0 {
+		output.Score = 0
+	} else if output.Score > 100 {
+		output.Score = 100
+	}
+	
+	// Validate findings
+	for i := range output.Findings {
+		if output.Findings[i].Severity != "CRITICAL" && output.Findings[i].Severity != "WARNING" && output.Findings[i].Severity != "NOTE" {
+			output.Findings[i].Severity = "NOTE"
+		}
+	}
+	
+	// Validate comment followups
+	for i := range output.CommentFollowups {
+		if output.CommentFollowups[i].Status != "ADDRESSED" && output.CommentFollowups[i].Status != "STILL_OPEN" && output.CommentFollowups[i].Status != "DISMISSED" {
+			output.CommentFollowups[i].Status = "STILL_OPEN"
+		}
+	}
+
 	return &output, nil
 }
 

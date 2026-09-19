@@ -30,6 +30,11 @@ func NewClient(baseURL, apiKey, model string) *Client {
 	}
 }
 
+// SetTimeout allows customizing the HTTP timeout
+func (c *Client) SetTimeout(timeout time.Duration) {
+	c.httpClient.Timeout = timeout
+}
+
 type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -55,6 +60,23 @@ type ChatResponse struct {
 }
 
 func (c *Client) ChatCompletion(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	// Validate inputs
+	if c.baseURL == "" {
+		return "", fmt.Errorf("base URL is not configured")
+	}
+	if c.apiKey == "" {
+		return "", fmt.Errorf("API key is not configured")
+	}
+	if c.model == "" {
+		return "", fmt.Errorf("model is not configured")
+	}
+	if strings.TrimSpace(systemPrompt) == "" {
+		return "", fmt.Errorf("system prompt cannot be empty")
+	}
+	if strings.TrimSpace(userPrompt) == "" {
+		return "", fmt.Errorf("user prompt cannot be empty")
+	}
+
 	reqBody := ChatRequest{
 		Model: c.model,
 		Messages: []ChatMessage{

@@ -14,6 +14,9 @@ type Client struct {
 }
 
 func NewClient(token string) *Client {
+	if token == "" {
+		return &Client{gh: github.NewClient(nil)}
+	}
 	ctx := context.Background()
 	var httpClient = oauth2.NewClient(ctx, oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token},
@@ -33,20 +36,38 @@ func ParseRepoOwner(repoFlag string) []string {
 }
 
 // ParsePRURL extracts owner, repo, and PR number from a standard GitHub PR URL
+// Supports various URL formats:
+// - https://github.com/owner/repo/pull/123
+// - http://github.com/owner/repo/pull/123
+// - https://github.com/owner/repo/pull/123/
+// - https://github.com/owner/repo/pull/123?query=params
 func ParsePRURL(prURL string) (owner string, repo string, number int, err error) {
-	// Example: https://github.com/thozoz/pr-review-go/pull/1
+	// Remove query parameters
+	if idx := strings.Index(prURL, "?"); idx != -1 {
+		prURL = prURL[:idx]
+	}
+	
+	// Remove trailing slash
+	prURL = strings.TrimSuffix(prURL, "/")
+	
+	// Remove protocol and domain
 	trimmed := strings.TrimPrefix(prURL, "https://github.com/")
 	trimmed = strings.TrimPrefix(trimmed, "http://github.com/")
+	
 	parts := strings.Split(trimmed, "/")
 	if len(parts) < 4 || parts[2] != "pull" {
-		return "", "", 0, fmt.Errorf("invalid PR URL format: %s", prURL)
+		return "", "", 0, fmt.Errorf("invalid PR URL format: %s (expected https://github.com/owner/repo/pull/number)", prURL)
 	}
 
 	owner = parts[0]
 	repo = parts[1]
 	_, err = fmt.Sscanf(parts[3], "%d", &number)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("failed to parse PR number: %w", err)
+		return "", "", 0, fmt.Errorf("failed to parse PR number from %s: %w", parts[3], err)
+	}
+
+	if owner == "" || repo == "" {
+		return "", "", 0, fmt.Errorf("owner or repo is empty in URL: %s", prURL)
 	}
 
 	return owner, repo, number, nil
@@ -84,26 +105,41 @@ func (c *Client) GetRawDiff(ctx context.Context, owner, repo string, number int)
 }
 
 func (c *Client) GetComments(ctx context.Context, owner, repo string, number int) ([]Comment, []DiscussionThread, error) {
-	// 1. Fetch general issue comments
-	issueComments, _, err := c.gh.Issues.ListComments(ctx, owner, repo, number, nil)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get issue comments: %w", err)
-	}
-
+	// 1. Fetch general issue comments with pagination
 	var generalComments []Comment
-	for _, ic := range issueComments {
-		generalComments = append(generalComments, Comment{
-			ID:        ic.GetID(),
-			User:      ic.GetUser().GetLogin(),
-			Body:      ic.GetBody(),
-			CreatedAt: ic.GetCreatedAt().Time,
-		})
+	opt := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
+	for {
+		issueComments, resp, err := c.gh.Issues.ListComments(ctx, owner, repo, number, opt)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get issue comments: %w", err)
+		}
+		for _, ic := range issueComments {
+			generalComments = append(generalComments, Comment{
+				ID:        ic.GetID(),
+				User:      ic.GetUser().GetLogin(),
+				Body:      ic.GetBody(),
+				CreatedAt: ic.GetCreatedAt().Time,
+			})
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
 	}
 
-	// 2. Fetch inline review comments
-	reviewComments, _, err := c.gh.PullRequests.ListComments(ctx, owner, repo, number, nil)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get review comments: %w", err)
+	// 2. Fetch inline review comments with pagination
+	var reviewComments []*github.PullRequestComment
+	prOpt := &github.PullRequestListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
+	for {
+		rcPage, resp, err := c.gh.PullRequests.ListComments(ctx, owner, repo, number, prOpt)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get review comments: %w", err)
+		}
+		reviewComments = append(reviewComments, rcPage...)
+		if resp.NextPage == 0 {
+			break
+		}
+		prOpt.Page = resp.NextPage
 	}
 
 	// Group inline comments into threads by root comment or file+line
@@ -120,7 +156,12 @@ func (c *Client) GetComments(ctx context.Context, owner, repo string, number int
 			InReplyToID: rc.GetInReplyTo(),
 		}
 
-		key := fmt.Sprintf("%s:%d", comm.Path, comm.Line)
+		// Use a more robust key that includes start line for multi-line comments
+		key := fmt.Sprintf("%s:%d:%d", comm.Path, comm.Line, comm.InReplyToID)
+		if comm.InReplyToID == 0 {
+			key = fmt.Sprintf("%s:%d", comm.Path, comm.Line)
+		}
+		
 		if thread, exists := threadMap[key]; exists {
 			thread.Comments = append(thread.Comments, comm)
 		} else {
