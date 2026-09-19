@@ -21,10 +21,12 @@ type ExecutionResult struct {
 }
 
 type VerificationReport struct {
-	WorkspaceDir string            `json:"workspace_dir"`
-	DetectedType string            `json:"detected_type"` // e.g. "go", "node", "python", "rust"
-	Results      []ExecutionResult `json:"results"`
-	Summary      string            `json:"summary"`
+	WorkspaceDir   string            `json:"workspace_dir"`
+	DetectedType   string            `json:"detected_type"` // e.g. "go", "node", "python", "rust"
+	Results        []ExecutionResult `json:"results"`
+	Summary        string            `json:"summary"`
+	CustomRules    string            `json:"custom_rules,omitempty"` // Content of AGENTS.md, copilot-instructions.md, etc.
+	RulesSource    string            `json:"rules_source,omitempty"` // Filename of discovered rules
 }
 
 type Runner struct {
@@ -110,12 +112,15 @@ func (r *Runner) PrepareWorkspace(ctx context.Context, cloneURL, headRef, headSH
 	return tmpDir, cleanup, nil
 }
 
-// VerifyProject detects project type and executes compilation/tests
+// VerifyProject detects project type, executes compilation/tests, and extracts custom instruction rules
 func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationReport, error) {
 	report := &VerificationReport{
 		WorkspaceDir: dir,
 		Results:      make([]ExecutionResult, 0),
 	}
+
+	// Read repository custom rules if present
+	r.extractCustomRules(dir, report)
 
 	// 1. Detect environment
 	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
@@ -236,6 +241,32 @@ func (r *Runner) runPythonVerification(ctx context.Context, dir string, report *
 		report.Summary = "FAILED: pytest reported issues."
 	} else {
 		report.Summary = "SUCCESS: Python tests passed."
+	}
+}
+
+func (r *Runner) extractCustomRules(dir string, report *VerificationReport) {
+	// Standard instruction file candidates in priority order
+	candidates := []string{
+		".github/copilot-instructions.md",
+		".github/instructions.md",
+		"AGENTS.md",
+		"CLAUDE.md",
+		".cursorrules",
+		"REVIEW_GUIDELINES.md",
+	}
+
+	for _, rel := range candidates {
+		target := filepath.Join(dir, rel)
+		data, err := os.ReadFile(target)
+		if err == nil && len(bytes.TrimSpace(data)) > 0 {
+			content := string(data)
+			if len(content) > 15000 {
+				content = content[:15000] + "\n...[instructions truncated]..."
+			}
+			report.CustomRules = content
+			report.RulesSource = rel
+			return
+		}
 	}
 }
 

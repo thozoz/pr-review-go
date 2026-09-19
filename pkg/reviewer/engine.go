@@ -58,6 +58,8 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 
 	// 4. Sandbox Verification (Optional/Configurable)
 	var verificationSummary = "Sandbox verification skipped."
+	var customRulesText = ""
+	var rulesSource = ""
 	if e.cfg.EnableSandbox {
 		workDir, cleanup, err := e.sandbox.PrepareWorkspace(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 		if err == nil {
@@ -65,6 +67,8 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 			verReport, err := e.sandbox.VerifyProject(ctx, workDir)
 			if err == nil {
 				verificationSummary = verReport.Summary
+				customRulesText = verReport.CustomRules
+				rulesSource = verReport.RulesSource
 				// If tests or build failed, append stderr/stdout snippet
 				for _, res := range verReport.Results {
 					if !res.Passed {
@@ -79,8 +83,8 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	}
 
 	// 5. Build Prompts
-	systemPrompt := buildSystemPrompt()
-	userPrompt := buildUserPrompt(pr, diff, generalComments, threads, verificationSummary)
+	systemPrompt := buildSystemPrompt(customRulesText, rulesSource)
+	userPrompt := buildUserPrompt(pr, diff, generalComments, threads, verificationSummary, customRulesText)
 
 	// 6. Call LLM
 	rawResponse, err := e.llm.ChatCompletion(ctx, systemPrompt, userPrompt)
@@ -100,6 +104,7 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 		Score:               parsed.Score,
 		Summary:             parsed.Summary,
 		VerificationSummary: verificationSummary,
+		RulesSource:         rulesSource,
 		CommentFollowups:    parsed.CommentFollowups,
 		Findings:            parsed.Findings,
 	}
@@ -108,8 +113,8 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	return report, nil
 }
 
-func buildSystemPrompt() string {
-	return `You are an elite, highly rigorous AI Code Reviewer.
+func buildSystemPrompt(customRules, rulesSource string) string {
+	base := `You are an elite, highly rigorous AI Code Reviewer.
 Your role is to analyze Pull Requests by combining three critical signals:
 1. Live Sandbox Verification (did the code compile, did tests pass in a real runner).
 2. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
@@ -121,13 +126,25 @@ CRITICAL RULES:
 - If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.
 - Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
 - Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
+
+	if customRules != "" {
+		base += fmt.Sprintf("\n\nCRITICAL: You MUST strictly enforce the project's repository custom instructions (from %s):\n```markdown\n%s\n```",
+			rulesSource, customRules)
+	}
+
+	return base
 }
 
-func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Comment, threads []github.DiscussionThread, verification string) string {
+func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Comment, threads []github.DiscussionThread, verification, customRules string) string {
 	var b strings.Builder
 
 	b.WriteString(fmt.Sprintf("## PR Info\nTitle: %s\nAuthor: %s\nBase Branch: %s\nHead Branch: %s\n\n",
 		pr.Title, pr.Author, pr.BaseRef, pr.HeadRef))
+
+	if customRules != "" {
+		b.WriteString("### Repository Review Instructions (Enforce Strictly):\n")
+		b.WriteString(customRules + "\n\n")
+	}
 
 	if pr.Body != "" {
 		b.WriteString(fmt.Sprintf("### PR Description:\n%s\n\n", pr.Body))
@@ -226,6 +243,9 @@ func FormatReportMarkdown(r *ReviewReport) string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("## 🤖 PR Review Report: %s (Score: %d/100)\n\n", r.PRTitle, r.Score))
+	if r.RulesSource != "" {
+		sb.WriteString(fmt.Sprintf("📋 **Custom Guidelines Enforced:** `%s`\n\n", r.RulesSource))
+	}
 	sb.WriteString(fmt.Sprintf("**Sandbox Verification:** %s\n\n", r.VerificationSummary))
 	sb.WriteString(fmt.Sprintf("### Summary\n%s\n\n", r.Summary))
 
