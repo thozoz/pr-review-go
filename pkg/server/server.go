@@ -6,15 +6,18 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/google/go-github/v68/github"
 	"github.com/thozoz/pr-review-go/pkg/assistant"
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/docgen"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/labeler"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
+	"github.com/thozoz/pr-review-go/pkg/sandbox"
 	"github.com/thozoz/pr-review-go/pkg/summarizer"
 )
 
@@ -159,6 +162,9 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 	} else if strings.HasPrefix(body, "/summarize") || strings.HasPrefix(body, "/summary") {
 		log.Printf("[webhook] PR %s/%s #%d triggered discussion summary by comment: %s", owner, repo, prNum, body)
 		go s.dispatchSummary(owner, repo, prNum)
+	} else if strings.HasPrefix(body, "/add_docs") || strings.HasPrefix(body, "/docs") {
+		log.Printf("[webhook] PR %s/%s #%d triggered add_docs by comment: %s", owner, repo, prNum, body)
+		go s.dispatchAddDocs(owner, repo, prNum)
 	} else if strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "@pr-review") || strings.HasPrefix(body, "/ask") {
 		question := strings.TrimSpace(strings.TrimPrefix(body, "@bot"))
 		question = strings.TrimSpace(strings.TrimPrefix(question, "@pr-review"))
@@ -179,6 +185,51 @@ func (s *Server) dispatchSummary(owner, repo string, prNum int) {
 		return
 	}
 	log.Printf("[summarizer] Successfully posted discussion summary to %s/%s #%d", owner, repo, prNum)
+}
+
+func (s *Server) dispatchAddDocs(owner, repo string, prNum int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	log.Printf("[docgen] Scanning for undocumented items on %s/%s #%d...", owner, repo, prNum)
+	pr, err := s.gh.GetPR(ctx, owner, repo, prNum)
+	if err != nil {
+		log.Printf("[docgen] Failed to fetch PR %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+
+	runner := sandbox.NewRunner(0)
+	workDir, cleanup, err := runner.PrepareWorkspace(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+	if err != nil {
+		log.Printf("[docgen] Failed to checkout workspace for %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+	defer cleanup()
+
+	items, err := docgen.FindUndocumentedGoItems(workDir)
+	if err != nil {
+		log.Printf("[docgen] Failed scanning %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+
+	var reportText string
+	if len(items) == 0 {
+		reportText = "## 📝 Documentation Report\n\nAll exported Go functions and types have doc comments! Everything looks great."
+	} else {
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("## 📝 Documentation Report: Found %d Undocumented Declarations\n\n", len(items)))
+		for _, it := range items {
+			relPath, _ := filepath.Rel(workDir, it.File)
+			sb.WriteString(fmt.Sprintf("- `%s` (`%s` in `%s`)\n", it.Name, it.Kind, relPath))
+		}
+		reportText = sb.String()
+	}
+
+	if err := s.gh.PostComment(ctx, owner, repo, prNum, reportText); err != nil {
+		log.Printf("[docgen] Failed to post comment on %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+	log.Printf("[docgen] Successfully posted documentation report to %s/%s #%d", owner, repo, prNum)
 }
 
 func (s *Server) dispatchAssistant(owner, repo string, prNum int, question string) {

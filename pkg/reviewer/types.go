@@ -29,6 +29,7 @@ type ReviewReport struct {
 	Summary             string
 	VerificationSummary string
 	RulesSource         string
+	DeduplicatedCount   int
 	CommentFollowups    []CommentTracking
 	Findings            []Finding
 	RawMarkdown         string

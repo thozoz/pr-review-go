@@ -90,6 +90,22 @@ Bu doküman, `pr-review-go` projesinin tüm mimari bileşenlerini, eklenen yeten
     4. `commit_and_push(commit_msg)`: Yapılan değişiklikleri `pr-review-go[bot]` adıyla PR dalına yeni commit olarak pushlar.
   - Model kullanıcı talimatına göre 6 adıma kadar otonom iterasyon yapabilir; işi bitince PR yorumuna açıklamasını bırakır.
 
+### G. SHA-256 Yorum Deduplication (`pkg/dedup`)
+- **Mantık:**
+  - Her bir bulgu (finding) için deterministik SHA-256 parmak izi hesaplar: `sha256(file:line:title:severity)`.
+  - İnceleme yorumu oluşturulurken her bulgunun altına gizli bir HTML parmak izi etiketi gömer (`<!-- pr-review-go:fingerprint=... -->`).
+  - PR yeniden incelendiğinde mevcut yorumlardaki tüm parmak izlerini tarar ve daha önce raporlanmış mükerrer bulguları filtreler.
+
+### H. Otomatik Dokümantasyon Üretici (`/add_docs`, `pkg/docgen`)
+- **Tetikleyici:** Yoruma `/add_docs` veya `/docs` yazıldığında ya da CLI `-add-docs` bayrağıyla.
+- **Mantık:**
+  - Go AST parser (`go/parser`, `go/ast`) kullanarak PR kodundaki üst düzey fonksiyon ve tip tanımlarını tarar.
+  - Öncesinde doc comment (`d.Doc == nil`) bulunmayan tanımları listeler ve standart godoc şablonu üretip PR'a raporlar.
+
+### I. Hız Seviyeleri: Lite vs Balanced (`pkg/config`, `pkg/reviewer`)
+- **`lite` Modu:** Hızlı diff ve meta veri tabanlı inceleme; sandbox klonlama ve test koşumunu atlayarak saniyeler içinde review üretir.
+- **`balanced` Modu (Varsayılan):** Kodu sandbox ortamına çekip derleyicileri ve testleri çalıştıran tam güvenilir derin analiz.
+
 ---
 
 ## 3. Yol Haritası ve Eklenecek Özellikler
