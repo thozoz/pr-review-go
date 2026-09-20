@@ -6,9 +6,12 @@ Inspired by GitHub Copilot's agentic architecture and PR-Agent:
 1. **Live Sandbox Verification**: Clones PR branch into an isolated temporary workspace and executes real compilers (`go build`, `cargo check`) and unit tests (`go test`, `npm test`, `pytest`) to eliminate hallucinations and verify claims empirically.
 2. **Review Discussion & Thread Awareness**: Gathers existing PR comments and inline review discussions. Tracks whether previous review feedback was addressed in new commits and prevents repeating resolved debates.
 3. **Discussion Summarizer (`/summarize`)**: Instantly compiles all PR comments, debates, and reviewer feedback into an executive summary table (zero sandbox overhead).
-4. **Interactive PR Assistant (`@bot` / `/ask`)**: Allows developers to mention `@bot` in comments with instructions like *"run tests in pkg/auth"* or *"read server.go line 40"*. The agent iteratively uses tools (`read_file`, `list_files`, `run_command`) in the sandbox to answer.
-5. **Auto-Labeler (`/labels`)**: Context-aware categorization using PR title, description, and diff.
-6. **Daemonless & Lightweight**: Consumes only ~10-15 MB RAM as a daemon.
+4. **Interactive PR Assistant (`@bot` / `/ask`)**: Allows developers to mention `@bot` in comments with instructions like *"run tests in pkg/auth"* or *"read server.go line 40"*. The agent iteratively uses tools (`read_file`, `write_file`, `list_files`, `run_command`, `commit_and_push`) in the sandbox to answer.
+5. **SHA-256 Yorum Deduplication (`pkg/dedup`)**: Prevents duplicate spam findings across multiple `/review` runs on the same PR using deterministic SHA-256 fingerprinting.
+6. **Automatic Documentation Generator (`/add_docs`, `pkg/docgen`)**: Scans PR code for undocumented functions/types and reports or generates godoc comments.
+7. **Effort Levels (`lite` vs `balanced`)**: Choose between fast diff-only inspection (`-effort lite`) and full sandbox-verified deep review (`-effort balanced`).
+8. **Auto-Labeler (`/labels`)**: Context-aware categorization using PR title, description, and diff.
+9. **Daemonless & Lightweight**: Consumes only ~10-15 MB RAM as a daemon.
 
 ## Architecture
 

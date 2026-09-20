@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/dedup"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
@@ -98,6 +99,29 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 		return nil, fmt.Errorf("failed to parse review response: %w, raw: %s", err, rawResponse)
 	}
 
+	// 8. Deduplicate findings against previous comments on PR
+	var allCommentBodies []string
+	for _, c := range generalComments {
+		allCommentBodies = append(allCommentBodies, c.Body)
+	}
+	for _, th := range threads {
+		for _, tc := range th.Comments {
+			allCommentBodies = append(allCommentBodies, tc.Body)
+		}
+	}
+	existingFPs := dedup.ExtractFingerprints(allCommentBodies)
+
+	var uniqueFindings []Finding
+	skippedCount := 0
+	for _, f := range parsed.Findings {
+		fp := dedup.ComputeFingerprint(f.File, f.Line, f.Title, f.Severity)
+		if existingFPs[fp] {
+			skippedCount++
+			continue
+		}
+		uniqueFindings = append(uniqueFindings, f)
+	}
+
 	report := &ReviewReport{
 		PRNumber:            number,
 		PRTitle:             pr.Title,
@@ -105,8 +129,9 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 		Summary:             parsed.Summary,
 		VerificationSummary: verificationSummary,
 		RulesSource:         rulesSource,
+		DeduplicatedCount:   skippedCount,
 		CommentFollowups:    parsed.CommentFollowups,
-		Findings:            parsed.Findings,
+		Findings:            uniqueFindings,
 	}
 
 	report.RawMarkdown = FormatReportMarkdown(report)
@@ -264,9 +289,16 @@ func FormatReportMarkdown(r *ReviewReport) string {
 	}
 
 	if len(r.Findings) == 0 {
-		sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected. Looks ready to merge!\n")
+		if r.DeduplicatedCount > 0 {
+			sb.WriteString(fmt.Sprintf("### 🎯 Findings\nAll %d detected issues were already reported previously and have been deduplicated.\n\n", r.DeduplicatedCount))
+		} else {
+			sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected. Looks ready to merge!\n\n")
+		}
 	} else {
 		sb.WriteString("### 🎯 Findings\n")
+		if r.DeduplicatedCount > 0 {
+			sb.WriteString(fmt.Sprintf("ℹ️ *%d duplicate findings previously reported were filtered out.*\n\n", r.DeduplicatedCount))
+		}
 		for _, f := range r.Findings {
 			sevIcon := "⚠️"
 			if f.Severity == "CRITICAL" {
@@ -275,7 +307,9 @@ func FormatReportMarkdown(r *ReviewReport) string {
 				sevIcon = "💡"
 			}
 
+			fp := dedup.ComputeFingerprint(f.File, f.Line, f.Title, f.Severity)
 			sb.WriteString(fmt.Sprintf("#### %s [%s] %s (`%s:%d`)\n", sevIcon, f.Severity, f.Title, f.File, f.Line))
+			sb.WriteString(fmt.Sprintf("<!-- pr-review-go:fingerprint=%s -->\n", fp))
 			sb.WriteString(fmt.Sprintf("%s\n\n", f.Description))
 			if f.Suggestion != "" {
 				sb.WriteString(fmt.Sprintf("> **Suggestion:** %s\n\n", f.Suggestion))

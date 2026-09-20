@@ -7,6 +7,10 @@ import (
 )
 
 type Config struct {
+	// EffortLevel determines the speed/rigor of the review process.
+	// Accepted values are "lite" (fast, no sandbox) or "balanced" (default, with sandbox verification).
+	EffortLevel string `json:"effort_level"` // lite or balanced
+
 	GitHubToken   string
 	WebhookSecret string
 	Port          int
@@ -16,8 +20,16 @@ type Config struct {
 	EnableSandbox bool
 }
 
-// Validate checks if required configuration is present
+// Validate checks if required configuration is present and validates EffortLevel
 func (c *Config) Validate() error {
+	// Set default EffortLevel if empty
+	if c.EffortLevel == "" {
+		c.EffortLevel = "balanced"
+	}
+	if c.EffortLevel != "lite" && c.EffortLevel != "balanced" {
+		return fmt.Errorf("invalid EffortLevel: %s (must be 'lite' or 'balanced')", c.EffortLevel)
+	}
+
 	if c.GitHubToken == "" {
 		return fmt.Errorf("GITHUB_TOKEN or GH_TOKEN is required")
 	}
@@ -66,6 +78,16 @@ func Load() *Config {
 		llmModel = "gpt-4o"
 	}
 
+	// Determine effort level and sandbox enablement
+	effort := os.Getenv("EFFORT_LEVEL")
+	if effort == "" {
+		effort = "balanced"
+	}
+	enableSandbox := true
+	if effort == "lite" {
+		enableSandbox = false
+	}
+
 	return &Config{
 		GitHubToken:   token,
 		WebhookSecret: webhookSecret,
@@ -73,6 +95,7 @@ func Load() *Config {
 		LLMBaseURL:    llmBaseURL,
 		LLMAPIKey:     llmAPIKey,
 		LLMModel:      llmModel,
-		EnableSandbox: true,
+		EffortLevel:   effort,
+		EnableSandbox: enableSandbox,
 	}
 }
