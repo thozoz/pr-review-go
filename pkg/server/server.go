@@ -156,6 +156,9 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 	if strings.HasPrefix(body, "/review") {
 		log.Printf("[webhook] PR %s/%s #%d triggered review by comment: %s", owner, repo, prNum, body)
 		go s.dispatchReview(owner, repo, prNum)
+	} else if strings.HasPrefix(body, "/improve") {
+		log.Printf("[webhook] PR %s/%s #%d triggered improvements", owner, repo, prNum)
+		go s.dispatchImprove(owner, repo, prNum)
 	} else if strings.HasPrefix(body, "/generate_labels") || strings.HasPrefix(body, "/labels") {
 		log.Printf("[webhook] PR %s/%s #%d triggered label generation by comment: %s", owner, repo, prNum, body)
 		go s.dispatchLabels(owner, repo, prNum)
@@ -172,6 +175,26 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 		log.Printf("[webhook] PR %s/%s #%d triggered interactive assistant: %s", owner, repo, prNum, question)
 		go s.dispatchAssistant(owner, repo, prNum, question)
 	}
+}
+
+func (s *Server) dispatchImprove(owner, repo string, prNum int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	report, err := s.engine.ReviewPR(ctx, owner, repo, prNum)
+	if err != nil {
+		log.Printf("[improve] Review failed for %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+	if len(report.Suggestions) == 0 {
+		log.Printf("[improve] No safe one-click suggestions for %s/%s #%d", owner, repo, prNum)
+		return
+	}
+	if err := s.gh.PostSuggestions(ctx, owner, repo, prNum, report.HeadSHA, report.Suggestions); err != nil {
+		log.Printf("[improve] Failed posting suggestions for %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+	log.Printf("[improve] Posted %d suggestions to %s/%s #%d", len(report.Suggestions), owner, repo, prNum)
 }
 
 func (s *Server) dispatchSummary(owner, repo string, prNum int) {

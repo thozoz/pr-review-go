@@ -13,6 +13,13 @@ type Client struct {
 	gh *github.Client
 }
 
+// InlineSuggestion is a one-click replacement attached to a changed PR line.
+type InlineSuggestion struct {
+	Path string
+	Line int
+	Body string
+}
+
 func NewClient(token string) *Client {
 	if token == "" {
 		return &Client{gh: github.NewClient(nil)}
@@ -46,14 +53,14 @@ func ParsePRURL(prURL string) (owner string, repo string, number int, err error)
 	if idx := strings.Index(prURL, "?"); idx != -1 {
 		prURL = prURL[:idx]
 	}
-	
+
 	// Remove trailing slash
 	prURL = strings.TrimSuffix(prURL, "/")
-	
+
 	// Remove protocol and domain
 	trimmed := strings.TrimPrefix(prURL, "https://github.com/")
 	trimmed = strings.TrimPrefix(trimmed, "http://github.com/")
-	
+
 	parts := strings.Split(trimmed, "/")
 	if len(parts) < 4 || parts[2] != "pull" {
 		return "", "", 0, fmt.Errorf("invalid PR URL format: %s (expected https://github.com/owner/repo/pull/number)", prURL)
@@ -161,7 +168,7 @@ func (c *Client) GetComments(ctx context.Context, owner, repo string, number int
 		if comm.InReplyToID == 0 {
 			key = fmt.Sprintf("%s:%d", comm.Path, comm.Line)
 		}
-		
+
 		if thread, exists := threadMap[key]; exists {
 			thread.Comments = append(thread.Comments, comm)
 		} else {
@@ -185,6 +192,31 @@ func (c *Client) GetComments(ctx context.Context, owner, repo string, number int
 func (c *Client) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
 	_, _, err := c.gh.Issues.CreateComment(ctx, owner, repo, number, &github.IssueComment{
 		Body: github.Ptr(body),
+	})
+	return err
+}
+
+// PostSuggestions creates one COMMENT review containing inline GitHub suggestion blocks.
+func (c *Client) PostSuggestions(ctx context.Context, owner, repo string, number int, commitSHA string, suggestions []InlineSuggestion) error {
+	if len(suggestions) == 0 {
+		return nil
+	}
+
+	comments := make([]*github.DraftReviewComment, 0, len(suggestions))
+	for _, suggestion := range suggestions {
+		comments = append(comments, &github.DraftReviewComment{
+			Path: github.Ptr(suggestion.Path),
+			Line: github.Ptr(suggestion.Line),
+			Side: github.Ptr("RIGHT"),
+			Body: github.Ptr(suggestion.Body),
+		})
+	}
+
+	_, _, err := c.gh.PullRequests.CreateReview(ctx, owner, repo, number, &github.PullRequestReviewRequest{
+		CommitID: github.Ptr(commitSHA),
+		Event:    github.Ptr("COMMENT"),
+		Body:     github.Ptr("## 🤖 PR Improvement Suggestions\n\nOne-click fixes for changed lines in a sandbox-verified PR."),
+		Comments: comments,
 	})
 	return err
 }
