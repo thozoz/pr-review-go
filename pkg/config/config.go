@@ -21,7 +21,9 @@ type Config struct {
 	EnableSandbox bool
 	// AutoActions run when a PR opens. Nil uses the backward-compatible default:
 	// review,labels. An empty slice disables all automatic actions.
-	AutoActions []string
+	AutoActions         []string
+	GitHubAppSetupToken string
+	PublicURL           string
 }
 
 // Validate checks if required configuration is present and validates EffortLevel
@@ -35,6 +37,12 @@ func (c *Config) Validate() error {
 	}
 	if c.AutoActions == nil {
 		c.AutoActions = []string{"review", "labels"}
+	}
+	if c.GitHubAppSetupToken != "" {
+		if c.PublicURL == "" {
+			return fmt.Errorf("PUBLIC_URL is required when GITHUB_APP_SETUP_TOKEN is set")
+		}
+		return nil
 	}
 	for _, action := range c.AutoActions {
 		switch action {
@@ -59,6 +67,8 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+func (c *Config) IsGitHubAppSetupMode() bool { return c.GitHubAppSetupToken != "" }
+
 func (c *Config) AutoActionEnabled(action string) bool {
 	for _, configured := range c.AutoActions {
 		if configured == action {
@@ -78,6 +88,8 @@ func Load() *Config {
 	if webhookSecret == "" {
 		webhookSecret = os.Getenv("GITHUB_WEBHOOK_SECRET")
 	}
+	setupToken := os.Getenv("GITHUB_APP_SETUP_TOKEN")
+	publicURL := strings.TrimRight(os.Getenv("PUBLIC_URL"), "/")
 
 	port := 3000
 	if portStr := os.Getenv("PORT"); portStr != "" {
@@ -123,14 +135,16 @@ func Load() *Config {
 	}
 
 	return &Config{
-		GitHubToken:   token,
-		WebhookSecret: webhookSecret,
-		Port:          port,
-		LLMBaseURL:    llmBaseURL,
-		LLMAPIKey:     llmAPIKey,
-		LLMModel:      llmModel,
-		EffortLevel:   effort,
-		EnableSandbox: enableSandbox,
-		AutoActions:   autoActions,
+		GitHubToken:         token,
+		WebhookSecret:       webhookSecret,
+		Port:                port,
+		LLMBaseURL:          llmBaseURL,
+		LLMAPIKey:           llmAPIKey,
+		LLMModel:            llmModel,
+		EffortLevel:         effort,
+		EnableSandbox:       enableSandbox,
+		AutoActions:         autoActions,
+		GitHubAppSetupToken: setupToken,
+		PublicURL:           publicURL,
 	}
 }

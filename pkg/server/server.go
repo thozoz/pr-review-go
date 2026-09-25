@@ -52,6 +52,11 @@ func NewServer(cfg *config.Config) *Server {
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
+	if s.cfg.IsGitHubAppSetupMode() {
+		mux.HandleFunc("GET /setup/github-app", s.handleGitHubAppSetup)
+		mux.HandleFunc("GET /setup/github-app/callback", s.handleGitHubAppCallback)
+		return mux
+	}
 
 	// Health check
 	mux.HandleFunc("GET /", s.handleHealth)
