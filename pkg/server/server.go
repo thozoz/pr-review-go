@@ -13,6 +13,7 @@ import (
 	"github.com/google/go-github/v68/github"
 	"github.com/thozoz/pr-review-go/pkg/assistant"
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/describer"
 	"github.com/thozoz/pr-review-go/pkg/docgen"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/labeler"
@@ -27,6 +28,7 @@ type Server struct {
 	labeler    *labeler.Labeler
 	summarizer *summarizer.Summarizer
 	assistant  *assistant.Assistant
+	describer  *describer.Describer
 	gh         *ghclient.Client
 }
 
@@ -40,6 +42,7 @@ func NewServer(cfg *config.Config) *Server {
 		labeler:    labeler.NewLabeler(cfg),
 		summarizer: summarizer.NewSummarizer(cfg),
 		assistant:  assistant.NewAssistant(cfg),
+		describer:  describer.NewDescriber(cfg),
 		gh:         ghclient.NewClient(cfg.GitHubToken),
 	}
 }
@@ -128,6 +131,9 @@ func (s *Server) handlePullRequestEvent(e *github.PullRequestEvent) {
 	// If freshly opened, automatically generate labels as well
 	if action == "opened" {
 		go s.dispatchLabels(owner, repo, prNum)
+		if strings.TrimSpace(e.GetPullRequest().GetBody()) == "" {
+			go s.dispatchDescribe(owner, repo, prNum)
+		}
 	}
 
 	// Run review asynchronously in background goroutine
@@ -159,6 +165,9 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 	} else if strings.HasPrefix(body, "/improve") {
 		log.Printf("[webhook] PR %s/%s #%d triggered improvements", owner, repo, prNum)
 		go s.dispatchImprove(owner, repo, prNum)
+	} else if strings.HasPrefix(body, "/describe") {
+		log.Printf("[webhook] PR %s/%s #%d triggered description generation", owner, repo, prNum)
+		go s.dispatchDescribe(owner, repo, prNum)
 	} else if strings.HasPrefix(body, "/generate_labels") || strings.HasPrefix(body, "/labels") {
 		log.Printf("[webhook] PR %s/%s #%d triggered label generation by comment: %s", owner, repo, prNum, body)
 		go s.dispatchLabels(owner, repo, prNum)
@@ -174,6 +183,20 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 		question = strings.TrimSpace(strings.TrimPrefix(question, "/ask"))
 		log.Printf("[webhook] PR %s/%s #%d triggered interactive assistant: %s", owner, repo, prNum, question)
 		go s.dispatchAssistant(owner, repo, prNum, question)
+	}
+}
+
+func (s *Server) dispatchDescribe(owner, repo string, prNum int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	updated, err := s.describer.RunAndUpdate(ctx, owner, repo, prNum)
+	if err != nil {
+		log.Printf("[describer] Failed for %s/%s #%d: %v", owner, repo, prNum, err)
+		return
+	}
+	if updated {
+		log.Printf("[describer] Updated PR body for %s/%s #%d", owner, repo, prNum)
 	}
 }
 

@@ -196,6 +196,12 @@ func (c *Client) PostComment(ctx context.Context, owner, repo string, number int
 	return err
 }
 
+// UpdatePRBody replaces only the PR description, not its title or other metadata.
+func (c *Client) UpdatePRBody(ctx context.Context, owner, repo string, number int, body string) error {
+	_, _, err := c.gh.PullRequests.Edit(ctx, owner, repo, number, &github.PullRequest{Body: github.Ptr(body)})
+	return err
+}
+
 // PostSuggestions creates one COMMENT review containing inline GitHub suggestion blocks.
 func (c *Client) PostSuggestions(ctx context.Context, owner, repo string, number int, commitSHA string, suggestions []InlineSuggestion) error {
 	if len(suggestions) == 0 {
