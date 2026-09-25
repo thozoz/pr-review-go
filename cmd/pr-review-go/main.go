@@ -171,7 +171,7 @@ func main() {
 
 	if *addDocs {
 		fmt.Printf("📝 Scanning for undocumented declarations in %s/%s #%d...\n", owner, repo, num)
-		ghClient := github.NewClient(cfg.GitHubToken)
+		ghClient := github.NewClientFromConfig(cfg)
 		pr, err := ghClient.GetPR(ctx, owner, repo, num)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to fetch PR: %v\n", err)
@@ -234,7 +234,7 @@ func main() {
 			fmt.Println("No safe one-click suggestions found.")
 			return
 		}
-		ghClient := github.NewClient(cfg.GitHubToken)
+		ghClient := github.NewClientFromConfig(cfg)
 		if err := ghClient.PostSuggestions(ctx, owner, repo, num, report.HeadSHA, report.Suggestions); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to post suggestions: %v\n", err)
 			os.Exit(1)
@@ -244,7 +244,7 @@ func main() {
 	}
 
 	if *postComment {
-		ghClient := github.NewClient(cfg.GitHubToken)
+		ghClient := github.NewClientFromConfig(cfg)
 		fmt.Printf("💬 Posting review comment to GitHub...\n")
 		if err := ghClient.PostComment(ctx, owner, repo, num, report.RawMarkdown); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to post comment to GitHub: %v\n", err)

@@ -27,7 +27,7 @@ type Assistant struct {
 func NewAssistant(cfg *config.Config) *Assistant {
 	return &Assistant{
 		cfg:     cfg,
-		gh:      github.NewClient(cfg.GitHubToken),
+		gh:      github.NewClientFromConfig(cfg),
 		sandbox: sandbox.NewRunner(2 * time.Minute),
 		llm:     llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}

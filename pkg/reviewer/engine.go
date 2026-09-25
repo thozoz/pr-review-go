@@ -27,7 +27,7 @@ func NewEngine(cfg *config.Config) *Engine {
 	}
 	return &Engine{
 		cfg:     cfg,
-		gh:      github.NewClient(cfg.GitHubToken),
+		gh:      github.NewClientFromConfig(cfg),
 		sandbox: sandbox.NewRunner(0),
 		llm:     llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
