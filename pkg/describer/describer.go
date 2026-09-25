@@ -22,7 +22,7 @@ func NewDescriber(cfg *config.Config) *Describer {
 		panic(fmt.Sprintf("invalid config: %v", err))
 	}
 	return &Describer{
-		gh:  github.NewClient(cfg.GitHubToken),
+		gh:  github.NewClientFromConfig(cfg),
 		llm: llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
 }

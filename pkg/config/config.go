@@ -21,9 +21,11 @@ type Config struct {
 	EnableSandbox bool
 	// AutoActions run when a PR opens. Nil uses the backward-compatible default:
 	// review,labels. An empty slice disables all automatic actions.
-	AutoActions         []string
-	GitHubAppSetupToken string
-	PublicURL           string
+	AutoActions             []string
+	GitHubAppSetupToken     string
+	PublicURL               string
+	GitHubAppID             int64
+	GitHubAppPrivateKeyPath string
 }
 
 // Validate checks if required configuration is present and validates EffortLevel
@@ -52,6 +54,12 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if c.GitHubAppID != 0 || c.GitHubAppPrivateKeyPath != "" {
+		if c.GitHubAppID == 0 || c.GitHubAppPrivateKeyPath == "" {
+			return fmt.Errorf("GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH must be set together")
+		}
+		return nil
+	}
 	if c.GitHubToken == "" {
 		return fmt.Errorf("GITHUB_TOKEN or GH_TOKEN is required")
 	}
@@ -90,6 +98,7 @@ func Load() *Config {
 	}
 	setupToken := os.Getenv("GITHUB_APP_SETUP_TOKEN")
 	publicURL := strings.TrimRight(os.Getenv("PUBLIC_URL"), "/")
+	appID, _ := strconv.ParseInt(os.Getenv("GITHUB_APP_ID"), 10, 64)
 
 	port := 3000
 	if portStr := os.Getenv("PORT"); portStr != "" {
@@ -135,16 +144,18 @@ func Load() *Config {
 	}
 
 	return &Config{
-		GitHubToken:         token,
-		WebhookSecret:       webhookSecret,
-		Port:                port,
-		LLMBaseURL:          llmBaseURL,
-		LLMAPIKey:           llmAPIKey,
-		LLMModel:            llmModel,
-		EffortLevel:         effort,
-		EnableSandbox:       enableSandbox,
-		AutoActions:         autoActions,
-		GitHubAppSetupToken: setupToken,
-		PublicURL:           publicURL,
+		GitHubToken:             token,
+		WebhookSecret:           webhookSecret,
+		Port:                    port,
+		LLMBaseURL:              llmBaseURL,
+		LLMAPIKey:               llmAPIKey,
+		LLMModel:                llmModel,
+		EffortLevel:             effort,
+		EnableSandbox:           enableSandbox,
+		AutoActions:             autoActions,
+		GitHubAppSetupToken:     setupToken,
+		PublicURL:               publicURL,
+		GitHubAppID:             appID,
+		GitHubAppPrivateKeyPath: os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
 	}
 }

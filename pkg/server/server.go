@@ -46,7 +46,7 @@ func NewServer(cfg *config.Config) *Server {
 		assistant:  assistant.NewAssistant(cfg),
 		describer:  describer.NewDescriber(cfg),
 		changelog:  changelog.NewUpdater(cfg),
-		gh:         ghclient.NewClient(cfg.GitHubToken),
+		gh:         ghclient.NewClientFromConfig(cfg),
 	}
 }
 
