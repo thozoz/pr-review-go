@@ -10,6 +10,7 @@ import (
 
 	"github.com/thozoz/pr-review-go/pkg/assistant"
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/describer"
 	"github.com/thozoz/pr-review-go/pkg/docgen"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/labeler"
@@ -29,6 +30,7 @@ func main() {
 	onlySummary := flag.Bool("summary", false, "Summarize PR discussions and reviews instead of code review")
 	askQuestion := flag.String("ask", "", "Ask the interactive PR assistant a question or give an execution command")
 	addDocs := flag.Bool("add-docs", false, "Scan PR files for undocumented items and report missing docstrings")
+	describe := flag.Bool("describe", false, "Generate and append a professional PR description")
 	improve := flag.Bool("improve", false, "Post safe one-click GitHub suggestion blocks for the PR")
 	effortFlag := flag.String("effort", "", "Review effort level: 'lite' (fast, diff-only) or 'balanced' (default, sandbox)")
 	noSandbox := flag.Bool("no-sandbox", false, "Disable local runner sandbox verification")
@@ -93,6 +95,20 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	if *describe {
+		updated, err := describer.NewDescriber(cfg).RunAndUpdate(ctx, owner, repo, num)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Description generation failed: %v\n", err)
+			os.Exit(1)
+		}
+		if updated {
+			fmt.Println("✅ PR description updated.")
+		} else {
+			fmt.Println("PR already has a generated description section.")
+		}
+		return
+	}
 
 	if *onlyLabels {
 		fmt.Printf("🏷️ Generating labels for %s/%s #%d...\n", owner, repo, num)

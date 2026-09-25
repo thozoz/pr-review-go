@@ -61,6 +61,9 @@ export LLM_MODEL="gpt-4o"
 
 # Post safe, inline one-click GitHub suggestions
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -improve
+
+# Append an AI-generated purpose and file walkthrough to the PR body
+./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -describe
 ```
 
 ### 3. 7/24 Webhook Daemon Mode (GitHub App / Webhook)
@@ -76,6 +79,7 @@ When running in server mode, incoming webhook triggers:
 - `pull_request`: `synchronize` -> incremental review
 - Comment `/review` -> triggers full sandbox review
 - Comment `/improve` -> posts safe inline GitHub suggestion blocks
+- Comment `/describe` -> appends a purpose and file walkthrough to PR body
 - Comment `/summarize` or `/summary` -> triggers discussion summary
 - Comment `/labels` or `/generate_labels` -> triggers label generation
 - Comment `@bot <task>`, `@pr-review <task>`, or `/ask <task>` -> launches interactive sandbox assistant
