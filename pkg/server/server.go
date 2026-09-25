@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/go-github/v68/github"
 	"github.com/thozoz/pr-review-go/pkg/assistant"
+	"github.com/thozoz/pr-review-go/pkg/changelog"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/describer"
 	"github.com/thozoz/pr-review-go/pkg/docgen"
@@ -29,6 +30,7 @@ type Server struct {
 	summarizer *summarizer.Summarizer
 	assistant  *assistant.Assistant
 	describer  *describer.Describer
+	changelog  *changelog.Updater
 	gh         *ghclient.Client
 }
 
@@ -43,6 +45,7 @@ func NewServer(cfg *config.Config) *Server {
 		summarizer: summarizer.NewSummarizer(cfg),
 		assistant:  assistant.NewAssistant(cfg),
 		describer:  describer.NewDescriber(cfg),
+		changelog:  changelog.NewUpdater(cfg),
 		gh:         ghclient.NewClient(cfg.GitHubToken),
 	}
 }
@@ -179,6 +182,9 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 	} else if strings.HasPrefix(body, "/describe") {
 		log.Printf("[webhook] PR %s/%s #%d triggered description generation", owner, repo, prNum)
 		go s.dispatchDescribe(owner, repo, prNum)
+	} else if strings.HasPrefix(body, "/update_changelog") {
+		log.Printf("[webhook] PR %s/%s #%d triggered changelog update", owner, repo, prNum)
+		go s.dispatchChangelog(owner, repo, prNum)
 	} else if strings.HasPrefix(body, "/generate_labels") || strings.HasPrefix(body, "/labels") {
 		log.Printf("[webhook] PR %s/%s #%d triggered label generation by comment: %s", owner, repo, prNum, body)
 		go s.dispatchLabels(owner, repo, prNum)
@@ -194,6 +200,14 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 		question = strings.TrimSpace(strings.TrimPrefix(question, "/ask"))
 		log.Printf("[webhook] PR %s/%s #%d triggered interactive assistant: %s", owner, repo, prNum, question)
 		go s.dispatchAssistant(owner, repo, prNum, question)
+	}
+}
+
+func (s *Server) dispatchChangelog(owner, repo string, prNum int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := s.changelog.RunAndPost(ctx, owner, repo, prNum); err != nil {
+		log.Printf("[changelog] Failed for %s/%s #%d: %v", owner, repo, prNum, err)
 	}
 }
 

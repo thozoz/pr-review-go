@@ -68,6 +68,9 @@ export AUTO_ACTIONS="review,labels,describe"
 
 # Append an AI-generated purpose and file walkthrough to the PR body
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -describe
+
+# Add and commit one Keep a Changelog entry (skips author edits)
+./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -update-changelog
 ```
 
 ### 3. 7/24 Webhook Daemon Mode (GitHub App / Webhook)
@@ -84,6 +87,7 @@ When running in server mode, incoming webhook triggers:
 - Comment `/review` -> triggers full sandbox review
 - Comment `/improve` -> posts safe inline GitHub suggestion blocks
 - Comment `/describe` -> appends a purpose and file walkthrough to PR body
+- Comment `/update_changelog` -> commits one changelog entry when author has not edited it
 
 `AUTO_ACTIONS` accepts `review`, `labels`, `describe`, and `improve`. Set it empty
 to disable automatic actions. `review` also runs on later PR updates when selected;
