@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/thozoz/pr-review-go/pkg/assistant"
+	"github.com/thozoz/pr-review-go/pkg/changelog"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/describer"
 	"github.com/thozoz/pr-review-go/pkg/docgen"
@@ -31,6 +32,7 @@ func main() {
 	askQuestion := flag.String("ask", "", "Ask the interactive PR assistant a question or give an execution command")
 	addDocs := flag.Bool("add-docs", false, "Scan PR files for undocumented items and report missing docstrings")
 	describe := flag.Bool("describe", false, "Generate and append a professional PR description")
+	updateChangelog := flag.Bool("update-changelog", false, "Generate and commit a Keep a Changelog entry")
 	improve := flag.Bool("improve", false, "Post safe one-click GitHub suggestion blocks for the PR")
 	effortFlag := flag.String("effort", "", "Review effort level: 'lite' (fast, diff-only) or 'balanced' (default, sandbox)")
 	noSandbox := flag.Bool("no-sandbox", false, "Disable local runner sandbox verification")
@@ -95,6 +97,15 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	if *updateChangelog {
+		if err := changelog.NewUpdater(cfg).RunAndPost(ctx, owner, repo, num); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Changelog update failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("✅ Changelog command completed.")
+		return
+	}
 
 	if *describe {
 		updated, err := describer.NewDescriber(cfg).RunAndUpdate(ctx, owner, repo, num)

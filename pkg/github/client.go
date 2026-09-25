@@ -20,6 +20,11 @@ type InlineSuggestion struct {
 	Body string
 }
 
+type FileContent struct {
+	Content string
+	SHA     string
+}
+
 func NewClient(token string) *Client {
 	if token == "" {
 		return &Client{gh: github.NewClient(nil)}
@@ -200,6 +205,32 @@ func (c *Client) PostComment(ctx context.Context, owner, repo string, number int
 func (c *Client) UpdatePRBody(ctx context.Context, owner, repo string, number int, body string) error {
 	_, _, err := c.gh.PullRequests.Edit(ctx, owner, repo, number, &github.PullRequest{Body: github.Ptr(body)})
 	return err
+}
+
+func (c *Client) GetFileContent(ctx context.Context, owner, repo, path, ref string) (*FileContent, error) {
+	file, _, _, err := c.gh.Repositories.GetContents(ctx, owner, repo, path, &github.RepositoryContentGetOptions{Ref: ref})
+	if err != nil {
+		return nil, err
+	}
+	content, err := file.GetContent()
+	if err != nil {
+		return nil, err
+	}
+	return &FileContent{Content: content, SHA: file.GetSHA()}, nil
+}
+
+// UpdateFile creates one commit on branch containing only path.
+func (c *Client) UpdateFile(ctx context.Context, owner, repo, path, branch, sha, content, message string) (string, error) {
+	result, _, err := c.gh.Repositories.UpdateFile(ctx, owner, repo, path, &github.RepositoryContentFileOptions{
+		Message: github.Ptr(message),
+		Content: []byte(content),
+		SHA:     github.Ptr(sha),
+		Branch:  github.Ptr(branch),
+	})
+	if err != nil {
+		return "", err
+	}
+	return result.Commit.GetSHA(), nil
 }
 
 // PostSuggestions creates one COMMENT review containing inline GitHub suggestion blocks.
