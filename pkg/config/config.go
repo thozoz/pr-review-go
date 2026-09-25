@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -18,6 +19,9 @@ type Config struct {
 	LLMAPIKey     string
 	LLMModel      string
 	EnableSandbox bool
+	// AutoActions run when a PR opens. Nil uses the backward-compatible default:
+	// review,labels. An empty slice disables all automatic actions.
+	AutoActions []string
 }
 
 // Validate checks if required configuration is present and validates EffortLevel
@@ -28,6 +32,16 @@ func (c *Config) Validate() error {
 	}
 	if c.EffortLevel != "lite" && c.EffortLevel != "balanced" {
 		return fmt.Errorf("invalid EffortLevel: %s (must be 'lite' or 'balanced')", c.EffortLevel)
+	}
+	if c.AutoActions == nil {
+		c.AutoActions = []string{"review", "labels"}
+	}
+	for _, action := range c.AutoActions {
+		switch action {
+		case "review", "labels", "describe", "improve":
+		default:
+			return fmt.Errorf("invalid AUTO_ACTIONS value: %s", action)
+		}
 	}
 
 	if c.GitHubToken == "" {
@@ -43,6 +57,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("LLM_BASE_URL is required")
 	}
 	return nil
+}
+
+func (c *Config) AutoActionEnabled(action string) bool {
+	for _, configured := range c.AutoActions {
+		if configured == action {
+			return true
+		}
+	}
+	return false
 }
 
 func Load() *Config {
@@ -88,6 +111,17 @@ func Load() *Config {
 		enableSandbox = false
 	}
 
+	var autoActions []string
+	if raw, set := os.LookupEnv("AUTO_ACTIONS"); set {
+		autoActions = []string{}
+		for _, action := range strings.Split(raw, ",") {
+			action = strings.TrimSpace(strings.ToLower(action))
+			if action != "" {
+				autoActions = append(autoActions, action)
+			}
+		}
+	}
+
 	return &Config{
 		GitHubToken:   token,
 		WebhookSecret: webhookSecret,
@@ -97,5 +131,6 @@ func Load() *Config {
 		LLMModel:      llmModel,
 		EffortLevel:   effort,
 		EnableSandbox: enableSandbox,
+		AutoActions:   autoActions,
 	}
 }

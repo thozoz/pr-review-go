@@ -47,6 +47,10 @@ export LLM_BASE_URL="https://api.openai.com/v1"
 export LLM_API_KEY="your_api_key_here"
 export LLM_MODEL="gpt-4o"
 
+# Choose actions that run automatically when a PR opens.
+# Omit AUTO_ACTIONS for the default: review,labels.
+export AUTO_ACTIONS="review,labels,describe"
+
 # Review a pull request directly
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42
 
@@ -80,6 +84,10 @@ When running in server mode, incoming webhook triggers:
 - Comment `/review` -> triggers full sandbox review
 - Comment `/improve` -> posts safe inline GitHub suggestion blocks
 - Comment `/describe` -> appends a purpose and file walkthrough to PR body
+
+`AUTO_ACTIONS` accepts `review`, `labels`, `describe`, and `improve`. Set it empty
+to disable automatic actions. `review` also runs on later PR updates when selected;
+other automatic actions run only when the PR opens. All commands remain manual.
 - Comment `/summarize` or `/summary` -> triggers discussion summary
 - Comment `/labels` or `/generate_labels` -> triggers label generation
 - Comment `@bot <task>`, `@pr-review <task>`, or `/ask <task>` -> launches interactive sandbox assistant

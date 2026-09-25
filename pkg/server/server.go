@@ -128,16 +128,27 @@ func (s *Server) handlePullRequestEvent(e *github.PullRequestEvent) {
 
 	log.Printf("[webhook] PR %s/%s #%d triggered by action: %s", owner, repo, prNum, action)
 
-	// If freshly opened, automatically generate labels as well
+	// Configured actions run only when a PR first opens. Later pushes run review
+	// only, preventing description/label churn.
 	if action == "opened" {
-		go s.dispatchLabels(owner, repo, prNum)
-		if strings.TrimSpace(e.GetPullRequest().GetBody()) == "" {
+		if s.cfg.AutoActionEnabled("labels") {
+			go s.dispatchLabels(owner, repo, prNum)
+		}
+		if s.cfg.AutoActionEnabled("describe") && strings.TrimSpace(e.GetPullRequest().GetBody()) == "" {
 			go s.dispatchDescribe(owner, repo, prNum)
 		}
+		if s.cfg.AutoActionEnabled("improve") {
+			go s.dispatchImprove(owner, repo, prNum)
+		}
+		if s.cfg.AutoActionEnabled("review") {
+			go s.dispatchReview(owner, repo, prNum)
+		}
+		return
 	}
 
-	// Run review asynchronously in background goroutine
-	go s.dispatchReview(owner, repo, prNum)
+	if s.cfg.AutoActionEnabled("review") {
+		go s.dispatchReview(owner, repo, prNum)
+	}
 }
 
 func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
