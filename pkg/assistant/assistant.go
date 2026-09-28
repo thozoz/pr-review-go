@@ -3,7 +3,10 @@ package assistant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,18 +110,14 @@ GENERAL AGENT RULES:
 func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolCallRequest) string {
 	switch step.Action {
 	case "read_file":
-		target, err := resolveWorkspacePath(workDir, step.Path)
+		content, err := readWorkspaceFile(workDir, step.Path)
 		if err != nil {
+			if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+				return fmt.Sprintf("Error reading file: %v", err)
+			}
 			return fmt.Sprintf("Error: Access denied (%v).", err)
 		}
-		data, err := os.ReadFile(target)
-		if err != nil {
-			return fmt.Sprintf("Error reading file: %v", err)
-		}
-		if len(data) > 30000 {
-			return string(data[:30000]) + "\n...[file truncated, exceeded 30KB]..."
-		}
-		return string(data)
+		return content
 
 	case "write_file":
 		return "Error: write_file is disabled: the assistant is read-only and file modifications are not permitted."
@@ -128,22 +127,14 @@ func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolC
 		if p == "" {
 			p = "."
 		}
-		target, err := resolveWorkspacePath(workDir, p)
+		listing, err := listWorkspaceFiles(workDir, p)
 		if err != nil {
+			if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+				return fmt.Sprintf("Error listing files: %v", err)
+			}
 			return fmt.Sprintf("Error: Access denied (%v).", err)
 		}
-		var files []string
-		_ = filepath.Walk(target, func(walkedPath string, info os.FileInfo, err error) error {
-			if err != nil || len(files) > 100 {
-				return nil
-			}
-			rel, _ := filepath.Rel(workDir, walkedPath)
-			if rel != "." && !isGitPath(filepath.ToSlash(rel)) {
-				files = append(files, rel)
-			}
-			return nil
-		})
-		return strings.Join(files, "\n")
+		return listing
 
 	case "run_command":
 		return "Error: run_command is disabled: host command execution is not permitted without container isolation."
@@ -156,7 +147,21 @@ func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolC
 	}
 }
 
-func resolveWorkspacePath(workDir, userPath string) (string, error) {
+// readWorkspaceFile opens and reads a file strictly within workDir.
+// It uses os.OpenRoot to confine file operations to the workspace root,
+// preventing path traversal and symlink escapes outside the workspace.
+// Once opened, verifyFileHandle inspects the underlying open handle for
+// defense-in-depth, and contents are read directly from the descriptor.
+//
+// Limitations and atomicity note:
+// This approach substantially mitigates the check-then-open symlink swap window by reading
+// directly from the opened descriptor rather than re-resolving by string path. However, it does
+// NOT provide an absolute TOCTOU guarantee: on platforms without kernel-enforced atomic root
+// containment (such as Linux openat2 with RESOLVE_BENEATH), os.Root relies on component-by-component
+// traversal (using openat/O_NOFOLLOW on Unix and windows.Openat/O_NOFOLLOW_ANY on Windows).
+// Consequently, residual race windows remain if a concurrent hostile local process performs
+// high-frequency ancestor directory renames during path traversal.
+func readWorkspaceFile(workDir, userPath string) (string, error) {
 	if userPath == "" {
 		return "", fmt.Errorf("empty path")
 	}
@@ -169,91 +174,170 @@ func resolveWorkspacePath(workDir, userPath string) (string, error) {
 		canonicalWorkDir = evaled
 	}
 
-	cleanUserPath := filepath.Clean(userPath)
-	if filepath.IsAbs(cleanUserPath) || filepath.VolumeName(cleanUserPath) != "" {
+	// Lexical pre-checks
+	if strings.ContainsRune(userPath, 0) {
+		return "", fmt.Errorf("invalid path: contains null byte")
+	}
+	if filepath.IsAbs(userPath) || filepath.VolumeName(userPath) != "" ||
+		strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") {
 		return "", fmt.Errorf("absolute paths are not permitted")
 	}
 
-	target := filepath.Join(canonicalWorkDir, cleanUserPath)
-
-	// Lexical boundary check
-	lexRel, err := filepath.Rel(canonicalWorkDir, target)
-	if err != nil || lexRel == ".." || strings.HasPrefix(lexRel, ".."+string(filepath.Separator)) {
+	cleanRel := filepath.Clean(userPath)
+	slashRel := filepath.ToSlash(cleanRel)
+	if slashRel == "." {
+		return "", fmt.Errorf("cannot read directory as file")
+	}
+	if slashRel == ".." || strings.HasPrefix(slashRel, "../") {
 		return "", fmt.Errorf("path outside workspace")
 	}
-
-	// Block .git paths
-	if isGitPath(filepath.ToSlash(lexRel)) {
+	if isGitPath(slashRel) {
 		return "", fmt.Errorf(".git paths are restricted")
 	}
 
-	// Evaluate symlinks
-	fi, err := os.Lstat(target)
-	if err == nil {
-		// Target exists
-		resolved, err := filepath.EvalSymlinks(target)
-		if err != nil {
-			return "", fmt.Errorf("failed to resolve symlink: %w", err)
+	// Open workspace root for confined filesystem access
+	root, err := os.OpenRoot(canonicalWorkDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to open workspace: %w", err)
+	}
+	defer root.Close()
+
+	// Open file strictly relative to root
+	f, err := root.Open(cleanRel)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", err
 		}
-		rel, err := filepath.Rel(canonicalWorkDir, resolved)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		// Root escape, symlink loop, or permission error is an access denial
+		return "", fmt.Errorf("access denied (%w)", err)
+	}
+	defer f.Close()
+
+	// Verify opened file attributes
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("failed to stat file: %w", err)
+	}
+	if fi.IsDir() {
+		return "", fmt.Errorf("cannot read directory as file")
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("access denied: not a regular file")
+	}
+
+	// Post-open handle verification: query the OS kernel for the true target
+	// of the already-opened handle/descriptor to guarantee it is within canonicalWorkDir
+	// and does not point to restricted locations (e.g. .git).
+	if err := verifyFileHandle(f, canonicalWorkDir); err != nil {
+		return "", fmt.Errorf("access denied: %w", err)
+	}
+
+	// Read directly from the opened handle (limit to 30KB + 1 to detect truncation).
+	// This avoids any second path resolution (check-then-open TOCTOU).
+	const maxBytes = 30000
+	limited := io.LimitReader(f, maxBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return "", fmt.Errorf("error reading file: %w", err)
+	}
+
+	if len(data) > maxBytes {
+		return string(data[:maxBytes]) + "\n...[file truncated, exceeded 30KB]...", nil
+	}
+	return string(data), nil
+}
+
+// listWorkspaceFiles lists files strictly within workDir under userPath.
+func listWorkspaceFiles(workDir, userPath string) (string, error) {
+	canonicalWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspace: %w", err)
+	}
+	if evaled, err := filepath.EvalSymlinks(canonicalWorkDir); err == nil {
+		canonicalWorkDir = evaled
+	}
+
+	subPath := "."
+	if userPath != "" && userPath != "." {
+		if strings.ContainsRune(userPath, 0) {
+			return "", fmt.Errorf("invalid path: contains null byte")
+		}
+		if filepath.IsAbs(userPath) || filepath.VolumeName(userPath) != "" ||
+			strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") {
+			return "", fmt.Errorf("absolute paths are not permitted")
+		}
+		cleanRel := filepath.Clean(userPath)
+		slashRel := filepath.ToSlash(cleanRel)
+		if slashRel == ".." || strings.HasPrefix(slashRel, "../") {
 			return "", fmt.Errorf("path outside workspace")
 		}
-		if isGitPath(filepath.ToSlash(rel)) {
+		if isGitPath(slashRel) {
 			return "", fmt.Errorf(".git paths are restricted")
 		}
-		return resolved, nil
+		subPath = slashRel
 	}
 
-	// Target does not exist - verify if target itself is a broken symlink
-	if fi != nil && (fi.Mode()&os.ModeSymlink != 0) {
-		return "", fmt.Errorf("broken or inaccessible symlink")
+	root, err := os.OpenRoot(canonicalWorkDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to open workspace: %w", err)
 	}
+	defer root.Close()
 
-	// Find the lowest existing ancestor directory and verify it doesn't escape workspace
-	curr := target
-	var missingParts []string
-	for {
-		parent := filepath.Dir(curr)
-		missingParts = append([]string{filepath.Base(curr)}, missingParts...)
-		if parent == curr {
-			break
+	if subPath != "." {
+		fi, err := root.Stat(filepath.FromSlash(subPath))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", err
+			}
+			return "", fmt.Errorf("access denied (%w)", err)
 		}
-		if _, statErr := os.Lstat(parent); statErr == nil {
-			evalParent, evalErr := filepath.EvalSymlinks(parent)
-			if evalErr != nil {
-				return "", fmt.Errorf("failed to resolve parent directory: %w", evalErr)
-			}
-			rel, relErr := filepath.Rel(canonicalWorkDir, evalParent)
-			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				return "", fmt.Errorf("path outside workspace")
-			}
-			if isGitPath(filepath.ToSlash(rel)) {
-				return "", fmt.Errorf(".git paths are restricted")
-			}
-
-			resolved := evalParent
-			for _, part := range missingParts {
-				resolved = filepath.Join(resolved, part)
-			}
-
-			relFinal, relErr := filepath.Rel(canonicalWorkDir, resolved)
-			if relErr != nil || relFinal == ".." || strings.HasPrefix(relFinal, ".."+string(filepath.Separator)) {
-				return "", fmt.Errorf("path outside workspace")
-			}
-			if isGitPath(filepath.ToSlash(relFinal)) {
-				return "", fmt.Errorf(".git paths are restricted")
-			}
-			return resolved, nil
+		if !fi.IsDir() {
+			return filepath.FromSlash(subPath), nil
 		}
-		curr = parent
 	}
 
-	return "", fmt.Errorf("workspace directory does not exist")
+	fsys := root.FS()
+	var files []string
+	err = fs.WalkDir(fsys, subPath, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if path == subPath {
+				return walkErr
+			}
+			return nil
+		}
+		if len(files) > 100 {
+			return fs.SkipAll
+		}
+
+		slash := filepath.ToSlash(path)
+		if isGitPath(slash) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		if path != "." {
+			rel := filepath.FromSlash(path)
+			files = append(files, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(files, "\n"), nil
 }
 
 func isGitPath(slashRel string) bool {
 	lower := strings.ToLower(slashRel)
+	parts := strings.Split(lower, "/")
+	for _, part := range parts {
+		cleanPart := strings.TrimRight(part, ". ")
+		if cleanPart == ".git" || strings.HasPrefix(cleanPart, ".git:") {
+			return true
+		}
+	}
 	return lower == ".git" || strings.HasPrefix(lower, ".git/") ||
 		strings.Contains(lower, "/.git/") || strings.HasSuffix(lower, "/.git")
 }

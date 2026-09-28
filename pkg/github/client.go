@@ -11,7 +11,8 @@ import (
 )
 
 type Client struct {
-	gh *github.Client
+	gh      *github.Client
+	appAuth *AppAuth
 }
 
 // InlineSuggestion is a one-click replacement attached to a changed PR line.
@@ -24,6 +25,21 @@ type InlineSuggestion struct {
 type FileContent struct {
 	Content string
 	SHA     string
+}
+
+func (c *Client) ghForRepo(ctx context.Context, owner, repo string) (*github.Client, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	if c.appAuth != nil {
+		if owner == "" || repo == "" {
+			return nil, fmt.Errorf("owner and repo must not be empty for repository-scoped client")
+		}
+		return c.appAuth.getClient(ctx, owner, repo)
+	}
+	if c.gh == nil {
+		return nil, fmt.Errorf("github client is not initialized")
+	}
+	return c.gh, nil
 }
 
 func NewClient(token string) *Client {
@@ -51,6 +67,20 @@ func NewTestClient(baseURL string) (*Client, error) {
 	}
 	gh.BaseURL = u
 	return &Client{gh: gh}, nil
+}
+
+// NewTestClientWithToken creates a GitHub client pointed at a custom base URL with a static token for testing.
+func NewTestClientWithToken(baseURL, token string) (*Client, error) {
+	client := NewClient(token)
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasSuffix(u.Path, "/") {
+		u.Path += "/"
+	}
+	client.gh.BaseURL = u
+	return client, nil
 }
 
 // ParseRepoOwner splits "owner/repo" into [owner, repo]
@@ -101,7 +131,14 @@ func ParsePRURL(prURL string) (owner string, repo string, number int, err error)
 }
 
 func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PRDetails, error) {
-	pr, _, err := c.gh.PullRequests.Get(ctx, owner, repo, number)
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	pr, _, err := ghClient.PullRequests.Get(ctx, owner, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pull request: %w", err)
 	}
@@ -142,7 +179,14 @@ func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PR
 }
 
 func (c *Client) GetRawDiff(ctx context.Context, owner, repo string, number int) (string, error) {
-	diff, _, err := c.gh.PullRequests.GetRaw(ctx, owner, repo, number, github.RawOptions{
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return "", err
+	}
+
+	diff, _, err := ghClient.PullRequests.GetRaw(ctx, owner, repo, number, github.RawOptions{
 		Type: github.Diff,
 	})
 	if err != nil {
@@ -152,11 +196,18 @@ func (c *Client) GetRawDiff(ctx context.Context, owner, repo string, number int)
 }
 
 func (c *Client) GetComments(ctx context.Context, owner, repo string, number int) ([]Comment, []DiscussionThread, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// 1. Fetch general issue comments with pagination
 	var generalComments []Comment
 	opt := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
 	for {
-		issueComments, resp, err := c.gh.Issues.ListComments(ctx, owner, repo, number, opt)
+		issueComments, resp, err := ghClient.Issues.ListComments(ctx, owner, repo, number, opt)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get issue comments: %w", err)
 		}
@@ -178,7 +229,7 @@ func (c *Client) GetComments(ctx context.Context, owner, repo string, number int
 	var reviewComments []*github.PullRequestComment
 	prOpt := &github.PullRequestListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
 	for {
-		rcPage, resp, err := c.gh.PullRequests.ListComments(ctx, owner, repo, number, prOpt)
+		rcPage, resp, err := ghClient.PullRequests.ListComments(ctx, owner, repo, number, prOpt)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get review comments: %w", err)
 		}
@@ -231,10 +282,17 @@ func (c *Client) GetComments(ctx context.Context, owner, repo string, number int
 
 // CanWriteRepository checks the comment author's current repository permission.
 func (c *Client) CanWriteRepository(ctx context.Context, owner, repo, username string) (bool, error) {
+	username = strings.TrimSpace(username)
 	if username == "" {
 		return false, nil
 	}
-	permission, _, err := c.gh.Repositories.GetPermissionLevel(ctx, owner, repo, username)
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return false, err
+	}
+	permission, _, err := ghClient.Repositories.GetPermissionLevel(ctx, owner, repo, username)
 	if err != nil {
 		return false, err
 	}
@@ -250,7 +308,13 @@ func (c *Client) CanWriteRepository(ctx context.Context, owner, repo, username s
 }
 
 func (c *Client) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
-	_, _, err := c.gh.Issues.CreateComment(ctx, owner, repo, number, &github.IssueComment{
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return err
+	}
+	_, _, err = ghClient.Issues.CreateComment(ctx, owner, repo, number, &github.IssueComment{
 		Body: github.Ptr(body),
 	})
 	return err
@@ -258,12 +322,24 @@ func (c *Client) PostComment(ctx context.Context, owner, repo string, number int
 
 // UpdatePRBody replaces only the PR description, not its title or other metadata.
 func (c *Client) UpdatePRBody(ctx context.Context, owner, repo string, number int, body string) error {
-	_, _, err := c.gh.PullRequests.Edit(ctx, owner, repo, number, &github.PullRequest{Body: github.Ptr(body)})
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return err
+	}
+	_, _, err = ghClient.PullRequests.Edit(ctx, owner, repo, number, &github.PullRequest{Body: github.Ptr(body)})
 	return err
 }
 
 func (c *Client) GetFileContent(ctx context.Context, owner, repo, path, ref string) (*FileContent, error) {
-	file, _, _, err := c.gh.Repositories.GetContents(ctx, owner, repo, path, &github.RepositoryContentGetOptions{Ref: ref})
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	file, _, _, err := ghClient.Repositories.GetContents(ctx, owner, repo, path, &github.RepositoryContentGetOptions{Ref: ref})
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +352,13 @@ func (c *Client) GetFileContent(ctx context.Context, owner, repo, path, ref stri
 
 // UpdateFile creates one commit on branch containing only path.
 func (c *Client) UpdateFile(ctx context.Context, owner, repo, path, branch, sha, content, message string) (string, error) {
-	result, _, err := c.gh.Repositories.UpdateFile(ctx, owner, repo, path, &github.RepositoryContentFileOptions{
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return "", err
+	}
+	result, _, err := ghClient.Repositories.UpdateFile(ctx, owner, repo, path, &github.RepositoryContentFileOptions{
 		Message: github.Ptr(message),
 		Content: []byte(content),
 		SHA:     github.Ptr(sha),
@@ -294,6 +376,13 @@ func (c *Client) PostSuggestions(ctx context.Context, owner, repo string, number
 		return nil
 	}
 
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return err
+	}
+
 	comments := make([]*github.DraftReviewComment, 0, len(suggestions))
 	for _, suggestion := range suggestions {
 		comments = append(comments, &github.DraftReviewComment{
@@ -304,7 +393,7 @@ func (c *Client) PostSuggestions(ctx context.Context, owner, repo string, number
 		})
 	}
 
-	_, _, err := c.gh.PullRequests.CreateReview(ctx, owner, repo, number, &github.PullRequestReviewRequest{
+	_, _, err = ghClient.PullRequests.CreateReview(ctx, owner, repo, number, &github.PullRequestReviewRequest{
 		CommitID: github.Ptr(commitSHA),
 		Event:    github.Ptr("COMMENT"),
 		Body:     github.Ptr("## 🤖 PR Improvement Suggestions\n\nOne-click suggestions for changed lines."),
@@ -314,7 +403,13 @@ func (c *Client) PostSuggestions(ctx context.Context, owner, repo string, number
 }
 
 func (c *Client) GetLabels(ctx context.Context, owner, repo string, number int) ([]string, error) {
-	labels, _, err := c.gh.Issues.ListLabelsByIssue(ctx, owner, repo, number, nil)
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	labels, _, err := ghClient.Issues.ListLabelsByIssue(ctx, owner, repo, number, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list labels: %w", err)
 	}
@@ -330,7 +425,13 @@ func (c *Client) AddLabels(ctx context.Context, owner, repo string, number int, 
 	if len(labels) == 0 {
 		return nil
 	}
-	_, _, err := c.gh.Issues.AddLabelsToIssue(ctx, owner, repo, number, labels)
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return err
+	}
+	_, _, err = ghClient.Issues.AddLabelsToIssue(ctx, owner, repo, number, labels)
 	if err != nil {
 		return fmt.Errorf("failed to add labels: %w", err)
 	}
