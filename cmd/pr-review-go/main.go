@@ -29,12 +29,12 @@ func main() {
 	postComment := flag.Bool("post", false, "Post the review markdown as a comment on GitHub")
 	onlyLabels := flag.Bool("labels", false, "Generate and apply labels to PR instead of full code review")
 	onlySummary := flag.Bool("summary", false, "Summarize PR discussions and reviews instead of code review")
-	askQuestion := flag.String("ask", "", "Ask the interactive PR assistant a question or give an execution command")
+	askQuestion := flag.String("ask", "", "Ask the read-only PR assistant a question")
 	addDocs := flag.Bool("add-docs", false, "Scan PR files for undocumented items and report missing docstrings")
 	describe := flag.Bool("describe", false, "Generate and append a professional PR description")
 	updateChangelog := flag.Bool("update-changelog", false, "Generate and commit a Keep a Changelog entry")
-	improve := flag.Bool("improve", false, "Post safe one-click GitHub suggestion blocks for the PR")
-	effortFlag := flag.String("effort", "", "Review effort level: 'lite' (fast, diff-only) or 'balanced' (default, sandbox)")
+	improve := flag.Bool("improve", false, "One-click suggestions (unavailable until isolated project verification is configured)")
+	effortFlag := flag.String("effort", "", "Review effort level: 'lite' (fast, diff-only) or 'balanced' (default, workspace-assisted; build/tests skipped)")
 	noSandbox := flag.Bool("no-sandbox", false, "Disable local runner sandbox verification")
 	modelFlag := flag.String("model", "", "LLM model to use")
 	flag.Parse()
@@ -93,6 +93,11 @@ func main() {
 		_ = err
 	} else {
 		fmt.Fprintf(os.Stderr, "Usage: pr-review-go -pr <PR_URL> [-post] [-no-sandbox] [-model <model>]\n")
+		os.Exit(1)
+	}
+
+	if *improve {
+		fmt.Fprintln(os.Stderr, "One-click suggestions are unavailable until isolated project verification is configured. No build or tests were run.")
 		os.Exit(1)
 	}
 
@@ -217,7 +222,7 @@ func main() {
 	}
 
 	fmt.Printf("🚀 Starting review for %s/%s #%d...\n", owner, repo, num)
-	fmt.Printf("📦 Sandbox Verification: %v | Model: %s\n", cfg.EnableSandbox, cfg.LLMModel)
+	fmt.Printf("📦 Workspace analysis: %v | Project build/test verification: disabled | Model: %s\n", cfg.EnableSandbox, cfg.LLMModel)
 
 	engine := reviewer.NewEngine(cfg)
 
@@ -228,20 +233,6 @@ func main() {
 	}
 
 	fmt.Println("\n" + report.RawMarkdown)
-
-	if *improve {
-		if len(report.Suggestions) == 0 {
-			fmt.Println("No safe one-click suggestions found.")
-			return
-		}
-		ghClient := github.NewClientFromConfig(cfg)
-		if err := ghClient.PostSuggestions(ctx, owner, repo, num, report.HeadSHA, report.Suggestions); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to post suggestions: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("✅ Posted %d one-click suggestion(s).\n", len(report.Suggestions))
-		return
-	}
 
 	if *postComment {
 		ghClient := github.NewClientFromConfig(cfg)
