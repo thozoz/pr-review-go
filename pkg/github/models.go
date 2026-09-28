@@ -1,20 +1,33 @@
 package github
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // PRDetails holds basic metadata of the pull request
 type PRDetails struct {
-	Owner     string
-	Repo      string
-	Number    int
-	Title     string
-	Body      string
-	Author    string
-	BaseRef   string
-	HeadRef   string
-	HeadSHA   string
-	CloneURL  string
-	CreatedAt time.Time
+	Owner         string
+	Repo          string
+	Number        int
+	Title         string
+	Body          string
+	Author        string
+	BaseRef       string
+	HeadRef       string
+	HeadSHA       string
+	HeadRepoOwner string
+	HeadRepoName  string
+	CloneURL      string
+	CreatedAt     time.Time
+}
+
+// IsFork returns true if the pull request originates from a fork or if head repository metadata is missing.
+func (p *PRDetails) IsFork() bool {
+	if p == nil || p.HeadRepoOwner == "" || p.HeadRepoName == "" {
+		return true
+	}
+	return !strings.EqualFold(p.HeadRepoOwner, p.Owner) || !strings.EqualFold(p.HeadRepoName, p.Repo)
 }
 
 // Comment represents either an issue comment or inline review comment

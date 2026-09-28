@@ -1,12 +1,10 @@
 package assistant
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -34,12 +32,9 @@ func NewAssistant(cfg *config.Config) *Assistant {
 }
 
 type ToolCallRequest struct {
-	Action    string `json:"action"`     // "read_file", "write_file", "list_files", "run_command", "commit_and_push", "answer"
-	Path      string `json:"path"`       // For read_file, write_file, or list_files
-	Content   string `json:"content"`    // For write_file
-	Command   string `json:"command"`    // For run_command
-	CommitMsg string `json:"commit_msg"` // For commit_and_push
-	FinalText string `json:"final_text"` // For answer
+	Action    string `json:"action"`
+	Path      string `json:"path"`
+	FinalText string `json:"final_text"`
 }
 
 // HandleMention executes an interactive multi-step question/command regarding a PR
@@ -56,25 +51,17 @@ func (a *Assistant) HandleMention(ctx context.Context, owner, repo string, numbe
 	}
 	defer cleanup()
 
-	systemPrompt := `You are an elite, fully autonomous AI Coding Agent operating inside an isolated Git Pull Request sandbox environment (equivalent to GitHub Copilot Cloud Agent).
-You can inspect code, run tests, resolve merge conflicts, fix bugs, add new code/tests, and commit & push changes back to the PR branch.
+	systemPrompt := `You are an AI Coding Assistant operating on a Git Pull Request.
+You can inspect code, review changes, suggest fixes, and answer questions about the PR.
 
 AVAILABLE ACTIONS:
 1. "read_file": Read content of a file. ({"action": "read_file", "path": "path/to/file"})
-2. "write_file": Write or update file content. ({"action": "write_file", "path": "path/to/file", "content": "..."})
-3. "list_files": List files in a directory. ({"action": "list_files", "path": "."})
-4. "run_command": Execute any shell command in the project root. ({"action": "run_command", "command": "go test -v ./..." or "git status"})
-5. "commit_and_push": Commit modified files and push to PR branch. ({"action": "commit_and_push", "commit_msg": "fix: resolve merge conflicts in auth.go"})
-6. "answer": Deliver your final response to the user. ({"action": "answer", "final_text": "Markdown summary of what was done or answered..."})
+2. "list_files": List files in a directory. ({"action": "list_files", "path": "."})
+3. "answer": Deliver your final response to the user. ({"action": "answer", "final_text": "Markdown summary of what was done or answered..."})
 
 GENERAL AGENT RULES:
-- If asked to fix a bug or resolve merge conflicts:
-  1. Inspect the relevant files or run git commands.
-  2. Apply the fix using write_file.
-  3. ALWAYS verify your changes by executing compilers/test suites using run_command!
-  4. Once tests pass, commit and push your changes using commit_and_push.
-  5. Provide your final explanation via answer.
-- If asked a question or diagnosis without code modifications, inspect code/tests and deliver your final answer.
+- Inspect relevant files to answer questions, diagnose issues, or suggest fixes.
+- Direct command execution, file modifications, and automated git push are disabled because the assistant is read-only and the current environment lacks container isolation.
 - You can make up to 6 iterative tool steps before providing your final answer.
 - Output MUST be a single strict JSON object matching: {"action": "...", ...}
 - Never include markdown codeblocks surrounding your JSON tool calls.`
@@ -101,8 +88,8 @@ GENERAL AGENT RULES:
 
 		// Execute tool
 		toolOutput := a.executeTool(ctx, workDir, step)
-		history += fmt.Sprintf("\nAction executed: %s (path: %s, cmd: %s)\nTool Result:\n```\n%s\n```\nNext action (or provide final answer):",
-			step.Action, step.Path, step.Command, toolOutput)
+		history += fmt.Sprintf("\nAction requested: %s (path: %s)\nTool Result:\n```\n%s\n```\nNext action (or provide final answer):",
+			step.Action, step.Path, toolOutput)
 	}
 
 	// Final prompt to conclude
@@ -120,10 +107,9 @@ GENERAL AGENT RULES:
 func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolCallRequest) string {
 	switch step.Action {
 	case "read_file":
-		cleanPath := filepath.Clean(step.Path)
-		target := filepath.Join(workDir, cleanPath)
-		if !strings.HasPrefix(target, workDir) {
-			return "Error: Access denied (path outside workspace)."
+		target, err := resolveWorkspacePath(workDir, step.Path)
+		if err != nil {
+			return fmt.Sprintf("Error: Access denied (%v).", err)
 		}
 		data, err := os.ReadFile(target)
 		if err != nil {
@@ -135,33 +121,24 @@ func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolC
 		return string(data)
 
 	case "write_file":
-		cleanPath := filepath.Clean(step.Path)
-		target := filepath.Join(workDir, cleanPath)
-		if !strings.HasPrefix(target, workDir) {
-			return "Error: Access denied (path outside workspace)."
-		}
-		// Create directory if it doesn't exist
-		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-			return fmt.Sprintf("Error creating parent directories: %v", err)
-		}
-		if err := os.WriteFile(target, []byte(step.Content), 0644); err != nil {
-			return fmt.Sprintf("Error writing file: %v", err)
-		}
-		return fmt.Sprintf("Success: File %s updated (%d bytes written).", step.Path, len(step.Content))
+		return "Error: write_file is disabled: the assistant is read-only and file modifications are not permitted."
 
 	case "list_files":
-		cleanPath := filepath.Clean(step.Path)
-		target := filepath.Join(workDir, cleanPath)
-		if !strings.HasPrefix(target, workDir) {
-			return "Error: Access denied."
+		p := step.Path
+		if p == "" {
+			p = "."
+		}
+		target, err := resolveWorkspacePath(workDir, p)
+		if err != nil {
+			return fmt.Sprintf("Error: Access denied (%v).", err)
 		}
 		var files []string
-		_ = filepath.Walk(target, func(p string, info os.FileInfo, err error) error {
+		_ = filepath.Walk(target, func(walkedPath string, info os.FileInfo, err error) error {
 			if err != nil || len(files) > 100 {
 				return nil
 			}
-			rel, _ := filepath.Rel(workDir, p)
-			if rel != "." && !strings.HasPrefix(rel, ".git") {
+			rel, _ := filepath.Rel(workDir, walkedPath)
+			if rel != "." && !isGitPath(filepath.ToSlash(rel)) {
 				files = append(files, rel)
 			}
 			return nil
@@ -169,66 +146,116 @@ func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolC
 		return strings.Join(files, "\n")
 
 	case "run_command":
-		cmdCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(cmdCtx, "sh", "-c", step.Command)
-		cmd.Dir = workDir
-
-		var outBuf, errBuf bytes.Buffer
-		cmd.Stdout = &outBuf
-		cmd.Stderr = &errBuf
-
-		err := cmd.Run()
-		outStr := outBuf.String()
-		errStr := errBuf.String()
-
-		res := fmt.Sprintf("STDOUT:\n%s\nSTDERR:\n%s", outStr, errStr)
-		if err != nil {
-			res += fmt.Sprintf("\nExit Code / Error: %v", err)
-		}
-		if len(res) > 40000 {
-			res = res[:40000] + "\n...[output truncated]..."
-		}
-		return res
+		return "Error: run_command is disabled: host command execution is not permitted without container isolation."
 
 	case "commit_and_push":
-		msg := strings.TrimSpace(step.CommitMsg)
-		if msg == "" {
-			msg = "fix: apply changes suggested by AI assistant"
-		}
-
-		// Configure git user inside sandbox
-		_ = exec.Command("git", "-C", workDir, "config", "user.name", "pr-review-go[bot]").Run()
-		_ = exec.Command("git", "-C", workDir, "config", "user.email", "pr-review-go[bot]@users.noreply.github.com").Run()
-
-		// Git add
-		addCmd := exec.Command("git", "-C", workDir, "add", "-A")
-		if err := addCmd.Run(); err != nil {
-			return fmt.Sprintf("Error staging files: %v", err)
-		}
-
-		// Git commit
-		commitCmd := exec.Command("git", "-C", workDir, "commit", "-m", msg)
-		var commitErr bytes.Buffer
-		commitCmd.Stderr = &commitErr
-		if err := commitCmd.Run(); err != nil {
-			return fmt.Sprintf("Git commit failed (nothing to commit or error): %v - %s", err, commitErr.String())
-		}
-
-		// Git push
-		pushCmd := exec.CommandContext(ctx, "git", "-C", workDir, "push", "origin", "HEAD")
-		var pushErr bytes.Buffer
-		pushCmd.Stderr = &pushErr
-		if err := pushCmd.Run(); err != nil {
-			return fmt.Sprintf("Git push failed: %v - %s", err, pushErr.String())
-		}
-
-		return fmt.Sprintf("Success: Commit '%s' created and successfully pushed to PR branch.", msg)
+		return "Error: commit_and_push is disabled: git operations are not permitted without container isolation."
 
 	default:
 		return fmt.Sprintf("Unknown action: %s", step.Action)
 	}
+}
+
+func resolveWorkspacePath(workDir, userPath string) (string, error) {
+	if userPath == "" {
+		return "", fmt.Errorf("empty path")
+	}
+
+	canonicalWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspace: %w", err)
+	}
+	if evaled, err := filepath.EvalSymlinks(canonicalWorkDir); err == nil {
+		canonicalWorkDir = evaled
+	}
+
+	cleanUserPath := filepath.Clean(userPath)
+	if filepath.IsAbs(cleanUserPath) || filepath.VolumeName(cleanUserPath) != "" {
+		return "", fmt.Errorf("absolute paths are not permitted")
+	}
+
+	target := filepath.Join(canonicalWorkDir, cleanUserPath)
+
+	// Lexical boundary check
+	lexRel, err := filepath.Rel(canonicalWorkDir, target)
+	if err != nil || lexRel == ".." || strings.HasPrefix(lexRel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path outside workspace")
+	}
+
+	// Block .git paths
+	if isGitPath(filepath.ToSlash(lexRel)) {
+		return "", fmt.Errorf(".git paths are restricted")
+	}
+
+	// Evaluate symlinks
+	fi, err := os.Lstat(target)
+	if err == nil {
+		// Target exists
+		resolved, err := filepath.EvalSymlinks(target)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve symlink: %w", err)
+		}
+		rel, err := filepath.Rel(canonicalWorkDir, resolved)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("path outside workspace")
+		}
+		if isGitPath(filepath.ToSlash(rel)) {
+			return "", fmt.Errorf(".git paths are restricted")
+		}
+		return resolved, nil
+	}
+
+	// Target does not exist - verify if target itself is a broken symlink
+	if fi != nil && (fi.Mode()&os.ModeSymlink != 0) {
+		return "", fmt.Errorf("broken or inaccessible symlink")
+	}
+
+	// Find the lowest existing ancestor directory and verify it doesn't escape workspace
+	curr := target
+	var missingParts []string
+	for {
+		parent := filepath.Dir(curr)
+		missingParts = append([]string{filepath.Base(curr)}, missingParts...)
+		if parent == curr {
+			break
+		}
+		if _, statErr := os.Lstat(parent); statErr == nil {
+			evalParent, evalErr := filepath.EvalSymlinks(parent)
+			if evalErr != nil {
+				return "", fmt.Errorf("failed to resolve parent directory: %w", evalErr)
+			}
+			rel, relErr := filepath.Rel(canonicalWorkDir, evalParent)
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return "", fmt.Errorf("path outside workspace")
+			}
+			if isGitPath(filepath.ToSlash(rel)) {
+				return "", fmt.Errorf(".git paths are restricted")
+			}
+
+			resolved := evalParent
+			for _, part := range missingParts {
+				resolved = filepath.Join(resolved, part)
+			}
+
+			relFinal, relErr := filepath.Rel(canonicalWorkDir, resolved)
+			if relErr != nil || relFinal == ".." || strings.HasPrefix(relFinal, ".."+string(filepath.Separator)) {
+				return "", fmt.Errorf("path outside workspace")
+			}
+			if isGitPath(filepath.ToSlash(relFinal)) {
+				return "", fmt.Errorf(".git paths are restricted")
+			}
+			return resolved, nil
+		}
+		curr = parent
+	}
+
+	return "", fmt.Errorf("workspace directory does not exist")
+}
+
+func isGitPath(slashRel string) bool {
+	lower := strings.ToLower(slashRel)
+	return lower == ".git" || strings.HasPrefix(lower, ".git/") ||
+		strings.Contains(lower, "/.git/") || strings.HasSuffix(lower, "/.git")
 }
 
 func parseToolCall(raw string) (*ToolCallRequest, error) {

@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/google/go-github/v68/github"
@@ -36,6 +37,20 @@ func NewClient(token string) *Client {
 	return &Client{
 		gh: github.NewClient(httpClient),
 	}
+}
+
+// NewTestClient creates a GitHub client pointed at a custom base URL for testing.
+func NewTestClient(baseURL string) (*Client, error) {
+	gh := github.NewClient(nil)
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasSuffix(u.Path, "/") {
+		u.Path += "/"
+	}
+	gh.BaseURL = u
+	return &Client{gh: gh}, nil
 }
 
 // ParseRepoOwner splits "owner/repo" into [owner, repo]
@@ -91,18 +106,38 @@ func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PR
 		return nil, fmt.Errorf("failed to get pull request: %w", err)
 	}
 
+	var headRepoOwner string
+	var headRepoName string
+	var cloneURL string
+	var headRef string
+	var headSHA string
+
+	if head := pr.GetHead(); head != nil {
+		headRef = head.GetRef()
+		headSHA = head.GetSHA()
+		if hr := head.GetRepo(); hr != nil {
+			cloneURL = hr.GetCloneURL()
+			headRepoName = hr.GetName()
+			if hrOwner := hr.GetOwner(); hrOwner != nil {
+				headRepoOwner = hrOwner.GetLogin()
+			}
+		}
+	}
+
 	return &PRDetails{
-		Owner:     owner,
-		Repo:      repo,
-		Number:    number,
-		Title:     pr.GetTitle(),
-		Body:      pr.GetBody(),
-		Author:    pr.GetUser().GetLogin(),
-		BaseRef:   pr.GetBase().GetRef(),
-		HeadRef:   pr.GetHead().GetRef(),
-		HeadSHA:   pr.GetHead().GetSHA(),
-		CloneURL:  pr.GetHead().GetRepo().GetCloneURL(),
-		CreatedAt: pr.GetCreatedAt().Time,
+		Owner:         owner,
+		Repo:          repo,
+		Number:        number,
+		Title:         pr.GetTitle(),
+		Body:          pr.GetBody(),
+		Author:        pr.GetUser().GetLogin(),
+		BaseRef:       pr.GetBase().GetRef(),
+		HeadRef:       headRef,
+		HeadSHA:       headSHA,
+		HeadRepoOwner: headRepoOwner,
+		HeadRepoName:  headRepoName,
+		CloneURL:      cloneURL,
+		CreatedAt:     pr.GetCreatedAt().Time,
 	}, nil
 }
 
@@ -194,6 +229,26 @@ func (c *Client) GetComments(ctx context.Context, owner, repo string, number int
 	return generalComments, threads, nil
 }
 
+// CanWriteRepository checks the comment author's current repository permission.
+func (c *Client) CanWriteRepository(ctx context.Context, owner, repo, username string) (bool, error) {
+	if username == "" {
+		return false, nil
+	}
+	permission, _, err := c.gh.Repositories.GetPermissionLevel(ctx, owner, repo, username)
+	if err != nil {
+		return false, err
+	}
+	if permission == nil {
+		return false, nil
+	}
+	switch permission.GetPermission() {
+	case "admin", "maintain", "write":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
 func (c *Client) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
 	_, _, err := c.gh.Issues.CreateComment(ctx, owner, repo, number, &github.IssueComment{
 		Body: github.Ptr(body),
@@ -252,7 +307,7 @@ func (c *Client) PostSuggestions(ctx context.Context, owner, repo string, number
 	_, _, err := c.gh.PullRequests.CreateReview(ctx, owner, repo, number, &github.PullRequestReviewRequest{
 		CommitID: github.Ptr(commitSHA),
 		Event:    github.Ptr("COMMENT"),
-		Body:     github.Ptr("## 🤖 PR Improvement Suggestions\n\nOne-click fixes for changed lines in a sandbox-verified PR."),
+		Body:     github.Ptr("## 🤖 PR Improvement Suggestions\n\nOne-click suggestions for changed lines."),
 		Comments: comments,
 	})
 	return err

@@ -58,9 +58,7 @@ func (c *Config) Validate() error {
 		if c.GitHubAppID == 0 || c.GitHubAppPrivateKeyPath == "" {
 			return fmt.Errorf("GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH must be set together")
 		}
-		return nil
-	}
-	if c.GitHubToken == "" {
+	} else if c.GitHubToken == "" {
 		return fmt.Errorf("GITHUB_TOKEN or GH_TOKEN is required")
 	}
 	if c.LLMAPIKey == "" {
