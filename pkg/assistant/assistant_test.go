@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -290,5 +292,284 @@ func TestAssistant_ValidWorkspaceOperations(t *testing.T) {
 	})
 	if !strings.Contains(listResp, "nested") || !strings.Contains(listResp, "hello.go") {
 		t.Fatalf("expected list_files to include nested/dir/hello.go, got: %s", listResp)
+	}
+}
+
+func TestSecurity_ReadFile_GitRestricted(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	gitDir := filepath.Join(workDir, ".git")
+	if err := os.MkdirAll(gitDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configFile := filepath.Join(gitDir, "config")
+	if err := os.WriteFile(configFile, []byte("[core]\nrepositoryformatversion = 0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Assistant{}
+	ctx := context.Background()
+
+	testPaths := []string{
+		".git",
+		".git/config",
+		"./.git/config",
+		"sub/../../.git/config",
+		".git:stream",
+		".git/../.git/config",
+	}
+
+	for _, p := range testPaths {
+		t.Run(p, func(t *testing.T) {
+			resp := a.executeTool(ctx, workDir, &ToolCallRequest{
+				Action: "read_file",
+				Path:   p,
+			})
+			if strings.Contains(resp, "repositoryformatversion") {
+				t.Fatalf("VULNERABILITY: read .git file: %s", resp)
+			}
+			if !strings.Contains(strings.ToLower(resp), "access denied") && !strings.Contains(strings.ToLower(resp), "restricted") {
+				t.Errorf("expected access denied for path %s, got: %s", p, resp)
+			}
+		})
+	}
+}
+
+func TestSecurity_ReadFile_PathTraversalAndAbsolute(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(baseDir, "outside.txt")
+	if err := os.WriteFile(outsideFile, []byte("outside content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Assistant{}
+	ctx := context.Background()
+
+	testCases := []struct {
+		name string
+		path string
+	}{
+		{"parent traversal", "../outside.txt"},
+		{"deep traversal", "foo/../../outside.txt"},
+		{"empty path", ""},
+		{"root slash", "/outside.txt"},
+		{"null byte", "test\x00.txt"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := a.executeTool(ctx, workDir, &ToolCallRequest{
+				Action: "read_file",
+				Path:   tc.path,
+			})
+			if strings.Contains(resp, "outside content") {
+				t.Fatalf("VULNERABILITY: read outside file: %s", resp)
+			}
+			if !strings.Contains(strings.ToLower(resp), "access denied") {
+				t.Errorf("expected access denied for %s (%s), got: %s", tc.name, tc.path, resp)
+			}
+		})
+	}
+}
+
+func TestSecurity_ReadFile_TruncationAt30KB(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	largeContent := strings.Repeat("A", 35000)
+	targetFile := filepath.Join(workDir, "large.txt")
+	if err := os.WriteFile(targetFile, []byte(largeContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Assistant{}
+	ctx := context.Background()
+
+	resp := a.executeTool(ctx, workDir, &ToolCallRequest{
+		Action: "read_file",
+		Path:   "large.txt",
+	})
+
+	if !strings.Contains(resp, "...[file truncated, exceeded 30KB]...") {
+		t.Fatalf("expected truncation notice in response, got length %d", len(resp))
+	}
+	prefix := resp[:30000]
+	if prefix != strings.Repeat("A", 30000) {
+		t.Fatalf("expected exactly 30000 bytes of 'A', got length %d", len(prefix))
+	}
+}
+
+func TestSecurity_ReadFile_DirectoryLinkOutsideDenied(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	outsideDir := filepath.Join(baseDir, "outside")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	secretFile := filepath.Join(outsideDir, "secret.txt")
+	secretContent := "confidential-link-secret"
+	if err := os.WriteFile(secretFile, []byte(secretContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	linkPath := filepath.Join(workDir, "link-out")
+	var linked bool
+	// Try os.Symlink first (works on Unix, or Windows with dev mode)
+	if err := os.Symlink(outsideDir, linkPath); err == nil {
+		linked = true
+	} else if runtime.GOOS == "windows" {
+		// On Windows without dev mode, directory junction (mklink /J) works without elevation
+		cmd := exec.Command("cmd.exe", "/c", "mklink", "/J", linkPath, outsideDir)
+		if err := cmd.Run(); err == nil {
+			linked = true
+		}
+	}
+
+	if !linked {
+		t.Skip("skipping test: platform does not support symlinks or junctions without elevation")
+	}
+
+	a := &Assistant{}
+	ctx := context.Background()
+
+	resp := a.executeTool(ctx, workDir, &ToolCallRequest{
+		Action: "read_file",
+		Path:   "link-out/secret.txt",
+	})
+
+	if strings.Contains(resp, secretContent) {
+		t.Fatalf("VULNERABILITY: read secret file through directory link pointing outside: %s", resp)
+	}
+	if !strings.Contains(strings.ToLower(resp), "access denied") {
+		t.Errorf("expected access denied for link read, got: %s", resp)
+	}
+}
+
+func TestSecurity_ReadFile_CannotReadDirectory(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	subDir := filepath.Join(workDir, "subdir")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Assistant{}
+	ctx := context.Background()
+
+	resp := a.executeTool(ctx, workDir, &ToolCallRequest{
+		Action: "read_file",
+		Path:   "subdir",
+	})
+
+	if !strings.Contains(strings.ToLower(resp), "directory") && !strings.Contains(strings.ToLower(resp), "error") {
+		t.Errorf("expected error reading directory as file, got: %s", resp)
+	}
+}
+
+func TestSecurity_ListFiles_ExcludesGit(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	gitDir := filepath.Join(workDir, ".git")
+	if err := os.MkdirAll(gitDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	normalFile := filepath.Join(workDir, "main.go")
+	if err := os.WriteFile(normalFile, []byte("package main"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Assistant{}
+	ctx := context.Background()
+
+	resp := a.executeTool(ctx, workDir, &ToolCallRequest{
+		Action: "list_files",
+		Path:   ".",
+	})
+
+	if strings.Contains(resp, ".git") {
+		t.Fatalf("VULNERABILITY: list_files exposed .git: %s", resp)
+	}
+	if !strings.Contains(resp, "main.go") {
+		t.Fatalf("expected list_files to include main.go, got: %s", resp)
+	}
+}
+
+func TestSecurity_ReadFile_SwapAfterOpenDoesNotLeakSecret(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	outsideDir := filepath.Join(baseDir, "outside")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	secretFile := filepath.Join(outsideDir, "secret.txt")
+	secretContent := "super-confidential-outside-secret-token"
+	if err := os.WriteFile(secretFile, []byte(secretContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	victimFile := filepath.Join(workDir, "victim.txt")
+	benignContent := "benign-file-content"
+	if err := os.WriteFile(victimFile, []byte(benignContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Assistant{}
+	ctx := context.Background()
+
+	// Verify initial read succeeds
+	initialResp := a.executeTool(ctx, workDir, &ToolCallRequest{
+		Action: "read_file",
+		Path:   "victim.txt",
+	})
+	if initialResp != benignContent {
+		t.Fatalf("expected initial read to return benign content, got: %s", initialResp)
+	}
+
+	// Now swap victim.txt with a link/junction to outsideDir
+	_ = os.Remove(victimFile)
+	var linked bool
+	var testRelPath string
+	if err := os.Symlink(secretFile, victimFile); err == nil {
+		linked = true
+		testRelPath = "victim.txt"
+	} else if runtime.GOOS == "windows" {
+		// Try directory junction if file symlink fails
+		victimDir := filepath.Join(workDir, "victim_dir")
+		cmd := exec.Command("cmd.exe", "/c", "mklink", "/J", victimDir, outsideDir)
+		if err := cmd.Run(); err == nil {
+			linked = true
+			testRelPath = "victim_dir/secret.txt"
+		}
+	}
+
+	if linked {
+		swappedResp := a.executeTool(ctx, workDir, &ToolCallRequest{
+			Action: "read_file",
+			Path:   testRelPath,
+		})
+		if strings.Contains(swappedResp, secretContent) {
+			t.Fatalf("VULNERABILITY: read secret file after swap: %s", swappedResp)
+		}
+		if !strings.Contains(strings.ToLower(swappedResp), "access denied") {
+			t.Errorf("expected access denied after swap, got: %s", swappedResp)
+		}
 	}
 }

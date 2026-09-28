@@ -213,15 +213,21 @@ func TestCommentCommandPermissionAndImproveNotice(t *testing.T) {
 			if rr.Code != http.StatusOK {
 				t.Fatalf("signed webhook status = %d, want 200", rr.Code)
 			}
+			if !tc.wantNotice {
+				select {
+				case notice := <-notices:
+					t.Errorf("unauthorized comment produced notice: %s", notice)
+				case <-time.After(200 * time.Millisecond):
+				}
+				return
+			}
 			select {
 			case notice := <-notices:
-				if !tc.wantNotice || !strings.Contains(notice, "unavailable") {
+				if !strings.Contains(notice, "unavailable") {
 					t.Errorf("unexpected improvement notice: %s", notice)
 				}
-			case <-time.After(200 * time.Millisecond):
-				if tc.wantNotice {
-					t.Error("writer did not receive unavailable notice")
-				}
+			case <-time.After(5 * time.Second):
+				t.Error("writer did not receive unavailable notice")
 			}
 		})
 	}
