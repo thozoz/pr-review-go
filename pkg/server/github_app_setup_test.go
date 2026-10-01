@@ -39,6 +39,16 @@ func verifyNoCacheHeaders(t *testing.T, w *httptest.ResponseRecorder) {
 	if expires := w.Header().Get("Expires"); expires != "0" {
 		t.Errorf("Expires header = %q, want '0'", expires)
 	}
+	csp := w.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "form-action https://github.com") {
+		t.Errorf("Content-Security-Policy header missing required directives: %q", csp)
+	}
+	if xfo := w.Header().Get("X-Frame-Options"); xfo != "DENY" {
+		t.Errorf("X-Frame-Options header = %q, want 'DENY'", xfo)
+	}
+	if xcto := w.Header().Get("X-Content-Type-Options"); xcto != "nosniff" {
+		t.Errorf("X-Content-Type-Options header = %q, want 'nosniff'", xcto)
+	}
 }
 
 func TestGitHubAppSetupPage(t *testing.T) {
@@ -391,4 +401,57 @@ func TestGitHubAppCallbackErrorHandling(t *testing.T) {
 		}
 		verifyNoCacheHeaders(t, w)
 	})
+}
+
+func TestSetupModeLifecycleAndHealthRoutes(t *testing.T) {
+	// Setup mode with valid setup token and public URL, but missing LLM credentials
+	// and an App ID pointing to a non-existent private key file.
+	cfg := &config.Config{
+		GitHubAppSetupToken:     "valid-setup-token-999",
+		PublicURL:               "https://review.example.com",
+		GitHubAppID:             12345,
+		GitHubAppPrivateKeyPath: "/nonexistent/path/to/key.pem",
+		LLMAPIKey:               "",
+		LLMModel:                "",
+		LLMBaseURL:              "",
+		AutoActions:             []string{"review"},
+	}
+
+	// NewServer must not panic even with missing LLM credentials and unreadable private key
+	var srv *Server
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("NewServer panicked in setup mode: %v", r)
+		}
+	}()
+	srv = NewServer(cfg)
+	if srv == nil {
+		t.Fatalf("expected non-nil server")
+	}
+
+	routes := srv.Routes()
+
+	// 1. GET /healthz must return 200 OK
+	reqHealth := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	wHealth := httptest.NewRecorder()
+	routes.ServeHTTP(wHealth, reqHealth)
+	if wHealth.Code != http.StatusOK {
+		t.Errorf("GET /healthz status = %d, want 200", wHealth.Code)
+	}
+
+	// 2. GET / must return 200 OK
+	reqRoot := httptest.NewRequest(http.MethodGet, "/", nil)
+	wRoot := httptest.NewRecorder()
+	routes.ServeHTTP(wRoot, reqRoot)
+	if wRoot.Code != http.StatusOK {
+		t.Errorf("GET / status = %d, want 200", wRoot.Code)
+	}
+
+	// 3. POST /api/v1/github_webhooks must not be mounted in setup mode (returns 404)
+	reqWebhook := httptest.NewRequest(http.MethodPost, "/api/v1/github_webhooks", nil)
+	wWebhook := httptest.NewRecorder()
+	routes.ServeHTTP(wWebhook, reqWebhook)
+	if wWebhook.Code != http.StatusNotFound {
+		t.Errorf("POST /api/v1/github_webhooks status = %d, want 404", wWebhook.Code)
+	}
 }

@@ -43,6 +43,8 @@ type AppAuth struct {
 
 	mu    sync.Mutex
 	repos map[string]*repoEntry
+
+	onEntrySelected func(repoKey string, entry *repoEntry)
 }
 
 type repoEntry struct {
@@ -269,6 +271,14 @@ func (a *AppAuth) createInstallationToken(ctx context.Context, installationID in
 	}, nil
 }
 
+func (a *AppAuth) evictEntry(repoKey string, entry *repoEntry) {
+	a.mu.Lock()
+	if a.repos[repoKey] == entry {
+		delete(a.repos, repoKey)
+	}
+	a.mu.Unlock()
+}
+
 func (a *AppAuth) getClient(ctx context.Context, owner, repo string) (*gh.Client, error) {
 	owner = strings.TrimSpace(owner)
 	repo = strings.TrimSpace(repo)
@@ -277,82 +287,109 @@ func (a *AppAuth) getClient(ctx context.Context, owner, repo string) (*gh.Client
 	}
 	repoKey := strings.ToLower(owner) + "/" + strings.ToLower(repo)
 
-	// Acquire or allocate the per-repository entry under the global map lock.
-	// Network I/O is explicitly kept outside this global lock so cold lookups on one
-	// repository do not block cached or concurrent lookups on other repositories.
-	a.mu.Lock()
-	entry, ok := a.repos[repoKey]
-	if !ok {
-		entry = &repoEntry{}
-		a.repos[repoKey] = entry
-	}
-	a.mu.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
-
-	if entry.inst != nil {
-		return entry.inst.ghClient, nil
-	}
-
-	installationID, err := a.getRepoInstallationID(ctx, owner, repo)
-	if err != nil {
+		// Acquire or allocate the per-repository entry under the global map lock.
+		// Network I/O is explicitly kept outside this global lock so cold lookups on one
+		// repository do not block cached or concurrent lookups on other repositories.
 		a.mu.Lock()
-		delete(a.repos, repoKey)
+		entry, ok := a.repos[repoKey]
+		if !ok {
+			entry = &repoEntry{}
+			a.repos[repoKey] = entry
+		}
 		a.mu.Unlock()
-		return nil, fmt.Errorf("get installation for %s/%s: %w", owner, repo, err)
-	}
 
-	token, err := a.createInstallationToken(ctx, installationID)
-	if err != nil {
+		if a.onEntrySelected != nil {
+			a.onEntrySelected(repoKey, entry)
+		}
+
+		entry.mu.Lock()
+
+		// Verify whether this entry is still current in a.repos.
+		// If a concurrent error or retry already evicted or replaced it,
+		// release entry.mu and retry with the active entry.
 		a.mu.Lock()
-		delete(a.repos, repoKey)
+		current := a.repos[repoKey]
 		a.mu.Unlock()
-		return nil, fmt.Errorf("create installation token for %s/%s (installation %d): %w", owner, repo, installationID, err)
+
+		if current != entry {
+			entry.mu.Unlock()
+			continue
+		}
+
+		if entry.inst != nil {
+			client := entry.inst.ghClient
+			entry.mu.Unlock()
+			return client, nil
+		}
+
+		if err := ctx.Err(); err != nil {
+			entry.mu.Unlock()
+			return nil, err
+		}
+
+		installationID, err := a.getRepoInstallationID(ctx, owner, repo)
+		if err != nil {
+			a.evictEntry(repoKey, entry)
+			entry.mu.Unlock()
+			return nil, fmt.Errorf("get installation for %s/%s: %w", owner, repo, err)
+		}
+
+		token, err := a.createInstallationToken(ctx, installationID)
+		if err != nil {
+			a.evictEntry(repoKey, entry)
+			entry.mu.Unlock()
+			return nil, fmt.Errorf("create installation token for %s/%s (installation %d): %w", owner, repo, installationID, err)
+		}
+
+		repoInst := &repoInstallation{
+			owner:          owner,
+			repo:           repo,
+			installationID: installationID,
+			token:          token,
+		}
+
+		tokenSource := &repoTokenSource{
+			appAuth:  a,
+			repoInst: repoInst,
+		}
+
+		earlyExpiry := a.earlyExpiry
+		if earlyExpiry <= 0 {
+			earlyExpiry = 5 * time.Minute
+		}
+
+		// ReuseTokenSourceWithExpiry ensures proactive token refresh occurs whenever
+		// the token is within earlyExpiry (default 5m) of expiration, rather than the default 10s.
+		reuseSource := oauth2.ReuseTokenSourceWithExpiry(token, tokenSource, earlyExpiry)
+
+		transport := http.DefaultTransport
+		if a.httpClient != nil && a.httpClient.Transport != nil {
+			transport = a.httpClient.Transport
+		}
+
+		httpClient := &http.Client{
+			Transport: &oauth2.Transport{
+				Source: reuseSource,
+				Base:   transport,
+			},
+		}
+
+		ghClient := gh.NewClient(httpClient)
+		if a.parsedBaseURL != nil {
+			ghClient.BaseURL = a.parsedBaseURL
+		}
+
+		repoInst.ghClient = ghClient
+		entry.inst = repoInst
+		entry.mu.Unlock()
+
+		return ghClient, nil
 	}
-
-	repoInst := &repoInstallation{
-		owner:          owner,
-		repo:           repo,
-		installationID: installationID,
-		token:          token,
-	}
-
-	tokenSource := &repoTokenSource{
-		appAuth:  a,
-		repoInst: repoInst,
-	}
-
-	earlyExpiry := a.earlyExpiry
-	if earlyExpiry <= 0 {
-		earlyExpiry = 5 * time.Minute
-	}
-
-	// ReuseTokenSourceWithExpiry ensures proactive token refresh occurs whenever
-	// the token is within earlyExpiry (default 5m) of expiration, rather than the default 10s.
-	reuseSource := oauth2.ReuseTokenSourceWithExpiry(token, tokenSource, earlyExpiry)
-
-	transport := http.DefaultTransport
-	if a.httpClient != nil && a.httpClient.Transport != nil {
-		transport = a.httpClient.Transport
-	}
-
-	httpClient := &http.Client{
-		Transport: &oauth2.Transport{
-			Source: reuseSource,
-			Base:   transport,
-		},
-	}
-
-	ghClient := gh.NewClient(httpClient)
-	if a.parsedBaseURL != nil {
-		ghClient.BaseURL = a.parsedBaseURL
-	}
-
-	repoInst.ghClient = ghClient
-	entry.inst = repoInst
-
-	return ghClient, nil
 }
 
 func (s *repoTokenSource) Token() (*oauth2.Token, error) {

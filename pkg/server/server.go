@@ -24,19 +24,25 @@ import (
 )
 
 type Server struct {
-	cfg        *config.Config
-	engine     *reviewer.Engine
-	labeler    *labeler.Labeler
-	summarizer *summarizer.Summarizer
-	assistant  *assistant.Assistant
-	describer  *describer.Describer
-	changelog  *changelog.Updater
-	gh         *ghclient.Client
+	cfg          *config.Config
+	engine       *reviewer.Engine
+	labeler      *labeler.Labeler
+	summarizer   *summarizer.Summarizer
+	assistant    *assistant.Assistant
+	describer    *describer.Describer
+	changelog    *changelog.Updater
+	gh           *ghclient.Client
+	dispatchHook func(action, owner, repo string, prNum int)
 }
 
 func NewServer(cfg *config.Config) *Server {
 	if err := cfg.Validate(); err != nil {
 		panic(fmt.Sprintf("invalid config: %v", err))
+	}
+	if cfg.IsGitHubAppSetupMode() {
+		return &Server{
+			cfg: cfg,
+		}
 	}
 	return &Server{
 		cfg:        cfg,
@@ -52,17 +58,18 @@ func NewServer(cfg *config.Config) *Server {
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
+
+	// Health check (always available, including in setup mode)
+	mux.HandleFunc("GET /{$}", s.handleHealth)
+	mux.HandleFunc("GET /healthz", s.handleHealth)
+
 	if s.cfg.IsGitHubAppSetupMode() {
 		mux.HandleFunc("GET /setup/github-app", s.handleGitHubAppSetup)
 		mux.HandleFunc("GET /setup/github-app/callback", s.handleGitHubAppCallback)
 		return mux
 	}
 
-	// Health check
-	mux.HandleFunc("GET /", s.handleHealth)
-	mux.HandleFunc("GET /healthz", s.handleHealth)
-
-	// Webhook endpoint
+	// Webhook endpoint (only in normal mode)
 	mux.HandleFunc("POST /api/v1/github_webhooks", s.handleWebhook)
 
 	return mux
@@ -184,33 +191,40 @@ func (s *Server) handleIssueCommentEvent(ctx context.Context, e *github.IssueCom
 		return
 	}
 
+	dispatch := func(action string, runner func()) {
+		if s.dispatchHook != nil {
+			s.dispatchHook(action, owner, repo, prNum)
+		}
+		go runner()
+	}
+
 	if strings.HasPrefix(body, "/review") {
 		log.Printf("[webhook] PR %s/%s #%d triggered review by comment: %s", owner, repo, prNum, body)
-		go s.dispatchReview(owner, repo, prNum)
+		dispatch("review", func() { s.dispatchReview(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/improve") {
 		log.Printf("[webhook] PR %s/%s #%d triggered improvements", owner, repo, prNum)
-		go s.dispatchImprove(owner, repo, prNum)
+		dispatch("improve", func() { s.dispatchImprove(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/describe") {
 		log.Printf("[webhook] PR %s/%s #%d triggered description generation", owner, repo, prNum)
-		go s.dispatchDescribe(owner, repo, prNum)
+		dispatch("describe", func() { s.dispatchDescribe(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/update_changelog") {
 		log.Printf("[webhook] PR %s/%s #%d triggered changelog update", owner, repo, prNum)
-		go s.dispatchChangelog(owner, repo, prNum)
+		dispatch("changelog", func() { s.dispatchChangelog(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/generate_labels") || strings.HasPrefix(body, "/labels") {
 		log.Printf("[webhook] PR %s/%s #%d triggered label generation by comment: %s", owner, repo, prNum, body)
-		go s.dispatchLabels(owner, repo, prNum)
+		dispatch("labels", func() { s.dispatchLabels(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/summarize") || strings.HasPrefix(body, "/summary") {
 		log.Printf("[webhook] PR %s/%s #%d triggered discussion summary by comment: %s", owner, repo, prNum, body)
-		go s.dispatchSummary(owner, repo, prNum)
+		dispatch("summary", func() { s.dispatchSummary(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/add_docs") || strings.HasPrefix(body, "/docs") {
 		log.Printf("[webhook] PR %s/%s #%d triggered add_docs by comment: %s", owner, repo, prNum, body)
-		go s.dispatchAddDocs(owner, repo, prNum)
+		dispatch("add_docs", func() { s.dispatchAddDocs(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "@pr-review") || strings.HasPrefix(body, "/ask") {
 		question := strings.TrimSpace(strings.TrimPrefix(body, "@bot"))
 		question = strings.TrimSpace(strings.TrimPrefix(question, "@pr-review"))
 		question = strings.TrimSpace(strings.TrimPrefix(question, "/ask"))
 		log.Printf("[webhook] PR %s/%s #%d triggered interactive assistant: %s", owner, repo, prNum, question)
-		go s.dispatchAssistant(owner, repo, prNum, question)
+		dispatch("assistant", func() { s.dispatchAssistant(owner, repo, prNum, question) })
 	}
 }
 
