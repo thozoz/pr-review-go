@@ -58,6 +58,12 @@ function main() {
       'expected all platform package publish lines to precede the main package publish line'
     );
 
+    require('node:assert/strict').throws(() => publishAll({ npmRoot, dryRun: true, otp: '123456 & echo injected' }), /NPM_OTP/);
+    const firstPath = path.join(npmRoot, mapping[0].dir, 'package.json');
+    const first = JSON.parse(fs.readFileSync(firstPath));
+    first.version = '8.8.8';
+    fs.writeFileSync(firstPath, JSON.stringify(first));
+    require('node:assert/strict').throws(() => publishAll({ npmRoot, dryRun: true }), /versions must match/);
     console.log('publish-all.test.js: PASS');
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });

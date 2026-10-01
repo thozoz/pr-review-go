@@ -18,9 +18,7 @@ try {
     cwd: tmp, stdio: 'inherit',
   });
   for (const command of ['pr-review-go', 'pr-review-server']) {
-    const output = execFileSync(process.execPath, [
-      path.join(tmp, 'node_modules/@thozoz/pr-review-go/bin', `${command}.js`), '-version',
-    ], { encoding: 'utf8' });
+    const output = execFileSync(path.join(tmp, 'node_modules/.bin', command), ['-version'], { encoding: 'utf8' });
     assert.ok(output.startsWith(`${command} `), output);
     console.log(output.trim());
   }

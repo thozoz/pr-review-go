@@ -13,9 +13,9 @@ function packageArtifacts({ artifacts, version, npmRoot, repoRoot }) {
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/.test(version)) {
     throw new Error('packageArtifacts: version is required');
   }
-  if (!Array.isArray(artifacts) || artifacts.length !== 12) {
+  if (!Array.isArray(artifacts) || artifacts.length !== mapping.length * 2) {
     throw new Error(
-      `packageArtifacts: expected exactly 12 artifacts, got ${Array.isArray(artifacts) ? artifacts.length : typeof artifacts}`
+      `packageArtifacts: expected exactly ${mapping.length * 2} artifacts, got ${Array.isArray(artifacts) ? artifacts.length : typeof artifacts}`
     );
   }
 
@@ -37,6 +37,14 @@ function packageArtifacts({ artifacts, version, npmRoot, repoRoot }) {
       `packageArtifacts: missing artifacts for mapping rows: ${missing.join(', ')} (found: ${found.join(', ')})`
     );
   }
+
+  // Reject missing files or malformed manifests before changing any package.
+  for (const { artifact, row } of matched) {
+    const src = path.isAbsolute(artifact.path) ? artifact.path : path.resolve(repoRoot, artifact.path);
+    if (!fs.statSync(src).isFile()) throw new Error('Artifact is not a file');
+    JSON.parse(fs.readFileSync(path.join(npmRoot, row.dir, 'package.json'), 'utf8'));
+  }
+  JSON.parse(fs.readFileSync(path.join(npmRoot, 'pr-review-go', 'package.json'), 'utf8'));
 
   for (const { artifact, row } of matched) {
     const destDir = path.join(npmRoot, row.dir, 'bin');

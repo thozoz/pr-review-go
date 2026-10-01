@@ -20,6 +20,9 @@ const IS_WINDOWS = process.platform === 'win32';
 
 function runNpm(args, options) {
   if (IS_WINDOWS) {
+    if (args.some((arg) => !/^[A-Za-z0-9@/_.:-]+$/.test(arg))) {
+      throw new Error('Unsafe npm argument for Windows shell');
+    }
     return execSync(['npm.cmd', ...args].join(' '), options);
   }
   return execFileSync('npm', args, options);
@@ -30,7 +33,10 @@ function runNpm(args, options) {
 // the bootstrap script is often run from a non-TTY shell where no prompt is possible.
 // Accounts set to "Authorization only" need nothing here.
 function publishAll({ npmRoot, dryRun = false, log = console.log, otp = process.env.NPM_OTP }) {
+  if (otp && !/^\d{6}$/.test(otp)) throw new Error('NPM_OTP must contain exactly six digits');
   const dirs = [...mapping.map((row) => row.dir), 'pr-review-go'];
+  const versions = dirs.map((dir) => JSON.parse(fs.readFileSync(path.join(npmRoot, dir, 'package.json'), 'utf8')).version);
+  if (new Set(versions).size !== 1) throw new Error('npm package versions must match before publishing');
 
   for (const dir of dirs) {
     const pkgPath = path.join(npmRoot, dir, 'package.json');

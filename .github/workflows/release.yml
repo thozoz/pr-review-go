@@ -129,7 +129,7 @@ jobs:
 
   npm:
     name: Publish npm packages (opt-in)
-    if: vars.NPM_PUBLISH_ENABLED == 'true'
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request' && vars.NPM_PUBLISH_ENABLED == 'true'
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
