@@ -35,6 +35,36 @@ deploy/
 
 ## Quick Start
 
+### Install a release
+
+Version tags such as `v1.0.0` trigger tests, then publish a GitHub Release with
+Linux, macOS, and Windows archives for amd64 and arm64. Each archive contains
+`pr-review-go` and `pr-review-server`; `checksums.txt` contains SHA-256 checksums.
+Both binaries accept `-version` without requiring credentials.
+
+The same tag publishes a multi-platform server image:
+
+```bash
+docker run --rm --env-file .env -p 3000:3000 ghcr.io/thozoz/pr-review-go:1.0.0
+```
+
+Images use explicit version tags; stable releases also update `latest`.
+Pre-releases do not replace `latest`.
+The Docker image includes Git for workspace cloning. Packaging does not change
+the documented host-clone and filesystem isolation limits of PR review.
+
+After npm publishing is enabled, install both commands with:
+
+```bash
+npm install -g @thozoz/pr-review-go
+pr-review-go -version
+pr-review-server -version
+```
+
+The npm wrapper selects one of six platform packages through optional dependencies.
+Do not install with `--omit=optional`. npm publication is initially disabled;
+see [release setup](docs/RELEASING.md) for the one-time publisher configuration.
+
 ### 1. Build
 ```bash
 go build -o bin/pr-review-go ./cmd/pr-review-go
