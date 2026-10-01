@@ -1,0 +1,20 @@
+{
+  "name": "@thozoz/pr-review-go-win32-arm64",
+  "version": "0.0.0",
+  "description": "AI PR reviewer and read-only assistant \u2014 prebuilt Go CLI and webhook server",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thozoz/pr-review-go.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/pr-review-go.exe",
+    "bin/pr-review-server.exe"
+  ]
+}

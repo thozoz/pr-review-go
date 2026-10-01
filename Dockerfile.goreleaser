@@ -1,0 +1,7 @@
+FROM alpine:3.23
+RUN apk add --no-cache ca-certificates git tzdata
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/pr-review-server /usr/local/bin/pr-review-server
+WORKDIR /app
+EXPOSE 3000
+ENTRYPOINT ["pr-review-server"]

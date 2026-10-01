@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Test and package release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node -e 'if (!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/.test(process.env.RELEASE_TAG)) process.exit(1)'
+      - name: Verify dependencies and tests
+        run: |
+          go mod verify
+          go vet ./...
+          go test -race -count=1 -timeout=5m ./...
+          node npm/scripts/lib/package-artifacts.test.js
+          node npm/scripts/lib/publish-all.test.js
+      - name: Build snapshot archives
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          version: v2.18.2
+          args: release --snapshot --clean --skip=docker
+      - name: Smoke test binaries
+        run: |
+          dist/pr-review-go_linux_amd64_v1/pr-review-go -version
+          dist/pr-review-server_linux_amd64_v1/pr-review-server -version
+      - name: Smoke test Docker image
+        run: |
+          mkdir -p dist/docker/linux/amd64
+          cp dist/pr-review-server_linux_amd64_v1/pr-review-server dist/docker/linux/amd64/
+          docker build -f Dockerfile.goreleaser --build-arg TARGETPLATFORM=linux/amd64 -t pr-review-go:ci dist/docker
+          docker run --rm pr-review-go:ci -version
+      - name: Prepare and validate npm tarballs
+        env:
+          VERSION: 0.0.0-ci.${{ github.run_number }}
+          DRY_RUN: 'true'
+        run: |
+          node npm/scripts/prepare.js
+          node npm/scripts/publish.js
+          mkdir -p dist/npm
+          for package in npm/pr-review-go*/; do
+            npm pack "./${package}" --pack-destination dist/npm
+          done
+          node npm/scripts/smoke.js
+      - name: Upload preview packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-preview
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+            dist/npm/*.tgz
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release and Docker image
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          version: v2.18.2
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+      - name: Prepare npm release packages
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${RELEASE_TAG#v}" node npm/scripts/prepare.js
+          tar -czf dist/npm-release.tar.gz npm/pr-review-go*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-release
+          path: dist/npm-release.tar.gz
+          retention-days: 14
+
+  npm:
+    name: Publish npm packages (opt-in)
+    if: vars.NPM_PUBLISH_ENABLED == 'true'
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: npm-release
+          path: dist
+      - name: Restore npm release packages
+        run: tar -xzf dist/npm-release.tar.gz
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+      - name: Verify OIDC-capable npm
+        run: |
+          node -e 'const [a,b,c]=require("child_process").execFileSync("npm",["--version"],{encoding:"utf8"}).trim().split(".").map(Number); if(a<11 || (a===11 && (b<5 || (b===5 && c<1)))) process.exit(1)'
+      - name: Publish platform packages, then CLI
+        run: node npm/scripts/publish.js

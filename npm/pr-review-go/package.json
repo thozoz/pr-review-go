@@ -1,0 +1,38 @@
+{
+  "name": "@thozoz/pr-review-go",
+  "version": "0.0.0",
+  "description": "AI PR reviewer and read-only assistant \u2014 prebuilt Go CLI and webhook server",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thozoz/pr-review-go.git"
+  },
+  "bin": {
+    "pr-review-go": "bin/pr-review-go.js",
+    "pr-review-server": "bin/pr-review-server.js"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/pr-review-go.js",
+    "bin/pr-review-server.js"
+  ],
+  "optionalDependencies": {
+    "@thozoz/pr-review-go-linux-x64": "0.0.0",
+    "@thozoz/pr-review-go-linux-arm64": "0.0.0",
+    "@thozoz/pr-review-go-darwin-x64": "0.0.0",
+    "@thozoz/pr-review-go-darwin-arm64": "0.0.0",
+    "@thozoz/pr-review-go-win32-x64": "0.0.0",
+    "@thozoz/pr-review-go-win32-arm64": "0.0.0"
+  }
+}

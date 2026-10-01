@@ -19,6 +19,7 @@ import (
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 	"github.com/thozoz/pr-review-go/pkg/server"
 	"github.com/thozoz/pr-review-go/pkg/summarizer"
+	"github.com/thozoz/pr-review-go/pkg/version"
 )
 
 func main() {
@@ -37,7 +38,12 @@ func main() {
 	effortFlag := flag.String("effort", "", "Review effort level: 'lite' (fast, diff-only) or 'balanced' (default, workspace-assisted; build/tests skipped)")
 	noSandbox := flag.Bool("no-sandbox", false, "Disable local runner sandbox verification")
 	modelFlag := flag.String("model", "", "LLM model to use")
+	showVersion := flag.Bool("version", false, "Print release version")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("pr-review-go %s (%s, %s)\n", version.Version, version.Commit, version.Date)
+		return
+	}
 
 	cfg := config.Load()
 	if *modelFlag != "" {
