@@ -112,7 +112,7 @@ func (r *Runner) PrepareWorkspace(ctx context.Context, cloneURL, headRef, headSH
 	return tmpDir, cleanup, nil
 }
 
-// VerifyProject detects project type, executes compilation/tests, and extracts custom instruction rules
+// VerifyProject detects project type and extracts custom rules; execution requires container isolation.
 func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationReport, error) {
 	report := &VerificationReport{
 		WorkspaceDir: dir,
@@ -123,19 +123,21 @@ func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationRe
 	r.extractCustomRules(dir, report)
 
 	// 1. Detect environment
+	// Note: Host execution of build/test commands is disabled until real container
+	// isolation is implemented to prevent executing untrusted PR code on the host.
 	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
 		report.DetectedType = "go"
-		r.runGoVerification(ctx, dir, report)
+		report.Summary = "SKIPPED: Verification skipped due to missing container isolation."
 	} else if _, err := os.Stat(filepath.Join(dir, "package.json")); err == nil {
 		report.DetectedType = "node"
-		r.runNodeVerification(ctx, dir, report)
+		report.Summary = "SKIPPED: Verification skipped due to missing container isolation."
 	} else if _, err := os.Stat(filepath.Join(dir, "Cargo.toml")); err == nil {
 		report.DetectedType = "rust"
-		r.runRustVerification(ctx, dir, report)
+		report.Summary = "SKIPPED: Verification skipped due to missing container isolation."
 	} else if _, err := os.Stat(filepath.Join(dir, "pyproject.toml")); err == nil ||
 		fileExists(filepath.Join(dir, "requirements.txt")) {
 		report.DetectedType = "python"
-		r.runPythonVerification(ctx, dir, report)
+		report.Summary = "SKIPPED: Verification skipped due to missing container isolation."
 	} else {
 		report.DetectedType = "generic"
 		report.Summary = "No recognized build/test configuration found."

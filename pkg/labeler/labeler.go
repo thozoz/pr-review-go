@@ -39,7 +39,7 @@ func NewLabeler(cfg *config.Config) *Labeler {
 	}
 	return &Labeler{
 		cfg: cfg,
-		gh:  github.NewClient(cfg.GitHubToken),
+		gh:  github.NewClientFromConfig(cfg),
 		llm: llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
 }
@@ -134,11 +134,11 @@ func buildUserPrompt(pr *github.PRDetails, diff string) string {
 
 func parseLabelsJSON(raw string) ([]string, error) {
 	trimmed := strings.TrimSpace(raw)
-	
+
 	// Try to find JSON in the response
 	jsonStart := strings.Index(trimmed, "{")
 	jsonEnd := strings.LastIndex(trimmed, "}")
-	
+
 	if jsonStart >= 0 && jsonEnd > jsonStart {
 		trimmed = trimmed[jsonStart : jsonEnd+1]
 	}

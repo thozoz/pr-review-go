@@ -89,3 +89,77 @@ func TestValidateInvalidAutoAction(t *testing.T) {
 		t.Fatal("expected validation error for invalid auto action")
 	}
 }
+
+func TestValidateGitHubAppModeRequiresLLMSettings(t *testing.T) {
+	tests := []struct {
+		name        string
+		cfg         *Config
+		expectedErr string
+	}{
+		{
+			name: "missing LLM_API_KEY",
+			cfg: &Config{
+				GitHubAppID:             12345,
+				GitHubAppPrivateKeyPath: "/path/to/key.pem",
+				LLMModel:                "gpt-4o",
+				LLMBaseURL:              "https://api.openai.com/v1",
+			},
+			expectedErr: "LLM_API_KEY or OPENAI_API_KEY is required",
+		},
+		{
+			name: "missing LLM_MODEL",
+			cfg: &Config{
+				GitHubAppID:             12345,
+				GitHubAppPrivateKeyPath: "/path/to/key.pem",
+				LLMAPIKey:               "test-key",
+				LLMBaseURL:              "https://api.openai.com/v1",
+			},
+			expectedErr: "LLM_MODEL is required",
+		},
+		{
+			name: "missing LLM_BASE_URL",
+			cfg: &Config{
+				GitHubAppID:             12345,
+				GitHubAppPrivateKeyPath: "/path/to/key.pem",
+				LLMAPIKey:               "test-key",
+				LLMModel:                "gpt-4o",
+			},
+			expectedErr: "LLM_BASE_URL is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected validation error %q, got nil", tt.expectedErr)
+			}
+			if err.Error() != tt.expectedErr {
+				t.Fatalf("expected error %q, got %q", tt.expectedErr, err.Error())
+			}
+		})
+	}
+}
+
+func TestValidateGitHubAppModePositive(t *testing.T) {
+	cfg := &Config{
+		GitHubAppID:             12345,
+		GitHubAppPrivateKeyPath: "/path/to/key.pem",
+		LLMAPIKey:               "test-key",
+		LLMModel:                "gpt-4o",
+		LLMBaseURL:              "https://api.openai.com/v1",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config for App mode with LLM settings, got: %v", err)
+	}
+}
+
+func TestValidateSetupModeBypassesAuthAndLLM(t *testing.T) {
+	cfg := &Config{
+		GitHubAppSetupToken: "setup-token",
+		PublicURL:           "https://example.com",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected setup mode to bypass auth and LLM validation, got: %v", err)
+	}
+}

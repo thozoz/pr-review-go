@@ -24,9 +24,8 @@ Bu doküman, `pr-review-go` projesinin tüm mimari bileşenlerini, eklenen yeten
 └──────┬───────┘             └──────┬───────┘             └──────┬───────┘
        │                            │                            │
        ├─► pkg/sandbox              └─► GitHub API               ├─► Tool: read_file
-       │   (Klon, Test, Linter,         (Yorum Geçmişi)          ├─► Tool: write_file
-       │    Kural Dosyası Taraması)                              ├─► Tool: run_command
-       │                                                         └─► Tool: commit_and_push
+       │   (Geçici klon; derleme/       (Yorum Geçmişi)          └─► Tool: list_files
+       │    test devre dışı)
        └─► pkg/llm (LiteLLM / OpenAI)
            (Structured JSON & Promptlar)
 ```
@@ -35,15 +34,13 @@ Bu doküman, `pr-review-go` projesinin tüm mimari bileşenlerini, eklenen yeten
 
 ## 2. Mevcut Özellikler ve Çalışma Mantıkları
 
-### A. Sandbox Doğrulamalı Kod İnceleme (`pkg/reviewer`, `pkg/sandbox`)
-- **Tetikleyici:** PR açıldığında (`opened`), yeni commit pushlandığında (`synchronize`) veya yoruma `/review` yazıldığında.
+### A. Kod İnceleme (`pkg/reviewer`, `pkg/sandbox`)
+- **Tetikleyici:** PR açıldığında (`opened`), yeni commit pushlandığında (`synchronize`) veya yetkili kullanıcı yoruma `/review` yazdığında.
 - **Mantık:**
-  1. PR dalı geçici bir `/tmp/pr-review-sandbox-*` dizinine (veya Podman container'ına) `git clone` ile çekilir.
-  2. Proje tipi otomatik algılanır (`go.mod`, `package.json`, `Cargo.toml`, `pyproject.toml`).
-  3. Gerçek derleyici ve testler çalıştırılır (`go build`, `go test -race`, `cargo check`, `pytest` vb.).
-  4. Çıkan hata logları veya "başarılı" sinyali LLM'e kanıt olarak verilir.
-  5. **Sonuç:** LLM çalışan koda "burası bozuk" diyemez (halüsinasyon sıfırlanır).
-  6. İnceleme bittiğinde geçici dizin diskten tamamen silinir (`defer cleanup()`).
+  1. Balanced modda PR dalı host üzerinde geçici dizine `git clone` ile çekilir; bu işlem container izolasyonu sağlamaz.
+  2. Proje tipi algılanır (`go.mod`, `package.json`, `Cargo.toml`, `pyproject.toml`).
+  3. Container izolasyonu kurulana kadar PR derleme ve test komutları çalıştırılmaz; doğrulama atlandı bilgisi rapora girer.
+  4. İnceleme bitince geçici dizin silinir (`defer cleanup()`).
 
 ### B. Repo Özel Kuralları Taraması (`Custom Instructions Scanner`)
 - **Konum:** `pkg/sandbox/runner.go` -> `extractCustomRules()`
@@ -51,7 +48,7 @@ Bu doküman, `pr-review-go` projesinin tüm mimari bileşenlerini, eklenen yeten
   - Repo içinde ve `.github/` klasöründe dinamik tarama yapar.
   - Öncelikli: `.github/copilot-instructions.md`, `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `.cursorrules`.
   - Heuristic Tarayıcı: Adında `instruct`, `guide`, `rule`, `contribut`, `agent`, `standard`, `convention` geçen tüm markdown dosyalarını yakalar.
-  - Yakalanan kurallar LLM'in sistem promptuna `CRITICAL: You MUST strictly enforce the project's repository custom instructions` olarak enjekte edilir.
+  - Yakalanan içerik güvenilmeyen PR verisidir; reviewer system/user prompt'una talimat olarak eklenmez.
 
 ### C. Tartışma ve Yorum Takibi (`Discussion Memory`)
 - **Konum:** `pkg/github/client.go` -> `GetComments()`
@@ -79,16 +76,13 @@ Bu doküman, `pr-review-go` projesinin tüm mimari bileşenlerini, eklenen yeten
     - *Aksiyon Maddeleri (Action Items)*
   - PR altına yönetici özeti olarak basar.
 
-### F. Otonom İnteraktif Kodlama Ajanı (`pkg/assistant` - `@bot`)
-- **Tetikleyici:** PR yorumunda `@bot <talimat>`, `@pr-review <talimat>` veya `/ask <talimat>` yazıldığında.
+### F. Salt Okunur İnteraktif Asistan (`pkg/assistant` - `@bot`)
+- **Tetikleyici:** Yazma iznine sahip kullanıcı PR yorumunda `@bot <soru>`, `@pr-review <soru>` veya `/ask <soru>` yazdığında.
 - **Mantık (Tool-Calling Loop):**
-  - PR dalını sandbox'a çeker.
-  - Modelin kullanımına 4 temel araç sunar:
-    1. `read_file(path)`: Dosya içeriğini okur.
-    2. `write_file(path, content)`: Dosyayı günceller / sıfırdan yazar.
-    3. `run_command(cmd)`: İlgili dizinde terminal komutu koşturur (test, linter, git vb.).
-    4. `commit_and_push(commit_msg)`: Yapılan değişiklikleri `pr-review-go[bot]` adıyla PR dalına yeni commit olarak pushlar.
-  - Model kullanıcı talimatına göre 6 adıma kadar otonom iterasyon yapabilir; işi bitince PR yorumuna açıklamasını bırakır.
+  - PR dalını geçici çalışma dizinine çeker.
+  - `read_file(path)` ve `list_files(path)` ile dosyaları inceler; `answer` ile yanıt verir.
+  - `write_file`, `run_command` ve `commit_and_push` çağrıları reddedilir; dosya değişikliği veya push yapmaz.
+  - En fazla 6 araç adımından sonra PR yorumuna yanıtını bırakır.
 
 ### G. SHA-256 Yorum Deduplication (`pkg/dedup`)
 - **Mantık:**
@@ -104,7 +98,7 @@ Bu doküman, `pr-review-go` projesinin tüm mimari bileşenlerini, eklenen yeten
 
 ### I. Hız Seviyeleri: Lite vs Balanced (`pkg/config`, `pkg/reviewer`)
 - **`lite` Modu:** Hızlı diff ve meta veri tabanlı inceleme; sandbox klonlama ve test koşumunu atlayarak saniyeler içinde review üretir.
-- **`balanced` Modu (Varsayılan):** Kodu sandbox ortamına çekip derleyicileri ve testleri çalıştıran tam güvenilir derin analiz.
+- **`balanced` Modu (Varsayılan):** Kodu geçici çalışma dizinine çeker; container izolasyonu kurulana kadar derleme ve testleri atlar.
 
 ---
 

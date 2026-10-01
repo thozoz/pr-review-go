@@ -1,15 +1,15 @@
 # pr-review-go
 
-High-performance, sandbox-verified AI PR Reviewer and Interactive Assistant written in Go.
+AI PR Reviewer and read-only Interactive Assistant written in Go. Project build/test verification and one-click suggestions are disabled until isolated execution is configured.
 
 Inspired by GitHub Copilot's agentic architecture and PR-Agent:
-1. **Live Sandbox Verification**: Clones PR branch into an isolated temporary workspace and executes real compilers (`go build`, `cargo check`) and unit tests (`go test`, `npm test`, `pytest`) to eliminate hallucinations and verify claims empirically.
+1. **Project Verification (disabled)**: PR source is cloned into a temporary workspace, but build and test commands are skipped until container isolation is configured. Reviews must not claim live verification.
 2. **Review Discussion & Thread Awareness**: Gathers existing PR comments and inline review discussions. Tracks whether previous review feedback was addressed in new commits and prevents repeating resolved debates.
 3. **Discussion Summarizer (`/summarize`)**: Instantly compiles all PR comments, debates, and reviewer feedback into an executive summary table (zero sandbox overhead).
-4. **Interactive PR Assistant (`@bot` / `/ask`)**: Allows developers to mention `@bot` in comments with instructions like *"run tests in pkg/auth"* or *"read server.go line 40"*. The agent iteratively uses tools (`read_file`, `write_file`, `list_files`, `run_command`, `commit_and_push`) in the sandbox to answer.
+4. **Read-only PR Assistant (`@bot` / `/ask`)**: Allows repository writers to ask about PR files, using `read_file` and `list_files`. File writes, command execution, and pushes are unavailable.
 5. **SHA-256 Yorum Deduplication (`pkg/dedup`)**: Prevents duplicate spam findings across multiple `/review` runs on the same PR using deterministic SHA-256 fingerprinting.
-6. **Automatic Documentation Generator (`/add_docs`, `pkg/docgen`)**: Scans PR code for undocumented functions/types and reports or generates godoc comments.
-7. **Effort Levels (`lite` vs `balanced`)**: Choose between fast diff-only inspection (`-effort lite`) and full sandbox-verified deep review (`-effort balanced`).
+6. **Documentation Report (`/add_docs`, `pkg/docgen`)**: Scans PR code for undocumented functions/types and reports missing comments without modifying files.
+7. **Effort Levels (`lite` vs `balanced`)**: Choose between fast diff-only inspection (`-effort lite`) and workspace-assisted review (`-effort balanced`); neither runs PR build/tests.
 8. **Auto-Labeler (`/labels`)**: Context-aware categorization using PR title, description, and diff.
 9. **Daemonless & Lightweight**: Consumes only ~10-15 MB RAM as a daemon.
 
@@ -22,11 +22,11 @@ cmd/
 pkg/
   config/              # Environment & LLM configuration
   github/              # GitHub API client (PRs, diffs, comments, discussions, labels)
-  sandbox/             # Ephemeral workspace runner for compilation & test verification
+  sandbox/             # Ephemeral workspace runner; build/test verification currently disabled
   llm/                 # OpenAI-compatible / LiteLLM API client
   reviewer/            # Review orchestrator, prompt synthesis, and report formatting
   summarizer/          # Fast PR discussion & consensus summarizer
-  assistant/           # Tool-enabled interactive PR assistant (read_file, run_command)
+  assistant/           # Read-only interactive PR assistant (read_file, list_files)
   labeler/             # Auto-labeler based on PR contents
   server/              # GitHub Webhook server with HMAC validation & background runner
 deploy/
@@ -57,14 +57,11 @@ export AUTO_ACTIONS="review,labels,describe"
 # Summarize existing discussions on a PR (no sandbox needed, fast)
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -summary
 
-# Ask interactive assistant to inspect or run code
-./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -ask "Run unit tests and check if there are race conditions"
+# Ask read-only assistant about PR code (no commands are run)
+./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -ask "Explain the changes in server.go"
 
 # Only generate and apply labels
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -labels
-
-# Post safe, inline one-click GitHub suggestions
-./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -improve
 
 # Append an AI-generated purpose and file walkthrough to the PR body
 ./bin/pr-review-go -pr https://github.com/owner/repo/pull/42 -describe
@@ -84,14 +81,14 @@ export PORT=3000
 When running in server mode, incoming webhook triggers:
 - `pull_request`: `opened` -> auto-labels + code review
 - `pull_request`: `synchronize` -> incremental review
-- Comment `/review` -> triggers full sandbox review
-- Comment `/improve` -> posts safe inline GitHub suggestion blocks
+- Comment `/review` -> triggers code review; project build/tests remain disabled
+- Comment `/improve` -> posts an unavailable notice; no suggestions are generated
 - Comment `/describe` -> appends a purpose and file walkthrough to PR body
 - Comment `/update_changelog` -> commits one changelog entry when author has not edited it
 
-`AUTO_ACTIONS` accepts `review`, `labels`, `describe`, and `improve`. Set it empty
+`AUTO_ACTIONS` accepts `review`, `labels`, `describe`, and `improve`, but `improve` is currently skipped. Set it empty
 to disable automatic actions. `review` also runs on later PR updates when selected;
-other automatic actions run only when the PR opens. All commands remain manual.
+other automatic actions run only when the PR opens. Comment commands require repository write permission.
 - Comment `/summarize` or `/summary` -> triggers discussion summary
 - Comment `/labels` or `/generate_labels` -> triggers label generation
 - Comment `@bot <task>`, `@pr-review <task>`, or `/ask <task>` -> launches interactive sandbox assistant
