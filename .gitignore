@@ -30,3 +30,9 @@ dist/
 /CLAUDE.md
 /.claude/
 /.codex/
+
+# npm packaging output
+node_modules/
+*.tgz
+!/npm/pr-review-go/bin/
+!/npm/pr-review-go/bin/*.js

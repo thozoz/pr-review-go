@@ -21,6 +21,7 @@ import (
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 	"github.com/thozoz/pr-review-go/pkg/summarizer"
+	"github.com/thozoz/pr-review-go/pkg/version"
 )
 
 type Server struct {
@@ -80,7 +81,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status":  "ok",
 		"service": "pr-review-go",
-		"version": "1.0.0",
+		"version": version.Version,
 	})
 }
 

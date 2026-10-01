@@ -1,0 +1,59 @@
+version: 2
+project_name: pr-review-go
+
+builds:
+  - id: pr-review-go
+    main: ./cmd/pr-review-go
+    binary: pr-review-go
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X github.com/thozoz/pr-review-go/pkg/version.Version={{ .Version }}
+      - -X github.com/thozoz/pr-review-go/pkg/version.Commit={{ .ShortCommit }}
+      - -X github.com/thozoz/pr-review-go/pkg/version.Date={{ .Date }}
+  - id: pr-review-server
+    main: ./cmd/pr-review-server
+    binary: pr-review-server
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X github.com/thozoz/pr-review-go/pkg/version.Version={{ .Version }}
+      - -X github.com/thozoz/pr-review-go/pkg/version.Commit={{ .ShortCommit }}
+      - -X github.com/thozoz/pr-review-go/pkg/version.Date={{ .Date }}
+
+archives:
+  - ids: [pr-review-go, pr-review-server]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+    files: [README.md, deploy/pr-review.service]
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ['^docs:', '^test:', '^ci:', 'Merge pull request', 'Merge branch']
+
+dockers_v2:
+  - id: server
+    ids: [pr-review-server]
+    dockerfile: Dockerfile.goreleaser
+    images: [ghcr.io/thozoz/pr-review-go]
+    tags: ['{{ .Version }}']
+    platforms: [linux/amd64, linux/arm64]
+    labels:
+      org.opencontainers.image.source: https://github.com/thozoz/pr-review-go
+      org.opencontainers.image.version: '{{ .Version }}'
+      org.opencontainers.image.revision: '{{ .FullCommit }}'
+    sbom: false
