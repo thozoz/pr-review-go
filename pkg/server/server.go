@@ -24,19 +24,25 @@ import (
 )
 
 type Server struct {
-	cfg        *config.Config
-	engine     *reviewer.Engine
-	labeler    *labeler.Labeler
-	summarizer *summarizer.Summarizer
-	assistant  *assistant.Assistant
-	describer  *describer.Describer
-	changelog  *changelog.Updater
-	gh         *ghclient.Client
+	cfg          *config.Config
+	engine       *reviewer.Engine
+	labeler      *labeler.Labeler
+	summarizer   *summarizer.Summarizer
+	assistant    *assistant.Assistant
+	describer    *describer.Describer
+	changelog    *changelog.Updater
+	gh           *ghclient.Client
+	dispatchHook func(action, owner, repo string, prNum int)
 }
 
 func NewServer(cfg *config.Config) *Server {
 	if err := cfg.Validate(); err != nil {
 		panic(fmt.Sprintf("invalid config: %v", err))
+	}
+	if cfg.IsGitHubAppSetupMode() {
+		return &Server{
+			cfg: cfg,
+		}
 	}
 	return &Server{
 		cfg:        cfg,
@@ -46,18 +52,24 @@ func NewServer(cfg *config.Config) *Server {
 		assistant:  assistant.NewAssistant(cfg),
 		describer:  describer.NewDescriber(cfg),
 		changelog:  changelog.NewUpdater(cfg),
-		gh:         ghclient.NewClient(cfg.GitHubToken),
+		gh:         ghclient.NewClientFromConfig(cfg),
 	}
 }
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// Health check
-	mux.HandleFunc("GET /", s.handleHealth)
+	// Health check (always available, including in setup mode)
+	mux.HandleFunc("GET /{$}", s.handleHealth)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 
-	// Webhook endpoint
+	if s.cfg.IsGitHubAppSetupMode() {
+		mux.HandleFunc("GET /setup/github-app", s.handleGitHubAppSetup)
+		mux.HandleFunc("GET /setup/github-app/callback", s.handleGitHubAppCallback)
+		return mux
+	}
+
+	// Webhook endpoint (only in normal mode)
 	mux.HandleFunc("POST /api/v1/github_webhooks", s.handleWebhook)
 
 	return mux
@@ -73,23 +85,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
-	var payload []byte
-	var err error
+	if s.cfg.WebhookSecret == "" {
+		log.Printf("[webhook] Webhook secret not configured")
+		http.Error(w, "webhook secret not configured", http.StatusUnauthorized)
+		return
+	}
 
-	if s.cfg.WebhookSecret != "" {
-		payload, err = github.ValidatePayload(r, []byte(s.cfg.WebhookSecret))
-		if err != nil {
-			log.Printf("[webhook] HMAC validation failed: %v", err)
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
-			return
-		}
-	} else {
-		payload, err = github.ValidatePayload(r, nil)
-		if err != nil {
-			log.Printf("[webhook] Failed to read payload: %v", err)
-			http.Error(w, "bad payload", http.StatusBadRequest)
-			return
-		}
+	payload, err := github.ValidatePayload(r, []byte(s.cfg.WebhookSecret))
+	if err != nil {
+		log.Printf("[webhook] HMAC validation failed: %v", err)
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
 	}
 
 	event, err := github.ParseWebHook(github.WebHookType(r), payload)
@@ -103,7 +109,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	case *github.PullRequestEvent:
 		s.handlePullRequestEvent(e)
 	case *github.IssueCommentEvent:
-		s.handleIssueCommentEvent(e)
+		s.handleIssueCommentEvent(r.Context(), e)
 	default:
 		// Other events ignored silently
 		log.Printf("[webhook] Ignoring event type: %s", github.WebHookType(r))
@@ -141,7 +147,7 @@ func (s *Server) handlePullRequestEvent(e *github.PullRequestEvent) {
 			go s.dispatchDescribe(owner, repo, prNum)
 		}
 		if s.cfg.AutoActionEnabled("improve") {
-			go s.dispatchImprove(owner, repo, prNum)
+			log.Printf("[improve] Skipped for %s/%s #%d: container verification unavailable", owner, repo, prNum)
 		}
 		if s.cfg.AutoActionEnabled("review") {
 			go s.dispatchReview(owner, repo, prNum)
@@ -154,7 +160,7 @@ func (s *Server) handlePullRequestEvent(e *github.PullRequestEvent) {
 	}
 }
 
-func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
+func (s *Server) handleIssueCommentEvent(ctx context.Context, e *github.IssueCommentEvent) {
 	if e.GetAction() != "created" {
 		return
 	}
@@ -173,34 +179,65 @@ func (s *Server) handleIssueCommentEvent(e *github.IssueCommentEvent) {
 		return
 	}
 
+	if !isCommentCommand(body) {
+		return
+	}
+	username := e.GetComment().GetUser().GetLogin()
+	permissionCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	allowed, err := s.gh.CanWriteRepository(permissionCtx, owner, repo, username)
+	if err != nil || !allowed {
+		log.Printf("[webhook] Ignoring comment command from %q on %s/%s #%d: permission denied or unavailable: %v", username, owner, repo, prNum, err)
+		return
+	}
+
+	dispatch := func(action string, runner func()) {
+		if s.dispatchHook != nil {
+			s.dispatchHook(action, owner, repo, prNum)
+		}
+		go runner()
+	}
+
 	if strings.HasPrefix(body, "/review") {
 		log.Printf("[webhook] PR %s/%s #%d triggered review by comment: %s", owner, repo, prNum, body)
-		go s.dispatchReview(owner, repo, prNum)
+		dispatch("review", func() { s.dispatchReview(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/improve") {
 		log.Printf("[webhook] PR %s/%s #%d triggered improvements", owner, repo, prNum)
-		go s.dispatchImprove(owner, repo, prNum)
+		dispatch("improve", func() { s.dispatchImprove(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/describe") {
 		log.Printf("[webhook] PR %s/%s #%d triggered description generation", owner, repo, prNum)
-		go s.dispatchDescribe(owner, repo, prNum)
+		dispatch("describe", func() { s.dispatchDescribe(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/update_changelog") {
 		log.Printf("[webhook] PR %s/%s #%d triggered changelog update", owner, repo, prNum)
-		go s.dispatchChangelog(owner, repo, prNum)
+		dispatch("changelog", func() { s.dispatchChangelog(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/generate_labels") || strings.HasPrefix(body, "/labels") {
 		log.Printf("[webhook] PR %s/%s #%d triggered label generation by comment: %s", owner, repo, prNum, body)
-		go s.dispatchLabels(owner, repo, prNum)
+		dispatch("labels", func() { s.dispatchLabels(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/summarize") || strings.HasPrefix(body, "/summary") {
 		log.Printf("[webhook] PR %s/%s #%d triggered discussion summary by comment: %s", owner, repo, prNum, body)
-		go s.dispatchSummary(owner, repo, prNum)
+		dispatch("summary", func() { s.dispatchSummary(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "/add_docs") || strings.HasPrefix(body, "/docs") {
 		log.Printf("[webhook] PR %s/%s #%d triggered add_docs by comment: %s", owner, repo, prNum, body)
-		go s.dispatchAddDocs(owner, repo, prNum)
+		dispatch("add_docs", func() { s.dispatchAddDocs(owner, repo, prNum) })
 	} else if strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "@pr-review") || strings.HasPrefix(body, "/ask") {
 		question := strings.TrimSpace(strings.TrimPrefix(body, "@bot"))
 		question = strings.TrimSpace(strings.TrimPrefix(question, "@pr-review"))
 		question = strings.TrimSpace(strings.TrimPrefix(question, "/ask"))
 		log.Printf("[webhook] PR %s/%s #%d triggered interactive assistant: %s", owner, repo, prNum, question)
-		go s.dispatchAssistant(owner, repo, prNum, question)
+		dispatch("assistant", func() { s.dispatchAssistant(owner, repo, prNum, question) })
 	}
+}
+
+func isCommentCommand(body string) bool {
+	for _, prefix := range []string{
+		"/review", "/improve", "/describe", "/update_changelog", "/generate_labels", "/labels",
+		"/summarize", "/summary", "/add_docs", "/docs", "@bot", "@pr-review", "/ask",
+	} {
+		if strings.HasPrefix(body, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) dispatchChangelog(owner, repo string, prNum int) {
@@ -226,23 +263,13 @@ func (s *Server) dispatchDescribe(owner, repo string, prNum int) {
 }
 
 func (s *Server) dispatchImprove(owner, repo string, prNum int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	report, err := s.engine.ReviewPR(ctx, owner, repo, prNum)
-	if err != nil {
-		log.Printf("[improve] Review failed for %s/%s #%d: %v", owner, repo, prNum, err)
-		return
+	const message = "## PR Improvement Suggestions\n\nOne-click suggestions are unavailable until isolated project verification is configured. No build or tests were run."
+	if err := s.gh.PostComment(ctx, owner, repo, prNum, message); err != nil {
+		log.Printf("[improve] Failed posting unavailable notice for %s/%s #%d: %v", owner, repo, prNum, err)
 	}
-	if len(report.Suggestions) == 0 {
-		log.Printf("[improve] No safe one-click suggestions for %s/%s #%d", owner, repo, prNum)
-		return
-	}
-	if err := s.gh.PostSuggestions(ctx, owner, repo, prNum, report.HeadSHA, report.Suggestions); err != nil {
-		log.Printf("[improve] Failed posting suggestions for %s/%s #%d: %v", owner, repo, prNum, err)
-		return
-	}
-	log.Printf("[improve] Posted %d suggestions to %s/%s #%d", len(report.Suggestions), owner, repo, prNum)
 }
 
 func (s *Server) dispatchSummary(owner, repo string, prNum int) {

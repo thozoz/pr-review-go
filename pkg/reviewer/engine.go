@@ -27,7 +27,7 @@ func NewEngine(cfg *config.Config) *Engine {
 	}
 	return &Engine{
 		cfg:     cfg,
-		gh:      github.NewClient(cfg.GitHubToken),
+		gh:      github.NewClientFromConfig(cfg),
 		sandbox: sandbox.NewRunner(0),
 		llm:     llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
@@ -60,8 +60,6 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 
 	// 4. Sandbox Verification (Optional/Configurable)
 	var verificationSummary = "Sandbox verification skipped."
-	var customRulesText = ""
-	var rulesSource = ""
 	sandboxVerified := false
 	if e.cfg.EnableSandbox {
 		workDir, cleanup, err := e.sandbox.PrepareWorkspace(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
@@ -70,8 +68,6 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 			verReport, err := e.sandbox.VerifyProject(ctx, workDir)
 			if err == nil {
 				verificationSummary = verReport.Summary
-				customRulesText = verReport.CustomRules
-				rulesSource = verReport.RulesSource
 				sandboxVerified = len(verReport.Results) > 0
 				// If tests or build failed, append stderr/stdout snippet
 				for _, res := range verReport.Results {
@@ -88,8 +84,8 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	}
 
 	// 5. Build Prompts
-	systemPrompt := buildSystemPrompt(customRulesText, rulesSource)
-	userPrompt := buildUserPrompt(pr, diff, generalComments, threads, verificationSummary, customRulesText)
+	systemPrompt := buildSystemPrompt(sandboxVerified)
+	userPrompt := buildUserPrompt(pr, diff, generalComments, threads, verificationSummary, sandboxVerified)
 
 	// 6. Call LLM
 	rawResponse, err := e.llm.ChatCompletion(ctx, systemPrompt, userPrompt)
@@ -133,7 +129,7 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 		Score:               parsed.Score,
 		Summary:             parsed.Summary,
 		VerificationSummary: verificationSummary,
-		RulesSource:         rulesSource,
+		RulesSource:         "",
 		DeduplicatedCount:   skippedCount,
 		CommentFollowups:    parsed.CommentFollowups,
 		Findings:            uniqueFindings,
@@ -146,8 +142,9 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	return report, nil
 }
 
-func buildSystemPrompt(customRules, rulesSource string) string {
-	base := `You are an elite, highly rigorous AI Code Reviewer.
+func buildSystemPrompt(sandboxVerified bool) string {
+	if sandboxVerified {
+		return `You are an elite, highly rigorous AI Code Reviewer.
 Your role is to analyze Pull Requests by combining three critical signals:
 1. Live Sandbox Verification (did the code compile, did tests pass in a real runner).
 2. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
@@ -160,31 +157,39 @@ CRITICAL RULES:
 - Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
 - Set suggested_code only when it is a small, exact, safe replacement for one changed line. It must be compatible with verified sandbox results. Otherwise omit it.
 - Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
-
-	if customRules != "" {
-		base += fmt.Sprintf("\n\nCRITICAL: You MUST strictly enforce the project's repository custom instructions (from %s):\n```markdown\n%s\n```",
-			rulesSource, customRules)
 	}
 
-	return base
+	return `You are an elite, highly rigorous AI Code Reviewer.
+Your role is to analyze Pull Requests by combining two critical signals:
+1. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
+2. The Git Diff.
+
+NOTE: Live sandbox verification was skipped or unavailable. Do not claim or assume live sandbox verification was performed.
+
+CRITICAL RULES:
+- Never hallucinate false bugs. Do not claim builds or tests ran in a live sandbox when verification was skipped.
+- If an existing discussion thread shows a concern was already acknowledged, discussed, or dismissed by the author/reviewer, DO NOT repeat it as a new issue.
+- If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.
+- Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
+- Set suggested_code only when it is a small, exact, safe replacement for one changed line. Otherwise omit it.
+- Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
 }
 
-func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Comment, threads []github.DiscussionThread, verification, customRules string) string {
+func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Comment, threads []github.DiscussionThread, verification string, sandboxVerified bool) string {
 	var b strings.Builder
 
 	b.WriteString(fmt.Sprintf("## PR Info\nTitle: %s\nAuthor: %s\nBase Branch: %s\nHead Branch: %s\n\n",
 		pr.Title, pr.Author, pr.BaseRef, pr.HeadRef))
 
-	if customRules != "" {
-		b.WriteString("### Repository Review Instructions (Enforce Strictly):\n")
-		b.WriteString(customRules + "\n\n")
-	}
-
 	if pr.Body != "" {
 		b.WriteString(fmt.Sprintf("### PR Description:\n%s\n\n", pr.Body))
 	}
 
-	b.WriteString("### Real Sandbox Environment Verification:\n")
+	if sandboxVerified {
+		b.WriteString("### Real Sandbox Environment Verification:\n")
+	} else {
+		b.WriteString("### Sandbox Verification (Skipped / Unavailable):\n")
+	}
 	b.WriteString(verification + "\n\n")
 
 	b.WriteString("### Existing PR Discussion & Review Threads:\n")

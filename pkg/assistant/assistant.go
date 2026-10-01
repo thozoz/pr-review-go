@@ -1,12 +1,13 @@
 package assistant
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -27,19 +28,16 @@ type Assistant struct {
 func NewAssistant(cfg *config.Config) *Assistant {
 	return &Assistant{
 		cfg:     cfg,
-		gh:      github.NewClient(cfg.GitHubToken),
+		gh:      github.NewClientFromConfig(cfg),
 		sandbox: sandbox.NewRunner(2 * time.Minute),
 		llm:     llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
 }
 
 type ToolCallRequest struct {
-	Action    string `json:"action"`     // "read_file", "write_file", "list_files", "run_command", "commit_and_push", "answer"
-	Path      string `json:"path"`       // For read_file, write_file, or list_files
-	Content   string `json:"content"`    // For write_file
-	Command   string `json:"command"`    // For run_command
-	CommitMsg string `json:"commit_msg"` // For commit_and_push
-	FinalText string `json:"final_text"` // For answer
+	Action    string `json:"action"`
+	Path      string `json:"path"`
+	FinalText string `json:"final_text"`
 }
 
 // HandleMention executes an interactive multi-step question/command regarding a PR
@@ -56,25 +54,17 @@ func (a *Assistant) HandleMention(ctx context.Context, owner, repo string, numbe
 	}
 	defer cleanup()
 
-	systemPrompt := `You are an elite, fully autonomous AI Coding Agent operating inside an isolated Git Pull Request sandbox environment (equivalent to GitHub Copilot Cloud Agent).
-You can inspect code, run tests, resolve merge conflicts, fix bugs, add new code/tests, and commit & push changes back to the PR branch.
+	systemPrompt := `You are an AI Coding Assistant operating on a Git Pull Request.
+You can inspect code, review changes, suggest fixes, and answer questions about the PR.
 
 AVAILABLE ACTIONS:
 1. "read_file": Read content of a file. ({"action": "read_file", "path": "path/to/file"})
-2. "write_file": Write or update file content. ({"action": "write_file", "path": "path/to/file", "content": "..."})
-3. "list_files": List files in a directory. ({"action": "list_files", "path": "."})
-4. "run_command": Execute any shell command in the project root. ({"action": "run_command", "command": "go test -v ./..." or "git status"})
-5. "commit_and_push": Commit modified files and push to PR branch. ({"action": "commit_and_push", "commit_msg": "fix: resolve merge conflicts in auth.go"})
-6. "answer": Deliver your final response to the user. ({"action": "answer", "final_text": "Markdown summary of what was done or answered..."})
+2. "list_files": List files in a directory. ({"action": "list_files", "path": "."})
+3. "answer": Deliver your final response to the user. ({"action": "answer", "final_text": "Markdown summary of what was done or answered..."})
 
 GENERAL AGENT RULES:
-- If asked to fix a bug or resolve merge conflicts:
-  1. Inspect the relevant files or run git commands.
-  2. Apply the fix using write_file.
-  3. ALWAYS verify your changes by executing compilers/test suites using run_command!
-  4. Once tests pass, commit and push your changes using commit_and_push.
-  5. Provide your final explanation via answer.
-- If asked a question or diagnosis without code modifications, inspect code/tests and deliver your final answer.
+- Inspect relevant files to answer questions, diagnose issues, or suggest fixes.
+- Direct command execution, file modifications, and automated git push are disabled because the assistant is read-only and the current environment lacks container isolation.
 - You can make up to 6 iterative tool steps before providing your final answer.
 - Output MUST be a single strict JSON object matching: {"action": "...", ...}
 - Never include markdown codeblocks surrounding your JSON tool calls.`
@@ -101,8 +91,8 @@ GENERAL AGENT RULES:
 
 		// Execute tool
 		toolOutput := a.executeTool(ctx, workDir, step)
-		history += fmt.Sprintf("\nAction executed: %s (path: %s, cmd: %s)\nTool Result:\n```\n%s\n```\nNext action (or provide final answer):",
-			step.Action, step.Path, step.Command, toolOutput)
+		history += fmt.Sprintf("\nAction requested: %s (path: %s)\nTool Result:\n```\n%s\n```\nNext action (or provide final answer):",
+			step.Action, step.Path, toolOutput)
 	}
 
 	// Final prompt to conclude
@@ -120,115 +110,236 @@ GENERAL AGENT RULES:
 func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolCallRequest) string {
 	switch step.Action {
 	case "read_file":
-		cleanPath := filepath.Clean(step.Path)
-		target := filepath.Join(workDir, cleanPath)
-		if !strings.HasPrefix(target, workDir) {
-			return "Error: Access denied (path outside workspace)."
-		}
-		data, err := os.ReadFile(target)
+		content, err := readWorkspaceFile(workDir, step.Path)
 		if err != nil {
-			return fmt.Sprintf("Error reading file: %v", err)
+			if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+				return fmt.Sprintf("Error reading file: %v", err)
+			}
+			return fmt.Sprintf("Error: Access denied (%v).", err)
 		}
-		if len(data) > 30000 {
-			return string(data[:30000]) + "\n...[file truncated, exceeded 30KB]..."
-		}
-		return string(data)
+		return content
 
 	case "write_file":
-		cleanPath := filepath.Clean(step.Path)
-		target := filepath.Join(workDir, cleanPath)
-		if !strings.HasPrefix(target, workDir) {
-			return "Error: Access denied (path outside workspace)."
-		}
-		// Create directory if it doesn't exist
-		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-			return fmt.Sprintf("Error creating parent directories: %v", err)
-		}
-		if err := os.WriteFile(target, []byte(step.Content), 0644); err != nil {
-			return fmt.Sprintf("Error writing file: %v", err)
-		}
-		return fmt.Sprintf("Success: File %s updated (%d bytes written).", step.Path, len(step.Content))
+		return "Error: write_file is disabled: the assistant is read-only and file modifications are not permitted."
 
 	case "list_files":
-		cleanPath := filepath.Clean(step.Path)
-		target := filepath.Join(workDir, cleanPath)
-		if !strings.HasPrefix(target, workDir) {
-			return "Error: Access denied."
+		p := step.Path
+		if p == "" {
+			p = "."
 		}
-		var files []string
-		_ = filepath.Walk(target, func(p string, info os.FileInfo, err error) error {
-			if err != nil || len(files) > 100 {
-				return nil
+		listing, err := listWorkspaceFiles(workDir, p)
+		if err != nil {
+			if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+				return fmt.Sprintf("Error listing files: %v", err)
 			}
-			rel, _ := filepath.Rel(workDir, p)
-			if rel != "." && !strings.HasPrefix(rel, ".git") {
-				files = append(files, rel)
-			}
-			return nil
-		})
-		return strings.Join(files, "\n")
+			return fmt.Sprintf("Error: Access denied (%v).", err)
+		}
+		return listing
 
 	case "run_command":
-		cmdCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(cmdCtx, "sh", "-c", step.Command)
-		cmd.Dir = workDir
-
-		var outBuf, errBuf bytes.Buffer
-		cmd.Stdout = &outBuf
-		cmd.Stderr = &errBuf
-
-		err := cmd.Run()
-		outStr := outBuf.String()
-		errStr := errBuf.String()
-
-		res := fmt.Sprintf("STDOUT:\n%s\nSTDERR:\n%s", outStr, errStr)
-		if err != nil {
-			res += fmt.Sprintf("\nExit Code / Error: %v", err)
-		}
-		if len(res) > 40000 {
-			res = res[:40000] + "\n...[output truncated]..."
-		}
-		return res
+		return "Error: run_command is disabled: host command execution is not permitted without container isolation."
 
 	case "commit_and_push":
-		msg := strings.TrimSpace(step.CommitMsg)
-		if msg == "" {
-			msg = "fix: apply changes suggested by AI assistant"
-		}
-
-		// Configure git user inside sandbox
-		_ = exec.Command("git", "-C", workDir, "config", "user.name", "pr-review-go[bot]").Run()
-		_ = exec.Command("git", "-C", workDir, "config", "user.email", "pr-review-go[bot]@users.noreply.github.com").Run()
-
-		// Git add
-		addCmd := exec.Command("git", "-C", workDir, "add", "-A")
-		if err := addCmd.Run(); err != nil {
-			return fmt.Sprintf("Error staging files: %v", err)
-		}
-
-		// Git commit
-		commitCmd := exec.Command("git", "-C", workDir, "commit", "-m", msg)
-		var commitErr bytes.Buffer
-		commitCmd.Stderr = &commitErr
-		if err := commitCmd.Run(); err != nil {
-			return fmt.Sprintf("Git commit failed (nothing to commit or error): %v - %s", err, commitErr.String())
-		}
-
-		// Git push
-		pushCmd := exec.CommandContext(ctx, "git", "-C", workDir, "push", "origin", "HEAD")
-		var pushErr bytes.Buffer
-		pushCmd.Stderr = &pushErr
-		if err := pushCmd.Run(); err != nil {
-			return fmt.Sprintf("Git push failed: %v - %s", err, pushErr.String())
-		}
-
-		return fmt.Sprintf("Success: Commit '%s' created and successfully pushed to PR branch.", msg)
+		return "Error: commit_and_push is disabled: git operations are not permitted without container isolation."
 
 	default:
 		return fmt.Sprintf("Unknown action: %s", step.Action)
 	}
+}
+
+// readWorkspaceFile opens and reads a file strictly within workDir.
+// It uses os.OpenRoot to confine file operations to the workspace root,
+// preventing path traversal and symlink escapes outside the workspace.
+// Once opened, verifyFileHandle inspects the underlying open handle for
+// defense-in-depth, and contents are read directly from the descriptor.
+//
+// Limitations and atomicity note:
+// This approach substantially mitigates the check-then-open symlink swap window by reading
+// directly from the opened descriptor rather than re-resolving by string path. However, it does
+// NOT provide an absolute TOCTOU guarantee: on platforms without kernel-enforced atomic root
+// containment (such as Linux openat2 with RESOLVE_BENEATH), os.Root relies on component-by-component
+// traversal (using openat/O_NOFOLLOW on Unix and windows.Openat/O_NOFOLLOW_ANY on Windows).
+// Consequently, residual race windows remain if a concurrent hostile local process performs
+// high-frequency ancestor directory renames during path traversal.
+func readWorkspaceFile(workDir, userPath string) (string, error) {
+	if userPath == "" {
+		return "", fmt.Errorf("empty path")
+	}
+
+	canonicalWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspace: %w", err)
+	}
+	if evaled, err := filepath.EvalSymlinks(canonicalWorkDir); err == nil {
+		canonicalWorkDir = evaled
+	}
+
+	// Lexical pre-checks
+	if strings.ContainsRune(userPath, 0) {
+		return "", fmt.Errorf("invalid path: contains null byte")
+	}
+	if filepath.IsAbs(userPath) || filepath.VolumeName(userPath) != "" ||
+		strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") {
+		return "", fmt.Errorf("absolute paths are not permitted")
+	}
+
+	cleanRel := filepath.Clean(userPath)
+	slashRel := filepath.ToSlash(cleanRel)
+	if slashRel == "." {
+		return "", fmt.Errorf("cannot read directory as file")
+	}
+	if slashRel == ".." || strings.HasPrefix(slashRel, "../") {
+		return "", fmt.Errorf("path outside workspace")
+	}
+	if isGitPath(slashRel) {
+		return "", fmt.Errorf(".git paths are restricted")
+	}
+
+	// Open workspace root for confined filesystem access
+	root, err := os.OpenRoot(canonicalWorkDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to open workspace: %w", err)
+	}
+	defer root.Close()
+
+	// Open file strictly relative to root
+	f, err := root.Open(cleanRel)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", err
+		}
+		// Root escape, symlink loop, or permission error is an access denial
+		return "", fmt.Errorf("access denied (%w)", err)
+	}
+	defer f.Close()
+
+	// Verify opened file attributes
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("failed to stat file: %w", err)
+	}
+	if fi.IsDir() {
+		return "", fmt.Errorf("cannot read directory as file")
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("access denied: not a regular file")
+	}
+
+	// Post-open handle verification: query the OS kernel for the true target
+	// of the already-opened handle/descriptor to guarantee it is within canonicalWorkDir
+	// and does not point to restricted locations (e.g. .git).
+	if err := verifyFileHandle(f, canonicalWorkDir); err != nil {
+		return "", fmt.Errorf("access denied: %w", err)
+	}
+
+	// Read directly from the opened handle (limit to 30KB + 1 to detect truncation).
+	// This avoids any second path resolution (check-then-open TOCTOU).
+	const maxBytes = 30000
+	limited := io.LimitReader(f, maxBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return "", fmt.Errorf("error reading file: %w", err)
+	}
+
+	if len(data) > maxBytes {
+		return string(data[:maxBytes]) + "\n...[file truncated, exceeded 30KB]...", nil
+	}
+	return string(data), nil
+}
+
+// listWorkspaceFiles lists files strictly within workDir under userPath.
+func listWorkspaceFiles(workDir, userPath string) (string, error) {
+	canonicalWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspace: %w", err)
+	}
+	if evaled, err := filepath.EvalSymlinks(canonicalWorkDir); err == nil {
+		canonicalWorkDir = evaled
+	}
+
+	subPath := "."
+	if userPath != "" && userPath != "." {
+		if strings.ContainsRune(userPath, 0) {
+			return "", fmt.Errorf("invalid path: contains null byte")
+		}
+		if filepath.IsAbs(userPath) || filepath.VolumeName(userPath) != "" ||
+			strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") {
+			return "", fmt.Errorf("absolute paths are not permitted")
+		}
+		cleanRel := filepath.Clean(userPath)
+		slashRel := filepath.ToSlash(cleanRel)
+		if slashRel == ".." || strings.HasPrefix(slashRel, "../") {
+			return "", fmt.Errorf("path outside workspace")
+		}
+		if isGitPath(slashRel) {
+			return "", fmt.Errorf(".git paths are restricted")
+		}
+		subPath = slashRel
+	}
+
+	root, err := os.OpenRoot(canonicalWorkDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to open workspace: %w", err)
+	}
+	defer root.Close()
+
+	if subPath != "." {
+		fi, err := root.Stat(filepath.FromSlash(subPath))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", err
+			}
+			return "", fmt.Errorf("access denied (%w)", err)
+		}
+		if !fi.IsDir() {
+			return filepath.FromSlash(subPath), nil
+		}
+	}
+
+	fsys := root.FS()
+	var files []string
+	err = fs.WalkDir(fsys, subPath, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if path == subPath {
+				return walkErr
+			}
+			return nil
+		}
+		if len(files) > 100 {
+			return fs.SkipAll
+		}
+
+		slash := filepath.ToSlash(path)
+		if isGitPath(slash) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		if path != "." {
+			rel := filepath.FromSlash(path)
+			files = append(files, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(files, "\n"), nil
+}
+
+func isGitPath(slashRel string) bool {
+	lower := strings.ToLower(slashRel)
+	parts := strings.Split(lower, "/")
+	for _, part := range parts {
+		cleanPart := strings.TrimRight(part, ". ")
+		if cleanPart == ".git" || strings.HasPrefix(cleanPart, ".git:") {
+			return true
+		}
+	}
+	return lower == ".git" || strings.HasPrefix(lower, ".git/") ||
+		strings.Contains(lower, "/.git/") || strings.HasSuffix(lower, "/.git")
 }
 
 func parseToolCall(raw string) (*ToolCallRequest, error) {

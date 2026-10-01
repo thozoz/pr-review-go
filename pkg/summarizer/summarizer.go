@@ -19,7 +19,7 @@ type Summarizer struct {
 func NewSummarizer(cfg *config.Config) *Summarizer {
 	return &Summarizer{
 		cfg: cfg,
-		gh:  github.NewClient(cfg.GitHubToken),
+		gh:  github.NewClientFromConfig(cfg),
 		llm: llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
 }

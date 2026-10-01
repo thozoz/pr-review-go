@@ -32,7 +32,7 @@ func NewUpdater(cfg *config.Config) *Updater {
 		panic(fmt.Sprintf("invalid config: %v", err))
 	}
 	return &Updater{
-		gh:  github.NewClient(cfg.GitHubToken),
+		gh:  github.NewClientFromConfig(cfg),
 		llm: llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
 }
@@ -43,6 +43,9 @@ func (u *Updater) RunAndPost(ctx context.Context, owner, repo string, number int
 	if err != nil {
 		return fmt.Errorf("failed to get PR: %w", err)
 	}
+	if pr.IsFork() {
+		return fmt.Errorf("refusing changelog update for fork PR")
+	}
 	diff, err := u.gh.GetRawDiff(ctx, owner, repo, number)
 	if err != nil {
 		return fmt.Errorf("failed to get PR diff: %w", err)
@@ -51,7 +54,7 @@ func (u *Updater) RunAndPost(ctx context.Context, owner, repo string, number int
 		return u.gh.PostComment(ctx, owner, repo, number, "## 📜 Changelog\n\n`CHANGELOG.md` already changed in this PR; no bot update created.")
 	}
 
-	file, err := u.gh.GetFileContent(ctx, owner, repo, changelogPath, pr.HeadRef)
+	file, err := u.gh.GetFileContent(ctx, owner, repo, changelogPath, pr.HeadSHA)
 	if err != nil {
 		return fmt.Errorf("failed to read %s: %w", changelogPath, err)
 	}

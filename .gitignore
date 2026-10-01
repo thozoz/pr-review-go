@@ -23,3 +23,10 @@ dist/
 .vscode/
 *.swp
 *.swo
+
+# Local planning and agent files
+/.planning/
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.codex/
