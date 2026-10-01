@@ -15,7 +15,8 @@ git push origin v1.0.0
 Use `v1.0.0-rc.1` for a pre-release. GoReleaser marks the GitHub release as a
 pre-release; npm uses the `next` dist-tag for pre-releases and `latest` for stable
 versions. Docker images are published to `ghcr.io/thozoz/pr-review-go` using the
-explicit version without `v`, for linux/amd64 and linux/arm64. Ensure the first
+explicit version without `v`, for linux/amd64 and linux/arm64. Stable releases
+also update `latest`; pre-releases leave `latest` unchanged. Ensure the first
 GHCR package is public if it must be pulled without login.
 
 GitHub Release and GHCR publication use the repository's `GITHUB_TOKEN`.

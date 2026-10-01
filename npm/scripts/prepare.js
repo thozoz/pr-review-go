@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const packageArtifacts = require('./lib/package-artifacts');
+const mapping = require('./lib/mapping');
 
 const EXCLUDED_TYPES = new Set(['Archive', 'Checksum', 'UploadableFile']);
 
@@ -28,9 +29,9 @@ function main() {
     return true;
   });
 
-  if (filtered.length !== 12) {
+  if (filtered.length !== mapping.length * 2) {
     throw new Error(
-      `prepare.js: expected exactly 12 matching artifacts, found ${filtered.length}: ${JSON.stringify(
+      `prepare.js: expected exactly ${mapping.length * 2} matching artifacts, found ${filtered.length}: ${JSON.stringify(
         filtered.map((a) => ({ goos: a.goos, goarch: a.goarch, type: a.type }))
       )}`
     );

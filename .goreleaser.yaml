@@ -50,7 +50,7 @@ dockers_v2:
     ids: [pr-review-server]
     dockerfile: Dockerfile.goreleaser
     images: [ghcr.io/thozoz/pr-review-go]
-    tags: ['{{ .Version }}']
+    tags: ['{{ .Version }}', '{{ if not .Prerelease }}latest{{ end }}']
     platforms: [linux/amd64, linux/arm64]
     labels:
       org.opencontainers.image.source: https://github.com/thozoz/pr-review-go

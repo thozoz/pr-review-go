@@ -48,7 +48,8 @@ The same tag publishes a multi-platform server image:
 docker run --rm --env-file .env -p 3000:3000 ghcr.io/thozoz/pr-review-go:1.0.0
 ```
 
-Images use explicit version tags; pre-releases do not replace stable versions.
+Images use explicit version tags; stable releases also update `latest`.
+Pre-releases do not replace `latest`.
 The Docker image includes Git for workspace cloning. Packaging does not change
 the documented host-clone and filesystem isolation limits of PR review.
 
