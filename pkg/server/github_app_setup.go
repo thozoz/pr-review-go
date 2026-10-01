@@ -20,15 +20,19 @@ import (
 
 const setupStateTTL = 10 * time.Minute
 
-// Architectural note on multi-instance deployments and restarts:
-// Setup states are signed statelessly using HMAC-SHA256 keyed by GITHUB_APP_SETUP_TOKEN,
-// containing a cryptographically random 32-byte nonce and an issuance timestamp.
-// This allows any server instance sharing the same GITHUB_APP_SETUP_TOKEN to verify
-// authenticity and enforce the bounded TTL (10 minutes) without shared session storage.
-// Single-use replay protection is tracked in-memory per instance.
-// Limitation: In active-active multi-instance deployments without sticky sessions,
-// replay protection is enforced per-instance within the TTL window; absolute cross-instance
-// replay prevention across distinct instances would require a distributed cache (e.g. Redis).
+// Architectural note on credentials display and replay protection:
+// 1. Credentials Display: The GitHub App Manifest conversion API returns the App ID,
+//    Webhook Secret, and private key PEM upon successful creation. Displaying these
+//    credentials directly in the HTML response body (within read-only textareas) is an
+//    application design choice to facilitate one-time initial setup without requiring an
+//    external secrets manager. To mitigate leakage risks, responses are served with strict
+//    no-store cache control, Content-Security-Policy, and anti-framing headers.
+// 2. Replay Protection: Setup states are HMAC-SHA256 signed using GITHUB_APP_SETUP_TOKEN
+//    with a 32-byte cryptographic nonce and timestamp (10-minute TTL). Single-use replay
+//    protection is tracked in-memory per server process. Consequently, in multi-instance
+//    deployments or across server restarts, replay prevention is enforced per-instance within
+//    the TTL window; global cross-instance replay prevention would require distributed storage
+//    (e.g., Redis), which is outside the scope of this lightweight daemon.
 
 type setupStateStore struct {
 	mu       sync.Mutex
@@ -85,6 +89,9 @@ func setNoCacheHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, private")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action https://github.com; frame-ancestors 'none'; base-uri 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
 }
 
 func computeSetupStateMAC(token, nonce string, ts int64) string {

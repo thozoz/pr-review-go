@@ -203,6 +203,10 @@ func TestCommentCommandPermissionAndImproveNotice(t *testing.T) {
 			cfg := &config.Config{GitHubToken: "test-token", LLMAPIKey: "test-key", LLMModel: "test-model", LLMBaseURL: "http://example.invalid", WebhookSecret: "secret", AutoActions: []string{}}
 			srv := NewServer(cfg)
 			srv.gh = client
+			dispatched := make(chan string, 1)
+			srv.dispatchHook = func(action, owner, repo string, prNum int) {
+				dispatched <- action
+			}
 			payload := []byte(`{"action":"created","issue":{"number":12,"pull_request":{"url":"https://api.github.com/repos/org/repo/pulls/12"}},"comment":{"body":"/improve","user":{"login":"member"}},"repository":{"name":"repo","owner":{"login":"org"}}}`)
 			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
 			req.Header.Set("X-GitHub-Event", "issue_comment")
@@ -215,11 +219,22 @@ func TestCommentCommandPermissionAndImproveNotice(t *testing.T) {
 			}
 			if !tc.wantNotice {
 				select {
-				case notice := <-notices:
-					t.Errorf("unauthorized comment produced notice: %s", notice)
-				case <-time.After(200 * time.Millisecond):
+				case act := <-dispatched:
+					t.Fatalf("unauthorized comment dispatched action: %s", act)
+				default:
+				}
+				if len(notices) != 0 {
+					t.Fatalf("unauthorized comment produced notice: %s", <-notices)
 				}
 				return
+			}
+			select {
+			case act := <-dispatched:
+				if act != "improve" {
+					t.Errorf("expected dispatched action 'improve', got %s", act)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("dispatch hook was not called for authorized user")
 			}
 			select {
 			case notice := <-notices:

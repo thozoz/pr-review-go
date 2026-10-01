@@ -696,3 +696,196 @@ func TestParsePrivateKey_Formats(t *testing.T) {
 		t.Fatalf("expected error for invalid PEM data, got nil")
 	}
 }
+
+func TestClientCacheEvictionAndOrphaningRegression(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+
+	var installCalls int32
+	var tokenCalls int32
+
+	g1InReq := make(chan struct{})
+	g1Release := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation":
+			callNum := atomic.AddInt32(&installCalls, 1)
+			if callNum == 1 {
+				close(g1InReq)
+				select {
+				case <-g1Release:
+				case <-time.After(5 * time.Second):
+					t.Errorf("timeout waiting for g1Release in server handler")
+				}
+				http.Error(w, `{"message":"temporary upstream error"}`, http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 555,
+			})
+			return
+
+		case r.URL.Path == "/app/installations/555/access_tokens":
+			atomic.AddInt32(&tokenCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token":      "tok-regression-555",
+				"expires_at": time.Now().Add(1 * time.Hour).Format(time.RFC3339),
+			})
+			return
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	appClient, err := NewTestAppClient(server.URL, 999, key)
+	if err != nil {
+		t.Fatalf("failed to create test app client: %v", err)
+	}
+	auth := appClient.appAuth
+
+	ctx := context.Background()
+	repoKey := "test-org/test-repo"
+
+	type result struct {
+		client any
+		err    error
+	}
+
+	resG1 := make(chan result, 1)
+	resG2 := make(chan result, 1)
+
+	var callCount int32
+	g1Selected := make(chan *repoEntry, 1)
+	g2Selected := make(chan *repoEntry, 2)
+	auth.onEntrySelected = func(rk string, e *repoEntry) {
+		if rk != repoKey {
+			return
+		}
+		c := atomic.AddInt32(&callCount, 1)
+		if c == 1 {
+			g1Selected <- e
+		} else {
+			g2Selected <- e
+		}
+	}
+
+	// Goroutine 1: will enter getClient first, hold entry1.mu, and hit install endpoint
+	go func() {
+		c, err := auth.getClient(ctx, "test-org", "test-repo")
+		resG1 <- result{client: c, err: err}
+	}()
+
+	var entry1 *repoEntry
+	select {
+	case entry1 = <-g1Selected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for G1 entry selection")
+	}
+
+	// Wait until G1 is actively inside the HTTP request holding entry1.mu
+	select {
+	case <-g1InReq:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for G1 in HTTP request")
+	}
+
+	auth.mu.Lock()
+	mapEntry1 := auth.repos[repoKey]
+	auth.mu.Unlock()
+	if mapEntry1 == nil || mapEntry1 != entry1 {
+		t.Fatalf("expected entry1 to be registered in auth.repos")
+	}
+
+	// Goroutine 2: starts while G1 still holds entry1.mu
+	go func() {
+		c, err := auth.getClient(ctx, "test-org", "test-repo")
+		resG2 <- result{client: c, err: err}
+	}()
+
+	// Synchronously verify that G2 obtained entry1 before G1 is released
+	var g2InitialEntry *repoEntry
+	select {
+	case g2InitialEntry = <-g2Selected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for G2 entry selection")
+	}
+	if g2InitialEntry != entry1 {
+		t.Fatalf("expected G2 to select entry1 while G1 holds it, got %p != %p", g2InitialEntry, entry1)
+	}
+
+	// Now that G2 is guaranteed to have obtained entry1 and is waiting on entry1.mu,
+	// release G1 so it fails with 500 and evicts entry1
+	close(g1Release)
+
+	var r1 result
+	select {
+	case r1 = <-resG1:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for G1 result")
+	}
+	if r1.err == nil {
+		t.Fatalf("expected G1 to fail with error, got success")
+	}
+
+	// G2 detects entry1 is stale, releases entry1.mu, and retries with a fresh entry
+	var g2RetryEntry *repoEntry
+	select {
+	case g2RetryEntry = <-g2Selected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for G2 retry entry selection")
+	}
+	if g2RetryEntry == entry1 {
+		t.Fatalf("expected G2 retry entry to be new, but got stale entry1")
+	}
+
+	// G2 must succeed after retry
+	var r2 result
+	select {
+	case r2 = <-resG2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for G2 result")
+	}
+	if r2.err != nil {
+		t.Fatalf("expected G2 to succeed after retry, got: %v", r2.err)
+	}
+	if r2.client == nil {
+		t.Fatalf("expected G2 client to be non-nil")
+	}
+
+	auth.mu.Lock()
+	entryInMap := auth.repos[repoKey]
+	auth.mu.Unlock()
+	if entryInMap == nil || entryInMap != g2RetryEntry {
+		t.Fatalf("expected g2RetryEntry to be in repos map")
+	}
+
+	// Verify that stale eviction attempt with entry1 CANNOT delete active retry entry
+	auth.evictEntry(repoKey, entry1)
+
+	auth.mu.Lock()
+	entryAfterStaleEvict := auth.repos[repoKey]
+	auth.mu.Unlock()
+	if entryAfterStaleEvict != g2RetryEntry {
+		t.Fatalf("stale eviction deleted active retry entry from repos map")
+	}
+
+	// Goroutine 3: new call must share the cached client without additional API calls
+	clientG3, err := auth.getClient(ctx, "test-org", "test-repo")
+	if err != nil {
+		t.Fatalf("G3 getClient failed: %v", err)
+	}
+	if clientG3 != r2.client {
+		t.Fatalf("G3 did not share the cached client from G2")
+	}
+
+	if atomic.LoadInt32(&installCalls) != 2 {
+		t.Errorf("expected exactly 2 install calls (1 failed G1, 1 successful G2), got %d", installCalls)
+	}
+	if atomic.LoadInt32(&tokenCalls) != 1 {
+		t.Errorf("expected exactly 1 token call (shared with G3), got %d", tokenCalls)
+	}
+}
