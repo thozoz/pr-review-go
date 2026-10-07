@@ -434,16 +434,45 @@ func (c *Client) CanWriteRepository(ctx context.Context, owner, repo, username s
 	}
 }
 
-func (c *Client) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
+// CreateComment creates a comment on an issue or pull request and returns its numeric ID.
+func (c *Client) CreateComment(ctx context.Context, owner, repo string, number int, body string) (int64, error) {
 	owner = strings.TrimSpace(owner)
 	repo = strings.TrimSpace(repo)
 	ghClient, err := c.ghForRepo(ctx, owner, repo)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, _, err = ghClient.Issues.CreateComment(ctx, owner, repo, number, &github.IssueComment{
+	comment, _, err := ghClient.Issues.CreateComment(ctx, owner, repo, number, &github.IssueComment{
 		Body: github.Ptr(body),
 	})
+	if err != nil {
+		return 0, err
+	}
+	if comment == nil {
+		return 0, fmt.Errorf("github api returned nil comment")
+	}
+	return comment.GetID(), nil
+}
+
+// EditComment updates an existing issue or pull request comment by its numeric ID.
+func (c *Client) EditComment(ctx context.Context, owner, repo string, commentID int64, body string) error {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	if commentID <= 0 {
+		return fmt.Errorf("invalid comment ID: %d", commentID)
+	}
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return err
+	}
+	_, _, err = ghClient.Issues.EditComment(ctx, owner, repo, commentID, &github.IssueComment{
+		Body: github.Ptr(body),
+	})
+	return err
+}
+
+func (c *Client) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
+	_, err := c.CreateComment(ctx, owner, repo, number, body)
 	return err
 }
 

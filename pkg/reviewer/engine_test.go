@@ -494,3 +494,107 @@ func TestPromptAndReportFormattingForAllVerificationStatuses(t *testing.T) {
 	}
 }
 
+func TestReviewPRAtHead_HeadValidationAndCompare(t *testing.T) {
+	const (
+		validBaseSHA = "1111111111111111111111111111111111111111"
+		validHeadSHA = "2222222222222222222222222222222222222222"
+		diffHeadSHA  = "3333333333333333333333333333333333333333"
+	)
+
+	llmCalls := 0
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCalls++
+		resp := llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{
+					Message: llm.ChatMessage{
+						Content: `{"score": 95, "summary": "Looks good", "findings": []}`,
+					},
+					FinishReason: "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	compareCalls := 0
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/42"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 42,
+				"title":  "Head test PR",
+				"body":   "Testing head binding",
+				"head":   map[string]any{"sha": validHeadSHA, "ref": "feat-x"},
+				"base":   map[string]any{"sha": validBaseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			compareCalls++
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/file.go b/file.go\n+new line\n"))
+		case strings.Contains(r.URL.Path, "/issues/42/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pulls/42/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false,
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+	// 1. Malformed expectedHead rejected before any external call
+	_, err = eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, "short123")
+	if err == nil {
+		t.Fatal("expected error for malformed expectedHead SHA")
+	}
+	if llmCalls != 0 || compareCalls != 0 {
+		t.Fatalf("expected 0 LLM/compare calls for malformed SHA, got llm=%d, compare=%d", llmCalls, compareCalls)
+	}
+
+	// 2. Mismatched expectedHead rejected before compare/LLM call
+	_, err = eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, diffHeadSHA)
+	if err == nil {
+		t.Fatal("expected error for mismatched expectedHead SHA")
+	}
+	if llmCalls != 0 || compareCalls != 0 {
+		t.Fatalf("expected 0 LLM/compare calls for mismatched SHA, got llm=%d, compare=%d", llmCalls, compareCalls)
+	}
+
+	// 3. Matching expectedHead succeeds and uses compare endpoint
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, validHeadSHA)
+	if err != nil {
+		t.Fatalf("ReviewPRAtHead failed: %v", err)
+	}
+	if report.HeadSHA != validHeadSHA {
+		t.Fatalf("expected report HeadSHA %s, got %s", validHeadSHA, report.HeadSHA)
+	}
+	if compareCalls != 1 {
+		t.Fatalf("expected 1 compare call, got %d", compareCalls)
+	}
+	if llmCalls != 1 {
+		t.Fatalf("expected 1 LLM call, got %d", llmCalls)
+	}
+}
+
+

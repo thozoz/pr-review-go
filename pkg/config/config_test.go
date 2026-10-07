@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaultEffortLevel(t *testing.T) {
@@ -233,6 +234,90 @@ func TestValidateSandboxResourceLimits(t *testing.T) {
 	cfg.SandboxTimeoutExecution = -1
 	if err := cfg.Validate(); err == nil {
 		t.Errorf("expected error for negative SandboxTimeoutExecution")
+	}
+}
+
+func TestValidateWebhookResourceLimits(t *testing.T) {
+	baseCfg := func() *Config {
+		return &Config{
+			GitHubToken:   "token",
+			LLMAPIKey:     "key",
+			LLMModel:      "model",
+			LLMBaseURL:    "https://example.com",
+			EnableSandbox: false,
+		}
+	}
+
+	// 1. Defaults are populated and valid
+	cfg := baseCfg()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default webhook config should be valid: %v", err)
+	}
+	if cfg.WebhookWorkers != DefaultWebhookWorkers {
+		t.Errorf("expected default workers %d, got %d", DefaultWebhookWorkers, cfg.WebhookWorkers)
+	}
+	if cfg.WebhookBacklog != DefaultWebhookBacklog {
+		t.Errorf("expected default backlog %d, got %d", DefaultWebhookBacklog, cfg.WebhookBacklog)
+	}
+	if cfg.WebhookDeliveryTTL != DefaultWebhookDeliveryTTL {
+		t.Errorf("expected default delivery TTL %v, got %v", DefaultWebhookDeliveryTTL, cfg.WebhookDeliveryTTL)
+	}
+	if cfg.WebhookDeliveryLimit != DefaultWebhookDeliveryLimit {
+		t.Errorf("expected default delivery limit %d, got %d", DefaultWebhookDeliveryLimit, cfg.WebhookDeliveryLimit)
+	}
+	if cfg.WebhookStateMaxBytes != DefaultWebhookStateMaxBytes {
+		t.Errorf("expected default state max bytes %d, got %d", DefaultWebhookStateMaxBytes, cfg.WebhookStateMaxBytes)
+	}
+	if cfg.WebhookBodyMaxBytes != DefaultWebhookBodyMaxBytes {
+		t.Errorf("expected default body max bytes %d, got %d", DefaultWebhookBodyMaxBytes, cfg.WebhookBodyMaxBytes)
+	}
+
+	// 2. Reject out of range workers
+	cfg = baseCfg()
+	cfg.WebhookWorkers = 0 // will be defaulted
+	cfg.WebhookWorkers = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative WebhookWorkers")
+	}
+	cfg.WebhookWorkers = 17
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for WebhookWorkers > 16")
+	}
+
+	// 3. Reject out of range backlog
+	cfg = baseCfg()
+	cfg.WebhookBacklog = 1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for WebhookBacklog < 2")
+	}
+	cfg.WebhookBacklog = 10001
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for WebhookBacklog > 10000")
+	}
+
+	// 4. Reject out of range DeliveryTTL
+	cfg = baseCfg()
+	cfg.WebhookDeliveryTTL = 30 * time.Minute
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for WebhookDeliveryTTL < 1h")
+	}
+	cfg.WebhookDeliveryTTL = 721 * time.Hour
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for WebhookDeliveryTTL > 720h")
+	}
+
+	// 5. Reject out of range StateMaxBytes
+	cfg = baseCfg()
+	cfg.WebhookStateMaxBytes = 1024 // 1 KiB (< 16 MiB)
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for WebhookStateMaxBytes < 16 MiB")
+	}
+
+	// 6. Reject out of range BodyMaxBytes
+	cfg = baseCfg()
+	cfg.WebhookBodyMaxBytes = 1024 // 1 KiB (< 64 KiB)
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for WebhookBodyMaxBytes < 64 KiB")
 	}
 }
 
