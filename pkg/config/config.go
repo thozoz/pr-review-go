@@ -98,64 +98,73 @@ func (c *Config) Validate() error {
 	}
 
 	if c.EnableSandbox {
-		if c.SandboxCPUs == 0 {
-			c.SandboxCPUs = DefaultSandboxCPUs
+		if err := c.ValidateSandboxResources(); err != nil {
+			return err
 		}
-		if c.SandboxCPUs <= 0 {
-			return fmt.Errorf("invalid SandboxCPUs: %v (must be positive)", c.SandboxCPUs)
-		}
+	}
 
-		if c.SandboxMemoryBytes == 0 {
-			c.SandboxMemoryBytes = DefaultSandboxMemoryBytes
-		}
-		if c.SandboxMemoryBytes <= 0 {
-			return fmt.Errorf("invalid SandboxMemoryBytes: %d (must be positive)", c.SandboxMemoryBytes)
-		}
+	return nil
+}
 
-		if c.SandboxPidsLimit == 0 {
-			c.SandboxPidsLimit = DefaultSandboxPidsLimit
-		}
-		if c.SandboxPidsLimit <= 0 {
-			return fmt.Errorf("invalid SandboxPidsLimit: %d (must be positive)", c.SandboxPidsLimit)
-		}
+// ValidateSandboxResources validates and defaults sandbox CPU, memory, pids, disk, and timeout settings.
+func (c *Config) ValidateSandboxResources() error {
+	if c.SandboxCPUs == 0 {
+		c.SandboxCPUs = DefaultSandboxCPUs
+	}
+	if c.SandboxCPUs <= 0 {
+		return fmt.Errorf("invalid SandboxCPUs: %v (must be positive)", c.SandboxCPUs)
+	}
 
-		if c.SandboxDiskBytes == 0 {
-			c.SandboxDiskBytes = DefaultSandboxDiskBytes
-		}
-		if c.SandboxDiskBytes <= 0 {
-			return fmt.Errorf("invalid SandboxDiskBytes: %d (must be positive)", c.SandboxDiskBytes)
-		}
-		if c.SandboxDiskBytes > MaxSandboxDiskBytes {
-			return fmt.Errorf("invalid SandboxDiskBytes: %d exceeds maximum 3 GiB limit (%d bytes)", c.SandboxDiskBytes, MaxSandboxDiskBytes)
-		}
+	if c.SandboxMemoryBytes == 0 {
+		c.SandboxMemoryBytes = DefaultSandboxMemoryBytes
+	}
+	if c.SandboxMemoryBytes <= 0 {
+		return fmt.Errorf("invalid SandboxMemoryBytes: %d (must be positive)", c.SandboxMemoryBytes)
+	}
 
-		if c.SandboxTimeoutSource == 0 {
-			c.SandboxTimeoutSource = DefaultSandboxTimeoutSource
-		}
-		if c.SandboxTimeoutSource <= 0 {
-			return fmt.Errorf("invalid SandboxTimeoutSource: %v (must be positive)", c.SandboxTimeoutSource)
-		}
+	if c.SandboxPidsLimit == 0 {
+		c.SandboxPidsLimit = DefaultSandboxPidsLimit
+	}
+	if c.SandboxPidsLimit <= 0 {
+		return fmt.Errorf("invalid SandboxPidsLimit: %d (must be positive)", c.SandboxPidsLimit)
+	}
 
-		if c.SandboxTimeoutPrep == 0 {
-			c.SandboxTimeoutPrep = DefaultSandboxTimeoutPrep
-		}
-		if c.SandboxTimeoutPrep <= 0 {
-			return fmt.Errorf("invalid SandboxTimeoutPrep: %v (must be positive)", c.SandboxTimeoutPrep)
-		}
+	if c.SandboxDiskBytes == 0 {
+		c.SandboxDiskBytes = DefaultSandboxDiskBytes
+	}
+	if c.SandboxDiskBytes <= 0 {
+		return fmt.Errorf("invalid SandboxDiskBytes: %d (must be positive)", c.SandboxDiskBytes)
+	}
+	if c.SandboxDiskBytes > MaxSandboxDiskBytes {
+		return fmt.Errorf("invalid SandboxDiskBytes: %d exceeds maximum 3 GiB limit (%d bytes)", c.SandboxDiskBytes, MaxSandboxDiskBytes)
+	}
 
-		if c.SandboxTimeoutExecution == 0 {
-			c.SandboxTimeoutExecution = DefaultSandboxTimeoutExecution
-		}
-		if c.SandboxTimeoutExecution <= 0 {
-			return fmt.Errorf("invalid SandboxTimeoutExecution: %v (must be positive)", c.SandboxTimeoutExecution)
-		}
+	if c.SandboxTimeoutSource == 0 {
+		c.SandboxTimeoutSource = DefaultSandboxTimeoutSource
+	}
+	if c.SandboxTimeoutSource <= 0 {
+		return fmt.Errorf("invalid SandboxTimeoutSource: %v (must be positive)", c.SandboxTimeoutSource)
+	}
 
-		if c.SandboxTimeoutCleanup == 0 {
-			c.SandboxTimeoutCleanup = DefaultSandboxTimeoutCleanup
-		}
-		if c.SandboxTimeoutCleanup <= 0 {
-			return fmt.Errorf("invalid SandboxTimeoutCleanup: %v (must be positive)", c.SandboxTimeoutCleanup)
-		}
+	if c.SandboxTimeoutPrep == 0 {
+		c.SandboxTimeoutPrep = DefaultSandboxTimeoutPrep
+	}
+	if c.SandboxTimeoutPrep <= 0 {
+		return fmt.Errorf("invalid SandboxTimeoutPrep: %v (must be positive)", c.SandboxTimeoutPrep)
+	}
+
+	if c.SandboxTimeoutExecution == 0 {
+		c.SandboxTimeoutExecution = DefaultSandboxTimeoutExecution
+	}
+	if c.SandboxTimeoutExecution <= 0 {
+		return fmt.Errorf("invalid SandboxTimeoutExecution: %v (must be positive)", c.SandboxTimeoutExecution)
+	}
+
+	if c.SandboxTimeoutCleanup == 0 {
+		c.SandboxTimeoutCleanup = DefaultSandboxTimeoutCleanup
+	}
+	if c.SandboxTimeoutCleanup <= 0 {
+		return fmt.Errorf("invalid SandboxTimeoutCleanup: %v (must be positive)", c.SandboxTimeoutCleanup)
 	}
 
 	return nil

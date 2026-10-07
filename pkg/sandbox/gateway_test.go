@@ -740,3 +740,108 @@ func TestDependencyGateway_LifecycleAndSocketCleanup(t *testing.T) {
 	}
 }
 
+func TestGitGateway_HostileRouteAttacks(t *testing.T) {
+	sockDir := t.TempDir()
+	sockPath := filepath.Join(sockDir, "git-attack.sock")
+
+	gw, err := StartGitGateway(GitGatewayConfig{
+		SocketPath:        sockPath,
+		RepoOwner:         "victim",
+		RepoName:          "repo",
+		UpstreamBaseURL:   "http://example.com",
+		AllowTestLoopback: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to start git gateway: %v", err)
+	}
+	defer gw.Close()
+
+	client := newUnixClient(sockPath)
+
+	// 1. Prohibited HTTP methods
+	disallowedMethods := []string{http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodHead, http.MethodOptions}
+	for _, method := range disallowedMethods {
+		req, _ := http.NewRequest(method, "http://unix/victim/repo/info/refs?service=git-upload-pack", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request with method %s failed: %v", method, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("expected 405 for method %s, got: %d", method, resp.StatusCode)
+		}
+	}
+
+	// 2. Traversal and hostile route paths
+	hostilePaths := []string{
+		"/victim/repo/../../etc/passwd",
+		"/victim/repo/%2e%2e/passwd",
+		"/victim/repo/info/refs/extra",
+		"/victim/repo/git-upload-pack/extra",
+		"/victim/repo/git-receive-pack",
+		"/other/repo/info/refs?service=git-upload-pack",
+	}
+	for _, p := range hostilePaths {
+		req, _ := http.NewRequest(http.MethodGet, "http://unix"+p, nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request with path %s failed: %v", p, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("expected 403 or 405 for hostile path %s, got: %d", p, resp.StatusCode)
+		}
+	}
+}
+
+func TestDependencyGateway_HostileRouteAttacks(t *testing.T) {
+	sockDir := t.TempDir()
+	sockPath := filepath.Join(sockDir, "dep-attack.sock")
+
+	gw, err := StartDependencyGateway(DependencyGatewayConfig{
+		SocketPath:        sockPath,
+		AllowTestLoopback: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to start gateway: %v", err)
+	}
+	defer gw.Close()
+
+	client := newUnixClient(sockPath)
+
+	// 1. Prohibited methods
+	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		req, _ := http.NewRequest(method, "http://unix/golang.org/x/sync/@v/v0.7.0.info", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("method %s request failed: %v", method, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("expected 405 for method %s, got: %d", method, resp.StatusCode)
+		}
+	}
+
+	// 2. Hostile and traversal paths
+	hostilePaths := []string{
+		"/golang.org/x/sync/%2e%2e/secret",
+		"/golang.org/x/sync/../../outside",
+		"//etc/passwd",
+		"/api/private/v1",
+		"/admin",
+		"/sumdb/unauthorized.org/latest",
+	}
+	for _, p := range hostilePaths {
+		req, _ := http.NewRequest(http.MethodGet, "http://unix"+p, nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("path %s request failed: %v", p, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("expected 403 for hostile path %s, got: %d", p, resp.StatusCode)
+		}
+	}
+}
+
+

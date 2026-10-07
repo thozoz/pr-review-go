@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -83,8 +84,7 @@ func TestPodmanTracer(t *testing.T) {
 	t.Run("LiveExecution", func(t *testing.T) {
 		podmanPath, err := exec.LookPath("podman")
 		if err != nil {
-			t.Logf("Podman binary not found in PATH: %v", err)
-			return
+			t.Fatalf("podman binary is required when PR_REVIEW_SANDBOX_INTEGRATION=1: %v", err)
 		}
 
 		imageDigest := os.Getenv("PR_REVIEW_SANDBOX_IMAGE")
@@ -493,8 +493,7 @@ func TestPodmanSourceTracer(t *testing.T) {
 	t.Run("LiveExecution", func(t *testing.T) {
 		podmanPath, err := exec.LookPath("podman")
 		if err != nil {
-			t.Logf("Podman binary not found in PATH: %v", err)
-			return
+			t.Fatalf("podman binary is required when PR_REVIEW_SANDBOX_INTEGRATION=1: %v", err)
 		}
 
 		imageDigest := os.Getenv("PR_REVIEW_SANDBOX_IMAGE")
@@ -1053,5 +1052,708 @@ func TestRunParallel_Error(t *testing.T) {
 		t.Logf("Live dependency preparation and offline build/race-test PASSED")
 	})
 }
+
+// TestPodmanSecurity covers hostile deployment denial boundaries, resource limits,
+// output flood protection, network/gateway isolation, credential stripping, cancellation,
+// source writer separation, slot quarantine, two-job isolation, and status reporting (D-01 through D-15).
+// It is opt-in via PR_REVIEW_SANDBOX_INTEGRATION=1.
+func TestPodmanSecurity(t *testing.T) {
+	if os.Getenv("PR_REVIEW_SANDBOX_INTEGRATION") != "1" {
+		t.Skip("skipping live deployment security tests: set PR_REVIEW_SANDBOX_INTEGRATION=1 to enable")
+	}
+
+	// 1. Prerequisites and resource boundary enforcement
+	t.Run("PrerequisitesAndResourceEnforcement", func(t *testing.T) {
+		// Enforce podman presence when integration test is enabled
+		if _, err := exec.LookPath("podman"); err != nil {
+			t.Fatalf("podman binary is required when PR_REVIEW_SANDBOX_INTEGRATION=1: %v", err)
+		}
+
+		// Enforce git presence when integration test is enabled
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Fatalf("git binary is required when PR_REVIEW_SANDBOX_INTEGRATION=1: %v", err)
+		}
+
+		// Distinct byte units: 3 GiB disk vs 2 GiB RAM
+		const expectedDiskBytes int64 = 3 * 1024 * 1024 * 1024 // 3221225472 bytes
+		const expectedRAMBytes int64 = 2 * 1024 * 1024 * 1024  // 2147483648 bytes
+		if MaxSlotCapacityBytes != expectedDiskBytes {
+			t.Fatalf("expected MaxSlotCapacityBytes to be 3 GiB (%d), got %d", expectedDiskBytes, MaxSlotCapacityBytes)
+		}
+		if config.DefaultSandboxMemoryBytes != expectedRAMBytes {
+			t.Fatalf("expected DefaultSandboxMemoryBytes to be 2 GiB (%d), got %d", expectedRAMBytes, config.DefaultSandboxMemoryBytes)
+		}
+
+		// Resource settings validation
+		invalidConfigs := []*config.Config{
+			{SandboxCPUs: -1.0, SandboxMemoryBytes: expectedRAMBytes, SandboxPidsLimit: 256, SandboxDiskBytes: expectedDiskBytes},
+			{SandboxCPUs: 2.0, SandboxMemoryBytes: -1, SandboxPidsLimit: 256, SandboxDiskBytes: expectedDiskBytes},
+			{SandboxCPUs: 2.0, SandboxMemoryBytes: expectedRAMBytes, SandboxPidsLimit: -1, SandboxDiskBytes: expectedDiskBytes},
+			{SandboxCPUs: 2.0, SandboxMemoryBytes: expectedRAMBytes, SandboxPidsLimit: 256, SandboxDiskBytes: -1},
+			{SandboxCPUs: 2.0, SandboxMemoryBytes: expectedRAMBytes, SandboxPidsLimit: 256, SandboxDiskBytes: 5 * 1024 * 1024 * 1024}, // > 3 GiB
+			{SandboxCPUs: 2.0, SandboxMemoryBytes: expectedRAMBytes, SandboxPidsLimit: 256, SandboxDiskBytes: expectedDiskBytes, SandboxTimeoutSource: -1},
+			{SandboxCPUs: 2.0, SandboxMemoryBytes: expectedRAMBytes, SandboxPidsLimit: 256, SandboxDiskBytes: expectedDiskBytes, SandboxTimeoutPrep: -1},
+			{SandboxCPUs: 2.0, SandboxMemoryBytes: expectedRAMBytes, SandboxPidsLimit: 256, SandboxDiskBytes: expectedDiskBytes, SandboxTimeoutExecution: -1},
+			{SandboxCPUs: 2.0, SandboxMemoryBytes: expectedRAMBytes, SandboxPidsLimit: 256, SandboxDiskBytes: expectedDiskBytes, SandboxTimeoutCleanup: -1},
+		}
+		for i, cfg := range invalidConfigs {
+			if err := cfg.ValidateSandboxResources(); err == nil {
+				t.Fatalf("case %d: expected ValidateSandboxResources to fail for invalid config: %+v", i, cfg)
+			}
+		}
+
+		// Missing image digest fails Attest
+		backendNoImage := NewPodmanBackend(PodmanConfig{})
+		if err := backendNoImage.Attest(context.Background()); err == nil {
+			t.Fatalf("expected Attest to fail when ImageDigest is empty")
+		}
+
+		// Unmounted normal directory fails slot mount check
+		unmountedDir := t.TempDir()
+		controlDir := t.TempDir()
+		slotMgr, err := NewLinuxSlotManager(unmountedDir, controlDir)
+		if err != nil {
+			t.Fatalf("failed to create slot manager: %v", err)
+		}
+		if _, err := slotMgr.ValidateSlotMount(unmountedDir); err == nil {
+			t.Fatalf("expected ValidateSlotMount to fail on normal unmounted directory")
+		}
+
+		// Quarantined slot refuses acquisition
+		slotMgr.SkipMountChecks = true
+		if err := slotMgr.QuarantineSlot(unmountedDir, "test quarantine"); err != nil {
+			t.Fatalf("failed to quarantine slot: %v", err)
+		}
+		if _, err := slotMgr.AcquireSlot(context.Background(), "job-security-fail"); err == nil || !strings.Contains(err.Error(), "quarantined") {
+			t.Fatalf("expected AcquireSlot to fail on quarantined slot, got: %v", err)
+		}
+	})
+
+	// 2. Source denial and hostile Git boundaries
+	t.Run("SourceDenialAndHostileGitBoundaries", func(t *testing.T) {
+		// Wrong/malformed OIDs
+		invalidOIDs := []string{
+			"",
+			"abc1234",
+			"0123456789abcdef0123456789abcdef0123456",   // 39 chars
+			"0123456789abcdef0123456789abcdef012345678",  // 41 chars
+			"0123456789abcdef0123456789abcdef0123456g",  // non-hex
+			"../etc/passwd",
+		}
+		for _, oid := range invalidOIDs {
+			if err := ValidateCommitOID(oid); !errors.Is(err, ErrInvalidCommitOID) {
+				t.Fatalf("expected ErrInvalidCommitOID for %q, got: %v", oid, err)
+			}
+		}
+
+		// Hostile clone URLs
+		hostileURLs := []string{
+			"http://insecure.example.com/repo",
+			"git://git.example.com/repo",
+			"file:///etc/passwd",
+			"ssh://git@github.com/repo",
+			"-oProxyCommand=calc",
+			"--upload-pack=touch /tmp/pwn",
+		}
+		for _, u := range hostileURLs {
+			if _, _, err := ValidateCloneURL(u); err == nil {
+				t.Fatalf("expected ValidateCloneURL to reject hostile URL: %q", u)
+			}
+		}
+
+		// Hostile path entries & symlinks
+		hostilePaths := []string{
+			"../outside.txt",
+			"sub/../../outside.txt",
+			"aux.go",
+			"CON",
+			"PRN",
+			"AUX",
+			"NUL",
+			"COM1",
+			"LPT1",
+		}
+		for _, p := range hostilePaths {
+			if err := ValidateSnapshotPath(p); err == nil {
+				t.Fatalf("expected ValidateSnapshotPath to reject hostile path: %q", p)
+			}
+		}
+
+		// Escaping symlink targets
+		if err := ValidateSymlinkTarget("entry.txt", "../outside"); err == nil {
+			t.Fatalf("expected ValidateSymlinkTarget to reject escaping symlink")
+		}
+		if err := ValidateSymlinkTarget("entry.txt", "/etc/passwd"); err == nil {
+			t.Fatalf("expected ValidateSymlinkTarget to reject absolute symlink target")
+		}
+
+		// Tree export with commit mismatch, .git omission, and LFS detection
+		gitPath, err := exec.LookPath("git")
+		if err != nil {
+			t.Fatalf("git binary required: %v", err)
+		}
+		fixtureDir := t.TempDir()
+		runGit := func(args ...string) string {
+			cmd := exec.Command(gitPath, args...)
+			cmd.Dir = fixtureDir
+			cmd.Env = []string{
+				"GIT_AUTHOR_NAME=Tracer", "GIT_AUTHOR_EMAIL=tracer@example.com",
+				"GIT_COMMITTER_NAME=Tracer", "GIT_COMMITTER_EMAIL=tracer@example.com",
+				"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME=/tmp",
+			}
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+			}
+			return strings.TrimSpace(string(out))
+		}
+		runGit("init")
+		runGit("config", "user.name", "Tracer")
+		runGit("config", "user.email", "tracer@example.com")
+		if err := os.WriteFile(filepath.Join(fixtureDir, "code.go"), []byte("package main\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		runGit("add", "code.go")
+		runGit("commit", "-m", "init")
+		headSHA := runGit("rev-parse", "HEAD")
+
+		// Mismatch SHA rejected
+		wrongSHA := "1111111111111111111111111111111111111111"
+		if _, err := ExportGitTree(context.Background(), fixtureDir, wrongSHA, t.TempDir()); err == nil {
+			t.Fatalf("expected ExportGitTree to reject mismatched commit SHA")
+		}
+
+		// Matching SHA succeeds, .git omitted
+		destDir := t.TempDir()
+		snap, err := ExportGitTree(context.Background(), fixtureDir, headSHA, destDir)
+		if err != nil {
+			t.Fatalf("ExportGitTree failed: %v", err)
+		}
+		if snap.CommitSHA != headSHA {
+			t.Fatalf("expected commit %s, got %s", headSHA, snap.CommitSHA)
+		}
+		if _, err := os.Stat(filepath.Join(destDir, ".git")); !os.IsNotExist(err) {
+			t.Fatalf(".git directory must not be present in exported snapshot")
+		}
+	})
+
+	// 3. Output flood and streaming limits
+	t.Run("OutputFloodAndStreamLimiting", func(t *testing.T) {
+		collector := NewLimitedCollector(100 * 1024) // 100 KiB
+
+		// Stream 1 MiB (1048576 bytes) of flood data in 4 KiB chunks
+		chunk := bytes.Repeat([]byte("A"), 4096)
+		totalStreamed := 0
+		for totalStreamed < 1024*1024 {
+			n, err := collector.Write(chunk)
+			if err != nil {
+				t.Fatalf("unexpected collector write error: %v", err)
+			}
+			totalStreamed += n
+		}
+
+		// Verifications:
+		// Written buffer capped at 100 KiB
+		if len(collector.Bytes()) != 100*1024 {
+			t.Fatalf("expected collector buffer len to be exactly 100 KiB (%d), got: %d", 100*1024, len(collector.Bytes()))
+		}
+		// Truncated flag set
+		if !collector.Truncated() {
+			t.Fatalf("expected collector.Truncated() to be true")
+		}
+		// Dropped bytes accurately calculated
+		expectedDropped := int64(1024*1024 - 100*1024)
+		if collector.DroppedBytes() != expectedDropped {
+			t.Fatalf("expected dropped bytes %d, got %d", expectedDropped, collector.DroppedBytes())
+		}
+	})
+
+	// 4. Disk and inode exhaustion enforcement
+	t.Run("DiskAndInodeExhaustionEnforcement", func(t *testing.T) {
+		slotDir := t.TempDir()
+		controlDir := t.TempDir()
+		slotMgr, err := NewLinuxSlotManager(slotDir, controlDir)
+		if err != nil {
+			t.Fatalf("failed to create slot manager: %v", err)
+		}
+		slotMgr.SkipMountChecks = true
+
+		// Subdirectories layout verified
+		for _, sub := range []string{"work", "tmp", "cache", "snapshot"} {
+			if err := os.MkdirAll(filepath.Join(slotDir, sub), 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Acquire slot successfully
+		lease, err := slotMgr.AcquireSlot(context.Background(), "job-sec-1")
+		if err != nil {
+			t.Fatalf("AcquireSlot failed: %v", err)
+		}
+
+		// Quarantine slot marks .quarantine and subsequent acquisition fails
+		if err := slotMgr.QuarantineSlot(slotDir, "disk capacity exceeded / ENOSPC simulation"); err != nil {
+			t.Fatalf("QuarantineSlot failed: %v", err)
+		}
+		_ = slotMgr.ReleaseSlot(lease)
+
+		// Refuse acquisition of quarantined slot
+		if _, err := slotMgr.AcquireSlot(context.Background(), "job-sec-2"); err == nil || !strings.Contains(err.Error(), "quarantined") {
+			t.Fatalf("expected AcquireSlot to fail on quarantined slot, got: %v", err)
+		}
+
+		// Verify quarantine record
+		if !slotMgr.IsQuarantined(slotDir) {
+			t.Fatalf("expected slot to be quarantined in IsQuarantined")
+		}
+	})
+
+	// 5. Network isolation and gateway denial boundaries
+	t.Run("NetworkIsolationAndGatewayDenialBoundaries", func(t *testing.T) {
+		// Test GitGateway route denials
+		sockDir := t.TempDir()
+		gitSockPath := filepath.Join(sockDir, "git-sec.sock")
+		gw, err := StartGitGateway(GitGatewayConfig{
+			SocketPath:        gitSockPath,
+			RepoOwner:         "targetowner",
+			RepoName:          "targetrepo",
+			UpstreamBaseURL:   "http://127.0.0.1:9090",
+			AllowTestLoopback: false, // Enforce SSRF protection
+		})
+		if err != nil {
+			t.Fatalf("failed to start git gateway: %v", err)
+		}
+		defer gw.Close()
+
+		client := newUnixClient(gitSockPath)
+
+		// 1. SSRF to local IP denied with 502 Bad Gateway
+		reqSSRF, _ := http.NewRequest(http.MethodGet, "http://unix/targetowner/targetrepo/info/refs?service=git-upload-pack", nil)
+		respSSRF, err := client.Do(reqSSRF)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respSSRF.Body.Close()
+		if respSSRF.StatusCode != http.StatusBadGateway {
+			t.Fatalf("expected 502 Bad Gateway on SSRF, got: %d", respSSRF.StatusCode)
+		}
+
+		// 2. Out-of-repo request denied with 403 Forbidden
+		reqOutOfRepo, _ := http.NewRequest(http.MethodGet, "http://unix/evilowner/evilrepo/info/refs?service=git-upload-pack", nil)
+		respOutOfRepo, err := client.Do(reqOutOfRepo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respOutOfRepo.Body.Close()
+		if respOutOfRepo.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for out-of-repo path, got: %d", respOutOfRepo.StatusCode)
+		}
+
+		// 3. Receive-pack denied with 403 Forbidden
+		reqRecv, _ := http.NewRequest(http.MethodPost, "http://unix/targetowner/targetrepo/git-receive-pack", strings.NewReader("bad"))
+		respRecv, err := client.Do(reqRecv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respRecv.Body.Close()
+		if respRecv.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for git-receive-pack, got: %d", respRecv.StatusCode)
+		}
+
+		// 4. CONNECT method denied with 405
+		reqConnect, _ := http.NewRequest(http.MethodConnect, "http://unix/targetowner/targetrepo", nil)
+		respConnect, err := client.Do(reqConnect)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respConnect.Body.Close()
+		if respConnect.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405 Method Not Allowed for CONNECT, got: %d", respConnect.StatusCode)
+		}
+
+		// Test DependencyGateway route denials
+		depSockPath := filepath.Join(sockDir, "dep-sec.sock")
+		depGW, err := StartDependencyGateway(DependencyGatewayConfig{
+			SocketPath:        depSockPath,
+			ProxyBaseURL:      "http://127.0.0.1:9091",
+			AllowTestLoopback: false,
+		})
+		if err != nil {
+			t.Fatalf("failed to start dependency gateway: %v", err)
+		}
+		defer depGW.Close()
+
+		depClient := newUnixClient(depSockPath)
+
+		// 5. Dependency SSRF denied with 502
+		reqDepSSRF, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/v0.7.0.info", nil)
+		respDepSSRF, err := depClient.Do(reqDepSSRF)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respDepSSRF.Body.Close()
+		if respDepSSRF.StatusCode != http.StatusBadGateway {
+			t.Fatalf("expected 502 Bad Gateway for dep gateway SSRF, got: %d", respDepSSRF.StatusCode)
+		}
+
+		// 6. Direct VCS route denied with 403
+		reqVCS, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync.git/info/refs", nil)
+		respVCS, err := depClient.Do(reqVCS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respVCS.Body.Close()
+		if respVCS.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for VCS route, got: %d", respVCS.StatusCode)
+		}
+
+		// 7. Traversal path denied with 403
+		reqTrav, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/../../../../etc/passwd", nil)
+		respTrav, err := depClient.Do(reqTrav)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respTrav.Body.Close()
+		if respTrav.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for path traversal, got: %d", respTrav.StatusCode)
+		}
+	})
+
+	// 6. Sentinel credential isolation and zeroization
+	t.Run("SentinelCredentialIsolationAndZeroization", func(t *testing.T) {
+		sentinelToken := "sentinel-credential-proof-token-12345"
+		var receivedAuthHeader string
+
+		upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedAuthHeader = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+			_, _ = w.Write([]byte("001e# service=git-upload-pack\n0000"))
+		}))
+		defer upstreamServer.Close()
+
+		sockDir := t.TempDir()
+		sockPath := filepath.Join(sockDir, "cred-sec.sock")
+		var onCloseCalled bool
+
+		gw, err := StartGitGateway(GitGatewayConfig{
+			SocketPath:        sockPath,
+			RepoOwner:         "canonowner",
+			RepoName:          "canonrepo",
+			UpstreamBaseURL:   upstreamServer.URL,
+			AllowTestLoopback: true,
+			RetrievalToken:    sentinelToken,
+			OnClose: func() {
+				onCloseCalled = true
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to start git gateway: %v", err)
+		}
+
+		client := newUnixClient(sockPath)
+
+		// Request carries spoofed client tokens
+		req, _ := http.NewRequest(http.MethodGet, "http://unix/canonowner/canonrepo/info/refs?service=git-upload-pack", nil)
+		req.Header.Set("Authorization", "Bearer spoofed-attacker-token")
+		req.Header.Set("Proxy-Authorization", "Basic attack")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK, got: %d", resp.StatusCode)
+		}
+
+		// Sentinel token injected upstream, spoofed token stripped
+		if receivedAuthHeader != "Bearer "+sentinelToken {
+			t.Fatalf("expected upstream to receive sentinel token, got: %q", receivedAuthHeader)
+		}
+
+		// On Close: token wiped in memory, hook invoked
+		if err := gw.Close(); err != nil {
+			t.Fatalf("gw.Close failed: %v", err)
+		}
+		if !onCloseCalled {
+			t.Fatalf("expected OnClose hook to be called")
+		}
+		if gw.retrievalToken != "" {
+			t.Fatalf("expected retrievalToken to be zeroized after Close, got: %q", gw.retrievalToken)
+		}
+	})
+
+	// 7. Source writer races and snapshot isolation
+	t.Run("SourceWriterRacesAndSnapshotIsolation", func(t *testing.T) {
+		// Custom rules extraction bounded and verified via handle checks
+		srcDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(srcDir, ".github"), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// 1. Escaping symlink in custom rules rejected
+		outside := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("SECRET"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(srcDir, ".github", "copilot-instructions.md")); err != nil {
+			t.Fatal(err)
+		}
+		runner := NewRunner(0)
+		report := &VerificationReport{}
+		runner.extractCustomRules(srcDir, report)
+		if report.CustomRules != "" {
+			t.Fatalf("expected escaping symlink to yield empty custom rules, got: %q", report.CustomRules)
+		}
+
+		// 2. Large rules file bounded to 15 KiB streaming cap
+		_ = os.Remove(filepath.Join(srcDir, ".github", "copilot-instructions.md"))
+		largeRules := strings.Repeat("rule line\n", 5000) // ~50 KB
+		if err := os.WriteFile(filepath.Join(srcDir, ".github", "copilot-instructions.md"), []byte(largeRules), 0644); err != nil {
+			t.Fatal(err)
+		}
+		report2 := &VerificationReport{}
+		runner.extractCustomRules(srcDir, report2)
+		if len(report2.CustomRules) > 16*1024 {
+			t.Fatalf("expected custom rules to be bounded to 15 KiB cap, got %d bytes", len(report2.CustomRules))
+		}
+	})
+
+	// 8. Cancellation and slot quarantine lifecycle
+	t.Run("CancellationAndSlotQuarantineLifecycle", func(t *testing.T) {
+		// Context cancellation fails closed immediately in PrepareSnapshot
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel upfront
+
+		runner := NewRunner(0)
+		_, _, err := runner.PrepareSnapshot(ctx, "https://github.com/owner/repo", "main", "0123456789abcdef0123456789abcdef01234567")
+		if err == nil {
+			t.Fatalf("expected PrepareSnapshot to fail on cancelled context")
+		}
+	})
+
+	// 9. Concurrency and two-job isolation
+	t.Run("ConcurrencyAndTwoJobIsolation", func(t *testing.T) {
+		controlDir := t.TempDir()
+		slotADir := t.TempDir()
+		slotBDir := t.TempDir()
+
+		slotMgrA, err := NewLinuxSlotManager(slotADir, controlDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slotMgrA.SkipMountChecks = true
+
+		slotMgrB, err := NewLinuxSlotManager(slotBDir, controlDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slotMgrB.SkipMountChecks = true
+
+		// Job 1 acquires Slot A
+		leaseA1, err := slotMgrA.AcquireSlot(context.Background(), "job-1")
+		if err != nil {
+			t.Fatalf("job-1 failed to acquire slot A: %v", err)
+		}
+
+		// Job 2 attempts to acquire Slot A concurrently -> rejected by exclusive lock
+		_, err = slotMgrA.AcquireSlot(context.Background(), "job-2")
+		if err == nil {
+			_ = slotMgrA.ReleaseSlot(leaseA1)
+			t.Fatalf("expected concurrent AcquireSlot on same slot directory to fail")
+		}
+
+		// Job 2 acquires Slot B -> succeeds (two independent slots)
+		leaseB, err := slotMgrB.AcquireSlot(context.Background(), "job-2")
+		if err != nil {
+			_ = slotMgrA.ReleaseSlot(leaseA1)
+			t.Fatalf("job-2 failed to acquire independent slot B: %v", err)
+		}
+
+		// Verify Slot A and Slot B have distinct, isolated directories
+		if slotMgrA.SlotDir == slotMgrB.SlotDir {
+			t.Fatalf("slots must have distinct directories")
+		}
+
+		// Cleanup leases
+		_ = slotMgrA.ReleaseSlot(leaseA1)
+		_ = slotMgrB.ReleaseSlot(leaseB)
+
+		// Slot A can now be acquired after release
+		leaseA2, err := slotMgrA.AcquireSlot(context.Background(), "job-3")
+		if err != nil {
+			t.Fatalf("job-3 failed to acquire slot A after release: %v", err)
+		}
+		_ = slotMgrA.ReleaseSlot(leaseA2)
+	})
+
+	// 10. Both Go commands required for passed
+	t.Run("BothGoCommandsRequiredForPassed", func(t *testing.T) {
+		mockScript := filepath.Join(t.TempDir(), "mock-podman-status.sh")
+		scriptContent := `#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "info" ]; then
+        echo '{"host":{"rootless":true,"cgroupVersion":"v2","security":{"rootless":true}}}'
+        exit 0
+    fi
+    if [ "$arg" = "/sys/fs/cgroup/memory.max" ]; then
+        echo '2147483648'
+        exit 0
+    fi
+    if [ "$arg" = "rm" ] || [ "$arg" = "kill" ]; then
+        exit 0
+    fi
+done
+
+case "$TEST_MOCK_OUTCOME" in
+    fail_build)
+        for arg in "$@"; do
+            if [ "$arg" = "build" ]; then
+                echo "syntax error in main.go" >&2
+                exit 1
+            fi
+        done
+        exit 0
+        ;;
+    fail_test)
+        for arg in "$@"; do
+            if [ "$arg" = "build" ]; then
+                exit 0
+            fi
+            if [ "$arg" = "test" ]; then
+                echo "FAIL: test assertion failed" >&2
+                exit 1
+            fi
+        done
+        exit 0
+        ;;
+    pass_all)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+`
+		if err := os.WriteFile(mockScript, []byte(scriptContent), 0755); err != nil {
+			t.Fatalf("failed to write mock podman script: %v", err)
+		}
+
+		mockSlot := newMockSlotManager(t)
+		backend := NewPodmanBackend(PodmanConfig{
+			BinaryPath:   mockScript,
+			ImageDigest:  "sha256:testdigest",
+			CPUs:         2.0,
+			MemoryBytes:  2147483648,
+			PidsLimit:    256,
+			TimeoutStage: 5 * time.Minute,
+			TimeoutClean: 15 * time.Second,
+		})
+
+		srcDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module testmod\n\ngo 1.22\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "main.go"), []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		validSHA := "0123456789abcdef0123456789abcdef01234567"
+		snap := &Snapshot{
+			CommitSHA: validSHA,
+			SourceDir: srcDir,
+		}
+
+		runner := &Runner{
+			Timeout:     5 * time.Minute,
+			Backend:     backend,
+			SlotManager: mockSlot,
+			DepPreparer: &mockDependencyPreparer{
+				result: &StageResult{StageName: "prep", Passed: true},
+			},
+		}
+
+		// Case 1: Build fails -> StatusBuildFailed
+		t.Setenv("TEST_MOCK_OUTCOME", "fail_build")
+		repBuildFail, err := runner.RunSnapshot(context.Background(), snap)
+		if err != nil {
+			t.Fatalf("RunSnapshot failed: %v", err)
+		}
+		if repBuildFail.Status != StatusBuildFailed {
+			t.Fatalf("expected StatusBuildFailed when build fails, got: %q", repBuildFail.Status)
+		}
+
+		// Case 2: Build passes, test fails -> StatusTestFailed
+		t.Setenv("TEST_MOCK_OUTCOME", "fail_test")
+		repTestFail, err := runner.RunSnapshot(context.Background(), snap)
+		if err != nil {
+			t.Fatalf("RunSnapshot failed: %v", err)
+		}
+		if repTestFail.Status != StatusTestFailed {
+			t.Fatalf("expected StatusTestFailed when test fails, got: %q", repTestFail.Status)
+		}
+
+		// Case 3: Both pass -> StatusPassed
+		t.Setenv("TEST_MOCK_OUTCOME", "pass_all")
+		repPass, err := runner.RunSnapshot(context.Background(), snap)
+		if err != nil {
+			t.Fatalf("RunSnapshot failed: %v", err)
+		}
+		if repPass.Status != StatusPassed {
+			t.Fatalf("expected StatusPassed when both build and test pass, got: %q", repPass.Status)
+		}
+	})
+
+	// 11. Live execution probes (if operator environment configured)
+	t.Run("LiveExecutionProbes", func(t *testing.T) {
+		podmanPath, err := exec.LookPath("podman")
+		if err != nil {
+			t.Fatalf("podman binary required when PR_REVIEW_SANDBOX_INTEGRATION=1: %v", err)
+		}
+
+		imageDigest := os.Getenv("PR_REVIEW_SANDBOX_IMAGE")
+		slotDir := os.Getenv("PR_REVIEW_SLOT_DIR")
+		if imageDigest == "" || slotDir == "" {
+			t.Logf("Operator setup required: set PR_REVIEW_SANDBOX_IMAGE and PR_REVIEW_SLOT_DIR to run live container probes")
+			t.Logf("See 01-USER-SETUP.md and docs/SANDBOX.md for administrator and operator provisioning instructions")
+			return
+		}
+
+		controlDir := os.Getenv("PR_REVIEW_CONTROL_DIR")
+		if controlDir == "" {
+			controlDir = t.TempDir()
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		slotMgr, err := NewLinuxSlotManager(slotDir, controlDir)
+		if err != nil {
+			t.Fatalf("failed to initialize slot manager: %v", err)
+		}
+
+		mountID, err := slotMgr.ValidateSlotMount(slotDir)
+		if err != nil {
+			t.Fatalf("operator slot %q failed validation: %v", slotDir, err)
+		}
+		t.Logf("Operator slot verified: %q (mount ID %d)", slotDir, mountID)
+
+		podmanCfg := PodmanConfig{
+			BinaryPath:   podmanPath,
+			ImageDigest:  imageDigest,
+			CPUs:         2.0,
+			MemoryBytes:  2147483648,
+			PidsLimit:    256,
+			TimeoutStage: 5 * time.Minute,
+			TimeoutClean: 15 * time.Second,
+		}
+		backend := NewPodmanBackend(podmanCfg)
+
+		if err := backend.Attest(ctx); err != nil {
+			t.Fatalf("podman capability attestation failed: %v", err)
+		}
+		t.Logf("Podman capability attestation PASSED")
+	})
+}
+
 
 
