@@ -2196,5 +2196,149 @@ func TestWebhookCommandReplay(t *testing.T) {
 	})
 }
 
+func TestWebhookCapacityConfig(t *testing.T) {
+	t.Run("defaults and environment loading", func(t *testing.T) {
+		t.Setenv("GITHUB_TOKEN", "token")
+		t.Setenv("LLM_API_KEY", "key")
+		t.Setenv("LLM_MODEL", "model")
+		t.Setenv("LLM_BASE_URL", "http://example.com")
+		t.Setenv("LLM_CONCURRENCY", "4")
+		t.Setenv("LLM_MIN_INTERVAL", "500ms")
+		t.Setenv("LLM_RESPONSE_MAX_BYTES", "2097152")
+		t.Setenv("SANDBOX_CONCURRENCY", "3")
+
+		cfg := config.Load()
+		if cfg.LLMConcurrency != 4 {
+			t.Fatalf("expected LLMConcurrency 4, got %d", cfg.LLMConcurrency)
+		}
+		if cfg.LLMMinInterval != 500*time.Millisecond {
+			t.Fatalf("expected LLMMinInterval 500ms, got %v", cfg.LLMMinInterval)
+		}
+		if cfg.LLMResponseMaxBytes != 2097152 {
+			t.Fatalf("expected LLMResponseMaxBytes 2097152, got %d", cfg.LLMResponseMaxBytes)
+		}
+		if cfg.SandboxConcurrency != 3 {
+			t.Fatalf("expected SandboxConcurrency 3, got %d", cfg.SandboxConcurrency)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("config validation failed: %v", err)
+		}
+	})
+
+	t.Run("validation rejects negative zero overflow values", func(t *testing.T) {
+		baseCfg := func() *config.Config {
+			return &config.Config{
+				GitHubToken: "t", LLMAPIKey: "k", LLMModel: "m", LLMBaseURL: "u",
+				EffortLevel: "lite", EnableSandbox: false,
+			}
+		}
+
+		invalidCases := []struct {
+			name   string
+			mutate func(c *config.Config)
+		}{
+			{"negative llm concurrency", func(c *config.Config) { c.LLMConcurrency = -1 }},
+			{"overflow llm concurrency", func(c *config.Config) { c.LLMConcurrency = 17 }},
+			{"negative min interval", func(c *config.Config) { c.LLMMinInterval = -1 * time.Second }},
+			{"underflow min interval", func(c *config.Config) { c.LLMMinInterval = 100 * time.Microsecond }},
+			{"overflow min interval", func(c *config.Config) { c.LLMMinInterval = 2 * time.Minute }},
+			{"negative max bytes", func(c *config.Config) { c.LLMResponseMaxBytes = -1 }},
+			{"underflow max bytes", func(c *config.Config) { c.LLMResponseMaxBytes = 100 }},
+			{"overflow max bytes", func(c *config.Config) { c.LLMResponseMaxBytes = 20 * 1024 * 1024 }},
+			{"negative sandbox concurrency", func(c *config.Config) { c.SandboxConcurrency = -1 }},
+			{"overflow sandbox concurrency", func(c *config.Config) { c.SandboxConcurrency = 17 }},
+		}
+
+		for _, tc := range invalidCases {
+			t.Run(tc.name, func(t *testing.T) {
+				c := baseCfg()
+				tc.mutate(c)
+				if err := c.Validate(); err == nil {
+					t.Fatalf("expected validation error for %s, got nil", tc.name)
+				}
+			})
+		}
+	})
+}
+
+func TestSharedActionCapacity(t *testing.T) {
+	t.Run("distinct actions share active concurrency and start rate limits", func(t *testing.T) {
+		var activeMu sync.Mutex
+		var currentActive int64
+		var maxActive int64
+		var totalCalls int64
+
+		llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt64(&totalCalls, 1)
+			activeMu.Lock()
+			currentActive++
+			if currentActive > maxActive {
+				maxActive = currentActive
+			}
+			activeMu.Unlock()
+
+			time.Sleep(30 * time.Millisecond)
+
+			activeMu.Lock()
+			currentActive--
+			activeMu.Unlock()
+
+			resp := llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message: llm.ChatMessage{
+							Content: `{"score": 85, "summary": "action complete", "findings": [], "labels": ["bug"]}`,
+						},
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		defer llmServer.Close()
+
+		gate, err := llm.NewRequestGate(2, 5*time.Millisecond, 1048576, nil)
+		if err != nil {
+			t.Fatalf("gate creation failed: %v", err)
+		}
+
+		client1 := llm.NewClient(llmServer.URL, "key", "model")
+		client2 := llm.NewClient(llmServer.URL, "key", "model")
+		client3 := llm.NewClient(llmServer.URL, "key", "model")
+
+		clients := []*llm.Client{client1, client2, client3}
+		var wg sync.WaitGroup
+
+		ctx := llm.WithAdmission(context.Background(), gate)
+
+		// Run 6 concurrent requests across 3 distinct clients
+		for i := 0; i < 6; i++ {
+			wg.Add(1)
+			clientIdx := i % len(clients)
+			go func(c *llm.Client) {
+				defer wg.Done()
+				_, reqErr := c.ChatCompletion(ctx, "system", "user")
+				if reqErr != nil {
+					t.Errorf("request failed: %v", reqErr)
+				}
+			}(clients[clientIdx])
+		}
+
+		wg.Wait()
+
+		if atomic.LoadInt64(&totalCalls) != 6 {
+			t.Fatalf("expected 6 total calls, got %d", atomic.LoadInt64(&totalCalls))
+		}
+
+		activeMu.Lock()
+		observedMax := maxActive
+		activeMu.Unlock()
+
+		if observedMax > 2 {
+			t.Fatalf("shared gate exceeded concurrency limit: max active was %d (expected <= 2)", observedMax)
+		}
+	})
+}
+
 
 

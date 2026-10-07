@@ -9,6 +9,7 @@ import (
 	"time"
 
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
+	"github.com/thozoz/pr-review-go/pkg/llm"
 )
 
 // JobExecutor defines the execution contract for individual scheduled jobs.
@@ -405,6 +406,7 @@ type Scheduler struct {
 	executor  JobExecutor
 	workers   int
 	activePRs map[string]bool
+	llmGate   llm.RequestGate
 	mu        sync.Mutex
 	wakeCh    chan struct{}
 	stopCh    chan struct{}
@@ -424,6 +426,20 @@ func NewScheduler(store JobStore, executor JobExecutor, workers int) *Scheduler 
 		wakeCh:    make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 	}
+}
+
+// SetLLMGate assigns a shared LLM RequestGate to the scheduler.
+func (s *Scheduler) SetLLMGate(gate llm.RequestGate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.llmGate = gate
+}
+
+// LLMGate returns the scheduler's shared LLM RequestGate.
+func (s *Scheduler) LLMGate() llm.RequestGate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.llmGate
 }
 
 func (s *Scheduler) Start(ctx context.Context) error {
@@ -502,7 +518,15 @@ func (s *Scheduler) workerLoop(ctx context.Context, workerID int) {
 			continue
 		}
 
-		_ = s.executor.ExecuteJob(ctx, job)
+		execCtx := ctx
+		s.mu.Lock()
+		gate := s.llmGate
+		s.mu.Unlock()
+		if gate != nil {
+			execCtx = llm.WithAdmission(execCtx, gate)
+		}
+
+		_ = s.executor.ExecuteJob(execCtx, job)
 		s.releaseJob(job)
 	}
 }

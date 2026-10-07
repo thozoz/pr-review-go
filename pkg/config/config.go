@@ -52,9 +52,28 @@ type Config struct {
 	WebhookBodyMaxBytes    int64         `json:"webhook_body_max_bytes"`
 	WebhookOldQueueWarning time.Duration `json:"webhook_old_queue_warning"`
 	WebhookShutdownTimeout time.Duration `json:"webhook_shutdown_timeout"`
+
+	// Capacity controls for LLM and sandbox execution
+	LLMConcurrency      int           `json:"llm_concurrency"`
+	LLMMinInterval      time.Duration `json:"llm_min_interval"`
+	LLMResponseMaxBytes int64         `json:"llm_response_max_bytes"`
+	SandboxConcurrency  int           `json:"sandbox_concurrency"`
 }
 
 const (
+	DefaultLLMConcurrency       = 2
+	MinLLMConcurrency           = 1
+	MaxLLMConcurrency           = 16
+	DefaultLLMMinInterval       = 1 * time.Second
+	MinLLMMinInterval           = 1 * time.Millisecond
+	MaxLLMMinInterval           = 1 * time.Minute
+	DefaultLLMResponseMaxBytes  = 1048576 // 1 MiB
+	MinLLMResponseMaxBytes      = 65536   // 64 KiB
+	MaxLLMResponseMaxBytes      = 16777216 // 16 MiB
+	DefaultSandboxConcurrency   = 1
+	MinSandboxConcurrency       = 1
+	MaxSandboxConcurrency       = 16
+
 	DefaultSandboxCPUs             = 2.0
 	DefaultSandboxMemoryBytes      = 2147483648 // 2 GiB
 	DefaultSandboxPidsLimit        = 256
@@ -141,6 +160,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.ValidateWebhook(); err != nil {
+		return err
+	}
+
+	if err := c.ValidateCapacity(); err != nil {
 		return err
 	}
 
@@ -275,6 +298,39 @@ func (c *Config) ValidateWebhook() error {
 	}
 	if c.WebhookShutdownTimeout < MinWebhookShutdownTimeout || c.WebhookShutdownTimeout > MaxWebhookShutdownTimeout {
 		return fmt.Errorf("invalid WebhookShutdownTimeout: %v (must be between %v and %v)", c.WebhookShutdownTimeout, MinWebhookShutdownTimeout, MaxWebhookShutdownTimeout)
+	}
+
+	return nil
+}
+
+// ValidateCapacity validates and defaults LLM and sandbox concurrency and rate settings.
+func (c *Config) ValidateCapacity() error {
+	if c.LLMConcurrency == 0 {
+		c.LLMConcurrency = DefaultLLMConcurrency
+	}
+	if c.LLMConcurrency < MinLLMConcurrency || c.LLMConcurrency > MaxLLMConcurrency {
+		return fmt.Errorf("invalid LLMConcurrency: %d (must be between %d and %d)", c.LLMConcurrency, MinLLMConcurrency, MaxLLMConcurrency)
+	}
+
+	if c.LLMMinInterval == 0 {
+		c.LLMMinInterval = DefaultLLMMinInterval
+	}
+	if c.LLMMinInterval < MinLLMMinInterval || c.LLMMinInterval > MaxLLMMinInterval {
+		return fmt.Errorf("invalid LLMMinInterval: %v (must be between %v and %v)", c.LLMMinInterval, MinLLMMinInterval, MaxLLMMinInterval)
+	}
+
+	if c.LLMResponseMaxBytes == 0 {
+		c.LLMResponseMaxBytes = DefaultLLMResponseMaxBytes
+	}
+	if c.LLMResponseMaxBytes < MinLLMResponseMaxBytes || c.LLMResponseMaxBytes > MaxLLMResponseMaxBytes {
+		return fmt.Errorf("invalid LLMResponseMaxBytes: %d (must be between %d and %d)", c.LLMResponseMaxBytes, MinLLMResponseMaxBytes, MaxLLMResponseMaxBytes)
+	}
+
+	if c.SandboxConcurrency == 0 {
+		c.SandboxConcurrency = DefaultSandboxConcurrency
+	}
+	if c.SandboxConcurrency < MinSandboxConcurrency || c.SandboxConcurrency > MaxSandboxConcurrency {
+		return fmt.Errorf("invalid SandboxConcurrency: %d (must be between %d and %d)", c.SandboxConcurrency, MinSandboxConcurrency, MaxSandboxConcurrency)
 	}
 
 	return nil
@@ -498,6 +554,42 @@ func Load() *Config {
 		}
 	}
 
+	llmConcurrency := DefaultLLMConcurrency
+	if raw := os.Getenv("LLM_CONCURRENCY"); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil {
+			llmConcurrency = val
+		} else {
+			llmConcurrency = -1
+		}
+	}
+
+	llmMinInterval := DefaultLLMMinInterval
+	if raw := os.Getenv("LLM_MIN_INTERVAL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			llmMinInterval = d
+		} else {
+			llmMinInterval = -1
+		}
+	}
+
+	llmResponseMaxBytes := int64(DefaultLLMResponseMaxBytes)
+	if raw := os.Getenv("LLM_RESPONSE_MAX_BYTES"); raw != "" {
+		if val, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			llmResponseMaxBytes = val
+		} else {
+			llmResponseMaxBytes = -1
+		}
+	}
+
+	sandboxConcurrency := DefaultSandboxConcurrency
+	if raw := os.Getenv("SANDBOX_CONCURRENCY"); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil {
+			sandboxConcurrency = val
+		} else {
+			sandboxConcurrency = -1
+		}
+	}
+
 	return &Config{
 		GitHubToken:             token,
 		WebhookSecret:           webhookSecret,
@@ -532,5 +624,9 @@ func Load() *Config {
 		WebhookBodyMaxBytes:     webhookBodyMaxBytes,
 		WebhookOldQueueWarning:  webhookOldQueueWarning,
 		WebhookShutdownTimeout:  webhookShutdownTimeout,
+		LLMConcurrency:          llmConcurrency,
+		LLMMinInterval:          llmMinInterval,
+		LLMResponseMaxBytes:     llmResponseMaxBytes,
+		SandboxConcurrency:      sandboxConcurrency,
 	}
 }

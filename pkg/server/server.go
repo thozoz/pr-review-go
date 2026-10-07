@@ -23,6 +23,7 @@ import (
 	"github.com/thozoz/pr-review-go/pkg/docgen"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/labeler"
+	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 	"github.com/thozoz/pr-review-go/pkg/summarizer"
@@ -100,6 +101,15 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.scheduler == nil {
 		executor := NewServerJobExecutor(s, s.store)
 		s.scheduler = NewScheduler(s.store, executor, s.cfg.WebhookWorkers)
+	}
+
+	if s.scheduler.LLMGate() == nil && s.cfg != nil {
+		llmGate, err := llm.NewRequestGate(s.cfg.LLMConcurrency, s.cfg.LLMMinInterval, s.cfg.LLMResponseMaxBytes, nil)
+		if err != nil {
+			s.runtimeErr = err
+			return err
+		}
+		s.scheduler.SetLLMGate(llmGate)
 	}
 
 	if err := s.scheduler.Start(ctx); err != nil {
