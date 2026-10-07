@@ -268,6 +268,7 @@ func TestCanWriteRepository(t *testing.T) {
 	}{
 		{"admin", true}, {"maintain", true}, {"write", true},
 		{"read", false}, {"triage", false}, {"none", false}, {"", false},
+		{"guest", false}, {"billing", false}, {"unknown_custom", false},
 	} {
 		t.Run(tc.permission, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -289,21 +290,65 @@ func TestCanWriteRepository(t *testing.T) {
 		})
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	}))
-	defer server.Close()
-	client, err := NewTestClient(server.URL)
-	if err != nil {
-		t.Fatal(err)
+	// API error status codes must all fail-closed (deny permission)
+	for _, status := range []int{
+		http.StatusInternalServerError,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusBadGateway,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, http.StatusText(status), status)
+			}))
+			defer server.Close()
+			client, err := NewTestClient(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			allowed, err := client.CanWriteRepository(context.Background(), "org", "repo", "member")
+			if err == nil || allowed {
+				t.Fatalf("expected denied permission and error on %d, got allowed=%v err=%v", status, allowed, err)
+			}
+		})
 	}
-	allowed, err := client.CanWriteRepository(context.Background(), "org", "repo", "member")
-	if err == nil || allowed {
-		t.Fatalf("expected denied permission on API error, got allowed=%v err=%v", allowed, err)
-	}
-	allowed, err = client.CanWriteRepository(context.Background(), "org", "repo", "")
-	if err != nil || allowed {
-		t.Fatalf("expected empty username denied without API call, got allowed=%v err=%v", allowed, err)
+
+	// Malformed JSON response must fail closed
+	t.Run("malformed JSON", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{not valid json`))
+		}))
+		defer server.Close()
+		client, err := NewTestClient(server.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		allowed, err := client.CanWriteRepository(context.Background(), "org", "repo", "member")
+		if err == nil || allowed {
+			t.Fatalf("expected error and denial on malformed JSON, got allowed=%v err=%v", allowed, err)
+		}
+	})
+
+	// Empty and whitespace username must be denied without API call
+	for _, emptyUser := range []string{"", " ", "\t\n"} {
+		t.Run("empty_user_"+emptyUser, func(t *testing.T) {
+			called := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+			client, err := NewTestClient(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			allowed, err := client.CanWriteRepository(context.Background(), "org", "repo", emptyUser)
+			if err != nil || allowed || called {
+				t.Fatalf("expected empty/whitespace user denied without API call, got allowed=%v err=%v called=%v", allowed, err, called)
+			}
+		})
 	}
 }
 

@@ -230,6 +230,9 @@ func (r *Runner) cleanupTimeout() time.Duration {
 
 // PrepareSnapshot retrieves a verified source snapshot using the configured SourceProvider.
 func (r *Runner) PrepareSnapshot(ctx context.Context, cloneURL, headRef, headSHA string) (*Snapshot, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if r.SourceProvider == nil {
 		return nil, nil, ErrSourceProviderUnavailable
 	}
