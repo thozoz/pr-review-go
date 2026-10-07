@@ -32,3 +32,7 @@ func (m *LinuxSlotManager) QuarantineSlot(slotDir, reason string) error {
 func (m *LinuxSlotManager) IsQuarantined(slotDir string) bool {
 	return false
 }
+
+func (m *LinuxSlotManager) ReconcileSlots(ctx context.Context) error {
+	return nil
+}

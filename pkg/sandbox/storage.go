@@ -57,4 +57,5 @@ type SlotManager interface {
 	ReleaseSlot(lease *SlotLease) error
 	QuarantineSlot(slotDir, reason string) error
 	IsQuarantined(slotDir string) bool
+	ReconcileSlots(ctx context.Context) error
 }

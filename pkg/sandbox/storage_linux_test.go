@@ -4,6 +4,8 @@ package sandbox
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -123,3 +125,81 @@ func TestSlotQuarantinePreventsLease(t *testing.T) {
 		t.Fatalf("expected quarantined error, got: %v", err)
 	}
 }
+
+func TestSlotReconcileOrphanState(t *testing.T) {
+	slotDir := t.TempDir()
+	controlDir := t.TempDir()
+
+	mgr, err := NewLinuxSlotManager(slotDir, controlDir)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	mgr.SkipMountChecks = true
+
+	// Simulate orphan state from previous crashed job
+	slotName := filepath.Base(slotDir)
+	statePath := filepath.Join(controlDir, slotName+".state")
+	orphanState := `{"job_id":"orphan-job","mount_id":0,"state":"leased","started_at":"2026-10-07T10:00:00Z"}`
+	if err := os.WriteFile(statePath, []byte(orphanState), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create leftover files in work dir
+	workDir := filepath.Join(slotDir, "work")
+	_ = os.MkdirAll(workDir, 0755)
+	_ = os.WriteFile(filepath.Join(workDir, "stale.txt"), []byte("stale"), 0644)
+
+	ctx := context.Background()
+	if err := mgr.ReconcileSlots(ctx); err != nil {
+		t.Fatalf("ReconcileSlots failed: %v", err)
+	}
+
+	// Verify stale file was removed
+	if _, err := os.Stat(filepath.Join(workDir, "stale.txt")); err == nil {
+		t.Fatalf("expected stale file to be removed by ReconcileSlots")
+	}
+
+	// Verify new lease can be acquired cleanly
+	lease, err := mgr.AcquireSlot(ctx, "fresh-job")
+	if err != nil {
+		t.Fatalf("expected clean acquire after reconcile, got: %v", err)
+	}
+	defer mgr.ReleaseSlot(lease)
+}
+
+func TestSlotRelease_CleanupFailureQuarantinesSlot(t *testing.T) {
+	slotDir := t.TempDir()
+	controlDir := t.TempDir()
+
+	mgr, err := NewLinuxSlotManager(slotDir, controlDir)
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	mgr.SkipMountChecks = true
+
+	ctx := context.Background()
+	lease, err := mgr.AcquireSlot(ctx, "job-fail-cleanup")
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+
+	// Simulate escaping/tampered directory path in lease that violates confinement
+	lease.WorkDir = "/outside/path"
+
+	err = mgr.ReleaseSlot(lease)
+	if err == nil {
+		t.Fatalf("expected ReleaseSlot to fail with ErrCleanupFailed, got nil")
+	}
+
+	// Verify slot is now quarantined
+	if !mgr.IsQuarantined(slotDir) {
+		t.Fatalf("expected slot to be marked quarantined after cleanup failure")
+	}
+
+	// Subsequent acquire must fail with ErrSlotQuarantined
+	_, err = mgr.AcquireSlot(ctx, "next-job")
+	if err == nil || !strings.Contains(err.Error(), "quarantined") {
+		t.Fatalf("expected ErrSlotQuarantined on next job acquire, got: %v", err)
+	}
+}
+

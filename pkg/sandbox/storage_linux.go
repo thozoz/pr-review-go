@@ -376,3 +376,52 @@ func (m *LinuxSlotManager) ReleaseSlot(lease *SlotLease) error {
 	lease.Released = true
 	return nil
 }
+
+// ReconcileSlots inspects persistent slot state files and reconciles orphaned leases.
+func (m *LinuxSlotManager) ReconcileSlots(ctx context.Context) error {
+	entries, err := os.ReadDir(m.ControlDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".state") {
+			statePath := filepath.Join(m.ControlDir, entry.Name())
+			data, err := os.ReadFile(statePath)
+			if err != nil {
+				continue
+			}
+			var state SlotState
+			if err := json.Unmarshal(data, &state); err != nil {
+				continue
+			}
+			if state.State == StateLeased || state.State == StateCleaning {
+				slotName := strings.TrimSuffix(entry.Name(), ".state")
+				slotPath := m.SlotDir
+				if filepath.Base(slotPath) == slotName {
+					// Clean slot subdirectories
+					workDir := filepath.Join(slotPath, "work")
+					tmpDir := filepath.Join(slotPath, "tmp")
+					cacheDir := filepath.Join(slotPath, "cache")
+					snapDir := filepath.Join(slotPath, "snapshot")
+					cleanFailed := false
+					for _, d := range []string{workDir, tmpDir, cacheDir, snapDir} {
+						if err := os.RemoveAll(d); err != nil {
+							cleanFailed = true
+							break
+						}
+					}
+					if cleanFailed {
+						_ = m.QuarantineSlot(slotPath, "reconciliation cleanup failed")
+					} else {
+						state.State = StateIdle
+						if d, err := json.Marshal(state); err == nil {
+							_ = os.WriteFile(statePath, d, 0600)
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+

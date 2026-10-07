@@ -78,3 +78,44 @@ func TestLimitedCollector_ConcurrentWritesDoNotDeadlockOrExceedCap(t *testing.T)
 		t.Fatalf("unexpected total bytes: %d", c.TotalBytes())
 	}
 }
+
+func TestLimitedCollector_StreamManyMiB_ConstantMemoryAndNoDeadlock(t *testing.T) {
+	c := NewLimitedCollector(DefaultMaxRetainedBytes) // 100 KiB cap
+
+	const totalMiB = 10
+	const chunkSize = 64 * 1024 // 64 KiB chunks
+	chunk := bytes.Repeat([]byte("X"), chunkSize)
+
+	totalBytes := int64(totalMiB * 1024 * 1024)
+	numChunks := int(totalBytes / chunkSize)
+
+	for i := 0; i < numChunks; i++ {
+		n, err := c.Write(chunk)
+		if err != nil {
+			t.Fatalf("unexpected error at chunk %d: %v", i, err)
+		}
+		if n != chunkSize {
+			t.Fatalf("expected write %d bytes, got %d", chunkSize, n)
+		}
+	}
+
+	if len(c.Bytes()) != DefaultMaxRetainedBytes {
+		t.Fatalf("expected retained bytes exactly %d, got %d", DefaultMaxRetainedBytes, len(c.Bytes()))
+	}
+	expectedDropped := totalBytes - int64(DefaultMaxRetainedBytes)
+	if c.DroppedBytes() != expectedDropped {
+		t.Fatalf("expected dropped bytes %d, got %d", expectedDropped, c.DroppedBytes())
+	}
+	if c.TotalBytes() != totalBytes {
+		t.Fatalf("expected total bytes %d, got %d", totalBytes, c.TotalBytes())
+	}
+	if !c.Truncated() {
+		t.Fatalf("expected Truncated() to be true")
+	}
+
+	formatted := c.Formatted("stdout")
+	if !strings.Contains(formatted, "exceeded 100 KiB cap") {
+		t.Fatalf("expected formatted string to mention 100 KiB cap, got: %s", formatted)
+	}
+}
+
