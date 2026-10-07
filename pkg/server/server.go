@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -108,6 +109,47 @@ func (s *Server) Start(ctx context.Context) error {
 	s.runtimeReady = true
 	s.runtimeErr = nil
 	return nil
+}
+
+func (s *Server) ensureStore() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.store != nil {
+		return nil
+	}
+	stateDir := s.cfg.WebhookStateDir
+	if stateDir == "" {
+		stateDir = filepath.Join(os.TempDir(), fmt.Sprintf("pr-review-ephemeral-%d", time.Now().UnixNano()))
+	}
+	dbPath := filepath.Join(stateDir, "jobs.db")
+	storeOpts := StoreOptions{
+		BacklogLimit:  s.cfg.WebhookBacklog,
+		DeliveryLimit: s.cfg.WebhookDeliveryLimit,
+		StateMaxBytes: s.cfg.WebhookStateMaxBytes,
+		DeliveryTTL:   s.cfg.WebhookDeliveryTTL,
+		OpenTimeout:   1 * time.Second,
+	}
+	store, err := OpenJobStore(dbPath, storeOpts)
+	if err != nil {
+		if errors.Is(err, ErrDatabaseLocked) {
+			ephemeralDir := filepath.Join(os.TempDir(), fmt.Sprintf("pr-review-ephemeral-%d-%d", os.Getpid(), time.Now().UnixNano()))
+			dbPath = filepath.Join(ephemeralDir, "jobs.db")
+			store, err = OpenJobStore(dbPath, storeOpts)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	s.store = store
+	if s.scheduler == nil {
+		executor := NewServerJobExecutor(s, store)
+		workers := s.cfg.WebhookWorkers
+		if workers <= 0 {
+			workers = 2
+		}
+		s.scheduler = NewScheduler(store, executor, workers)
+	}
+	return s.scheduler.Start(context.Background())
 }
 
 // Stop stops workers and closes the durable job store.
@@ -249,13 +291,12 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 
 	if store == nil {
-		if s.dispatchHook != nil && deliveryID == "" {
-			s.handleLegacyWebhook(w, r, payload)
+		if err := s.ensureStore(); err != nil {
+			log.Printf("[webhook] Failed to initialize store: %v", err)
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "runtime unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		w.Header().Set("Retry-After", "30")
-		http.Error(w, "runtime unavailable", http.StatusServiceUnavailable)
-		return
 	}
 
 	if !isValidDeliveryID(deliveryID) {
@@ -334,18 +375,7 @@ func (s *Server) handlePullRequestWebhook(ctx context.Context, w http.ResponseWr
 				HeadSHA:  headSHA,
 			})
 		}
-		if s.cfg.AutoActionEnabled("improve") {
-			jobs = append(jobs, Job{
-				Kind:     "improve",
-				Trigger:  "automatic",
-				PRKey:    prKey,
-				Owner:    owner,
-				Repo:     repo,
-				PRNumber: prNum,
-				BaseSHA:  baseSHA,
-				HeadSHA:  headSHA,
-			})
-		}
+		// Auto improve remains skipped on opened
 		if s.cfg.AutoActionEnabled("review") {
 			jobs = append(jobs, Job{
 				Kind:     "review",
@@ -400,11 +430,6 @@ func (s *Server) handlePullRequestWebhook(ctx context.Context, w http.ResponseWr
 
 	switch res.Status {
 	case AdmitAccepted:
-		if s.dispatchHook != nil {
-			for _, j := range jobs {
-				s.dispatchHook(j.Kind, owner, repo, prNum)
-			}
-		}
 		if s.scheduler != nil {
 			s.scheduler.Wake()
 		}
@@ -463,6 +488,12 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 		return
 	}
 
+	if len(payloadText) > 4096 {
+		payloadText = payloadText[:4096]
+	}
+
+	commentID := e.GetComment().GetID()
+
 	prKey, err := MakePRKey("github.com", repoID, prNum)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -470,14 +501,15 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 	}
 
 	job := Job{
-		Kind:     kind,
-		Trigger:  "explicit",
-		Author:   username,
-		PRKey:    prKey,
-		Owner:    owner,
-		Repo:     repo,
-		PRNumber: prNum,
-		Payload:  payloadText,
+		Kind:      kind,
+		Trigger:   "explicit",
+		Author:    username,
+		CommentID: commentID,
+		PRKey:     prKey,
+		Owner:     owner,
+		Repo:      repo,
+		PRNumber:  prNum,
+		Payload:   payloadText,
 	}
 
 	if kind == "review" {
@@ -509,9 +541,6 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 
 	switch res.Status {
 	case AdmitAccepted:
-		if s.dispatchHook != nil {
-			s.dispatchHook(kind, owner, repo, prNum)
-		}
 		if s.scheduler != nil {
 			s.scheduler.Wake()
 		}
@@ -526,22 +555,6 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 		w.Header().Set("Retry-After", "30")
 		http.Error(w, res.Reason, http.StatusServiceUnavailable)
 	}
-}
-
-func (s *Server) handleLegacyWebhook(w http.ResponseWriter, r *http.Request, payload []byte) {
-	event, err := github.ParseWebHook(github.WebHookType(r), payload)
-	if err != nil {
-		http.Error(w, "cannot parse webhook", http.StatusBadRequest)
-		return
-	}
-	switch e := event.(type) {
-	case *github.PullRequestEvent:
-		s.handlePullRequestEvent(e)
-	case *github.IssueCommentEvent:
-		s.handleIssueCommentEvent(r.Context(), e)
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"accepted"}`))
 }
 
 func isValidDeliveryID(s string) bool {
@@ -582,93 +595,6 @@ func parseCommentCommand(body string) (kind string, payload string) {
 	}
 }
 
-func (s *Server) handlePullRequestEvent(e *github.PullRequestEvent) {
-	action := e.GetAction()
-	if action != "opened" && action != "synchronize" && action != "reopened" {
-		return
-	}
-
-	owner := e.GetRepo().GetOwner().GetLogin()
-	repo := e.GetRepo().GetName()
-	prNum := e.GetPullRequest().GetNumber()
-
-	if owner == "" || repo == "" {
-		return
-	}
-
-	if action == "opened" {
-		if s.cfg.AutoActionEnabled("labels") {
-			go s.dispatchLabels(owner, repo, prNum)
-		}
-		if s.cfg.AutoActionEnabled("describe") && strings.TrimSpace(e.GetPullRequest().GetBody()) == "" {
-			go s.dispatchDescribe(owner, repo, prNum)
-		}
-		if s.cfg.AutoActionEnabled("improve") {
-			log.Printf("[improve] Skipped for %s/%s #%d: container verification unavailable", owner, repo, prNum)
-		}
-		if s.cfg.AutoActionEnabled("review") {
-			go s.dispatchReview(owner, repo, prNum)
-		}
-		return
-	}
-
-	if s.cfg.AutoActionEnabled("review") {
-		go s.dispatchReview(owner, repo, prNum)
-	}
-}
-
-func (s *Server) handleIssueCommentEvent(ctx context.Context, e *github.IssueCommentEvent) {
-	if e.GetAction() != "created" || !e.GetIssue().IsPullRequest() {
-		return
-	}
-
-	body := strings.TrimSpace(e.GetComment().GetBody())
-	owner := e.GetRepo().GetOwner().GetLogin()
-	repo := e.GetRepo().GetName()
-	prNum := e.GetIssue().GetNumber()
-
-	if owner == "" || repo == "" || !isCommentCommand(body) {
-		return
-	}
-
-	username := e.GetComment().GetUser().GetLogin()
-	permissionCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	allowed, err := s.gh.CanWriteRepository(permissionCtx, owner, repo, username)
-	if err != nil || !allowed {
-		log.Printf("[webhook] Ignoring comment command from %q on %s/%s #%d: permission denied or unavailable: %v", username, owner, repo, prNum, err)
-		return
-	}
-
-	dispatch := func(action string, runner func()) {
-		if s.dispatchHook != nil {
-			s.dispatchHook(action, owner, repo, prNum)
-		}
-		go runner()
-	}
-
-	if strings.HasPrefix(body, "/review") {
-		dispatch("review", func() { s.dispatchReview(owner, repo, prNum) })
-	} else if strings.HasPrefix(body, "/improve") {
-		dispatch("improve", func() { s.dispatchImprove(owner, repo, prNum) })
-	} else if strings.HasPrefix(body, "/describe") {
-		dispatch("describe", func() { s.dispatchDescribe(owner, repo, prNum) })
-	} else if strings.HasPrefix(body, "/update_changelog") {
-		dispatch("changelog", func() { s.dispatchChangelog(owner, repo, prNum) })
-	} else if strings.HasPrefix(body, "/generate_labels") || strings.HasPrefix(body, "/labels") {
-		dispatch("labels", func() { s.dispatchLabels(owner, repo, prNum) })
-	} else if strings.HasPrefix(body, "/summarize") || strings.HasPrefix(body, "/summary") {
-		dispatch("summary", func() { s.dispatchSummary(owner, repo, prNum) })
-	} else if strings.HasPrefix(body, "/add_docs") || strings.HasPrefix(body, "/docs") {
-		dispatch("add_docs", func() { s.dispatchAddDocs(owner, repo, prNum) })
-	} else if strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "@pr-review") || strings.HasPrefix(body, "/ask") {
-		question := strings.TrimSpace(strings.TrimPrefix(body, "@bot"))
-		question = strings.TrimSpace(strings.TrimPrefix(question, "@pr-review"))
-		question = strings.TrimSpace(strings.TrimPrefix(question, "/ask"))
-		dispatch("assistant", func() { s.dispatchAssistant(owner, repo, prNum, question) })
-	}
-}
-
 func isCommentCommand(body string) bool {
 	for _, prefix := range []string{
 		"/review", "/improve", "/describe", "/update_changelog", "/generate_labels", "/labels",
@@ -681,54 +607,10 @@ func isCommentCommand(body string) bool {
 	return false
 }
 
-func (s *Server) dispatchChangelog(owner, repo string, prNum int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	if err := s.changelog.RunAndPost(ctx, owner, repo, prNum); err != nil {
-		log.Printf("[changelog] Failed for %s/%s #%d: %v", owner, repo, prNum, err)
+func (s *Server) dispatchAddDocs(ctx context.Context, owner, repo string, prNum int) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-}
-
-func (s *Server) dispatchDescribe(owner, repo string, prNum int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	updated, err := s.describer.RunAndUpdate(ctx, owner, repo, prNum)
-	if err != nil {
-		log.Printf("[describer] Failed for %s/%s #%d: %v", owner, repo, prNum, err)
-		return
-	}
-	if updated {
-		log.Printf("[describer] Updated PR body for %s/%s #%d", owner, repo, prNum)
-	}
-}
-
-func (s *Server) dispatchImprove(owner, repo string, prNum int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	const message = "## PR Improvement Suggestions\n\nOne-click suggestions are unavailable until isolated project verification is configured. No build or tests were run."
-	if err := s.gh.PostComment(ctx, owner, repo, prNum, message); err != nil {
-		log.Printf("[improve] Failed posting unavailable notice for %s/%s #%d: %v", owner, repo, prNum, err)
-	}
-}
-
-func (s *Server) dispatchSummary(owner, repo string, prNum int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	log.Printf("[summarizer] Generating discussion summary for %s/%s #%d...", owner, repo, prNum)
-	_, err := s.summarizer.RunAndPost(ctx, owner, repo, prNum)
-	if err != nil {
-		log.Printf("[summarizer] Failed to generate/post summary for %s/%s #%d: %v", owner, repo, prNum, err)
-		return
-	}
-	log.Printf("[summarizer] Successfully posted discussion summary to %s/%s #%d", owner, repo, prNum)
-}
-
-func (s *Server) dispatchAddDocs(owner, repo string, prNum int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
 
 	log.Printf("[docgen] Scanning for undocumented items on %s/%s #%d...", owner, repo, prNum)
 	pr, err := s.gh.GetPR(ctx, owner, repo, prNum)
@@ -769,52 +651,6 @@ func (s *Server) dispatchAddDocs(owner, repo string, prNum int) {
 		return
 	}
 	log.Printf("[docgen] Successfully posted documentation report to %s/%s #%d", owner, repo, prNum)
-}
-
-func (s *Server) dispatchAssistant(owner, repo string, prNum int, question string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	log.Printf("[assistant] Running interactive task for %s/%s #%d: %s", owner, repo, prNum, question)
-	_, err := s.assistant.RunAndReply(ctx, owner, repo, prNum, question)
-	if err != nil {
-		log.Printf("[assistant] Failed to run assistant task for %s/%s #%d: %v", owner, repo, prNum, err)
-		return
-	}
-	log.Printf("[assistant] Successfully posted assistant reply to %s/%s #%d", owner, repo, prNum)
-}
-
-func (s *Server) dispatchLabels(owner, repo string, prNum int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	log.Printf("[labeler] Generating labels for %s/%s #%d...", owner, repo, prNum)
-	applied, err := s.labeler.RunAndApply(ctx, owner, repo, prNum)
-	if err != nil {
-		log.Printf("[labeler] Failed to generate/apply labels for %s/%s #%d: %v", owner, repo, prNum, err)
-		return
-	}
-	log.Printf("[labeler] Successfully applied labels to %s/%s #%d: %v", owner, repo, prNum, applied)
-}
-
-func (s *Server) dispatchReview(owner, repo string, prNum int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	log.Printf("[runner] Starting review for %s/%s #%d...", owner, repo, prNum)
-	report, err := s.engine.ReviewPR(ctx, owner, repo, prNum)
-	if err != nil {
-		log.Printf("[runner] Review failed for %s/%s #%d: %v", owner, repo, prNum, err)
-		return
-	}
-
-	log.Printf("[runner] Review finished for %s/%s #%d (Score: %d). Posting comment...", owner, repo, prNum, report.Score)
-	if err := s.gh.PostComment(ctx, owner, repo, prNum, report.RawMarkdown); err != nil {
-		log.Printf("[runner] Failed to post comment on %s/%s #%d: %v", owner, repo, prNum, err)
-		return
-	}
-
-	log.Printf("[runner] Review comment successfully posted to %s/%s #%d", owner, repo, prNum)
 }
 
 func (s *Server) ListenAndServe() error {

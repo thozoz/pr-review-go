@@ -23,9 +23,10 @@ import (
 	"go.etcd.io/bbolt"
 )
 
+const testSecret = "tracer-webhook-secret"
+
 func TestWebhookDurableTracer(t *testing.T) {
 	const (
-		testSecret   = "tracer-webhook-secret"
 		validBaseSHA = "1111111111111111111111111111111111111111"
 		validHeadSHA = "2222222222222222222222222222222222222222"
 		repoID       = int64(12345)
@@ -1347,5 +1348,853 @@ type JobExecutorFunc func(ctx context.Context, job *Job) error
 func (f JobExecutorFunc) ExecuteJob(ctx context.Context, job *Job) error {
 	return f(ctx, job)
 }
+
+func TestCommandScheduling(t *testing.T) {
+	t.Run("fairness between PRs and FIFO order retention", func(t *testing.T) {
+		stateDir := t.TempDir()
+		dbPath := filepath.Join(stateDir, "jobs.db")
+		store, err := OpenJobStore(dbPath, StoreOptions{
+			BacklogLimit:  20,
+			DeliveryLimit: 100,
+			StateMaxBytes: 16777216,
+			DeliveryTTL:   24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		prKey1, _ := MakePRKey("github.com", 100, 1)
+		prKey2, _ := MakePRKey("github.com", 100, 2)
+
+		deliv1 := Delivery{Host: "github.com", RepoID: 100, DeliveryID: "d1", EventKind: "issue_comment", PayloadHash: "h1", ReceivedAt: time.Now()}
+		deliv2 := Delivery{Host: "github.com", RepoID: 100, DeliveryID: "d2", EventKind: "issue_comment", PayloadHash: "h2", ReceivedAt: time.Now()}
+
+		res1, err := store.Admit(ctx, deliv1, []Job{
+			{Kind: "describe", Trigger: "explicit", Status: "queued", PRKey: prKey1, Owner: "o", Repo: "r", PRNumber: 1},
+			{Kind: "summary", Trigger: "explicit", Status: "queued", PRKey: prKey1, Owner: "o", Repo: "r", PRNumber: 1},
+			{Kind: "labels", Trigger: "explicit", Status: "queued", PRKey: prKey1, Owner: "o", Repo: "r", PRNumber: 1},
+		})
+		if err != nil || res1.Status != AdmitAccepted {
+			t.Fatalf("failed admitting PR 1 jobs: %v, status: %v", err, res1.Status)
+		}
+
+		res2, err := store.Admit(ctx, deliv2, []Job{
+			{Kind: "review", Trigger: "explicit", Status: "queued", PRKey: prKey2, Owner: "o", Repo: "r", PRNumber: 2},
+		})
+		if err != nil || res2.Status != AdmitAccepted {
+			t.Fatalf("failed admitting PR 2 job: %v, status: %v", err, res2.Status)
+		}
+
+		// 1. Claim first job: should be PR 1's first job ("describe")
+		activePRs := make(map[string]bool)
+		job1, err := store.ClaimNextJob(ctx, activePRs)
+		if err != nil || job1 == nil {
+			t.Fatalf("failed to claim job 1: %v", err)
+		}
+		if job1.Kind != "describe" || job1.PRNumber != 1 {
+			t.Fatalf("expected PR 1 'describe', got PR %d '%s'", job1.PRNumber, job1.Kind)
+		}
+		activePRs[job1.PRKey.String()] = true
+
+		// 2. While PR 1 is active, ClaimNextJob MUST pick PR 2's job ("review")
+		// Other eligible PR advances while busy PR retains FIFO commands
+		job2, err := store.ClaimNextJob(ctx, activePRs)
+		if err != nil || job2 == nil {
+			t.Fatalf("failed to claim job 2: %v", err)
+		}
+		if job2.Kind != "review" || job2.PRNumber != 2 {
+			t.Fatalf("expected other eligible PR 2 'review', got PR %d '%s'", job2.PRNumber, job2.Kind)
+		}
+		activePRs[job2.PRKey.String()] = true
+
+		// 3. Both PR 1 and PR 2 are busy; no other jobs should be claimable
+		jobNone, err := store.ClaimNextJob(ctx, activePRs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if jobNone != nil {
+			t.Fatalf("expected no claimable job while both PRs busy, got %+v", jobNone)
+		}
+
+		// 4. Release PR 1: next claim should get PR 1's second FIFO job ("summary")
+		delete(activePRs, job1.PRKey.String())
+		_ = store.ReleasePR(ctx, job1.PRKey)
+
+		job3, err := store.ClaimNextJob(ctx, activePRs)
+		if err != nil || job3 == nil {
+			t.Fatalf("failed to claim job 3: %v", err)
+		}
+		if job3.Kind != "summary" || job3.PRNumber != 1 {
+			t.Fatalf("expected PR 1 'summary' in FIFO sequence, got PR %d '%s'", job3.PRNumber, job3.Kind)
+		}
+		activePRs[job3.PRKey.String()] = true
+
+		// 5. Release PR 1 again: next claim should get PR 1's third FIFO job ("labels")
+		delete(activePRs, job3.PRKey.String())
+		_ = store.ReleasePR(ctx, job3.PRKey)
+
+		job4, err := store.ClaimNextJob(ctx, activePRs)
+		if err != nil || job4 == nil {
+			t.Fatalf("failed to claim job 4: %v", err)
+		}
+		if job4.Kind != "labels" || job4.PRNumber != 1 {
+			t.Fatalf("expected PR 1 'labels' in FIFO sequence, got PR %d '%s'", job4.PRNumber, job4.Kind)
+		}
+	})
+
+	t.Run("all recognized aliases admitted with correct kinds", func(t *testing.T) {
+		const validHeadSHA = "2222222222222222222222222222222222222222"
+		const validBaseSHA = "1111111111111111111111111111111111111111"
+
+		aliases := []struct {
+			command     string
+			wantKind    string
+			wantPayload string
+		}{
+			{"/review", "review", ""},
+			{"/describe", "describe", ""},
+			{"/update_changelog", "changelog", ""},
+			{"/generate_labels", "labels", ""},
+			{"/labels", "labels", ""},
+			{"/summarize", "summary", ""},
+			{"/summary", "summary", ""},
+			{"/add_docs", "docs", ""},
+			{"/docs", "docs", ""},
+			{"@bot explain how this works", "assistant", "explain how this works"},
+			{"@pr-review explain this", "assistant", "explain this"},
+			{"/ask what is this function", "assistant", "what is this function"},
+			{"/improve", "improve", ""},
+		}
+
+		for i, tc := range aliases {
+			t.Run(tc.command, func(t *testing.T) {
+				api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case strings.Contains(r.URL.Path, "/collaborators/"):
+						w.Header().Set("Content-Type", "application/json")
+						_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+					case strings.Contains(r.URL.Path, "/pulls/"):
+						w.Header().Set("Content-Type", "application/json")
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"number": 1,
+							"head":   map[string]any{"sha": validHeadSHA, "ref": "feat"},
+							"base":   map[string]any{"sha": validBaseSHA, "ref": "main"},
+						})
+					default:
+						http.NotFound(w, r)
+					}
+				}))
+				defer api.Close()
+
+				ghClient, err := ghclient.NewTestClient(api.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				stateDir := t.TempDir()
+				cfg := &config.Config{
+					GitHubToken:     "test-token",
+					LLMAPIKey:       "test-key",
+					LLMModel:        "test-model",
+					LLMBaseURL:      "http://example.invalid",
+					WebhookSecret:   testSecret,
+					WebhookStateDir: stateDir,
+				}
+				srv := NewServer(cfg)
+				srv.gh = ghClient
+				defer srv.Stop()
+
+				store, err := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{
+					BacklogLimit:  100,
+					DeliveryLimit: 100,
+					StateMaxBytes: 16777216,
+					DeliveryTTL:   24 * time.Hour,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				srv.SetStore(store)
+
+				commentID := int64(3000 + i)
+				payloadJSON := fmt.Sprintf(`{
+					"action": "created",
+					"issue": {
+						"number": 1,
+						"pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"}
+					},
+					"comment": {
+						"id": %d,
+						"body": %q,
+						"user": {"login": "dev"}
+					},
+					"repository": {
+						"id": 12345,
+						"name": "repo",
+						"owner": {"login": "org"}
+					}
+				}`, commentID, tc.command)
+				payload := []byte(payloadJSON)
+
+				req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+				req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("deliv-alias-%d", i))
+				req.Header.Set("X-GitHub-Event", "issue_comment")
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+				rr := httptest.NewRecorder()
+				srv.Routes().ServeHTTP(rr, req)
+
+				if rr.Code != http.StatusOK {
+					t.Fatalf("command %q returned status %d: %s", tc.command, rr.Code, rr.Body.String())
+				}
+
+				queued, err := store.ListQueuedJobs(context.Background())
+				if err != nil || len(queued) != 1 {
+					t.Fatalf("command %q expected 1 queued job, got %d (err=%v)", tc.command, len(queued), err)
+				}
+				if queued[0].Kind != tc.wantKind {
+					t.Errorf("command %q expected kind %q, got %q", tc.command, tc.wantKind, queued[0].Kind)
+				}
+				if queued[0].Payload != tc.wantPayload {
+					t.Errorf("command %q expected payload %q, got %q", tc.command, tc.wantPayload, queued[0].Payload)
+				}
+				if queued[0].Trigger != "explicit" {
+					t.Errorf("command %q expected trigger 'explicit', got %q", tc.command, queued[0].Trigger)
+				}
+			})
+		}
+	})
+
+	t.Run("command argument text bounded to 4096 bytes", func(t *testing.T) {
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+		}))
+		defer api.Close()
+
+		ghClient, _ := ghclient.NewTestClient(api.URL)
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			GitHubToken:     "test-token",
+			LLMAPIKey:       "test-key",
+			LLMModel:        "test-model",
+			LLMBaseURL:      "http://example.invalid",
+			WebhookSecret:   testSecret,
+			WebhookStateDir: stateDir,
+		}
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		defer srv.Stop()
+
+		store, _ := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{BacklogLimit: 10, DeliveryLimit: 10, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour})
+		srv.SetStore(store)
+
+		longQuestion := strings.Repeat("z", 5000)
+		body := "/ask " + longQuestion
+		payloadJSON := fmt.Sprintf(`{
+			"action": "created",
+			"issue": {"number": 1, "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"}},
+			"comment": {"id": 9999, "body": %q, "user": {"login": "dev"}},
+			"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+		}`, body)
+		payload := []byte(payloadJSON)
+
+		req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Delivery", "deliv-bounded")
+		req.Header.Set("X-GitHub-Event", "issue_comment")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rr := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+		queued, _ := store.ListQueuedJobs(context.Background())
+		if len(queued) != 1 {
+			t.Fatalf("expected 1 queued job, got %d", len(queued))
+		}
+		if len(queued[0].Payload) > 4096 {
+			t.Fatalf("expected payload bounded to <= 4096 bytes, got %d", len(queued[0].Payload))
+		}
+	})
+}
+
+func TestAutomaticActions(t *testing.T) {
+	const validHeadSHA = "2222222222222222222222222222222222222222"
+	const validBaseSHA = "1111111111111111111111111111111111111111"
+
+	t.Run("opened with empty body selects labels, describe, and review; improves skipped", func(t *testing.T) {
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			GitHubToken:     "test-token",
+			LLMAPIKey:       "test-key",
+			LLMModel:        "test-model",
+			LLMBaseURL:      "http://example.invalid",
+			WebhookSecret:   testSecret,
+			WebhookStateDir: stateDir,
+			AutoActions:     []string{"labels", "describe", "improve", "review"},
+		}
+		srv := NewServer(cfg)
+		defer srv.Stop()
+
+		store, _ := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{BacklogLimit: 10, DeliveryLimit: 10, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour})
+		srv.SetStore(store)
+
+		payloadJSON := fmt.Sprintf(`{
+			"action": "opened",
+			"pull_request": {
+				"number": 1,
+				"body": "",
+				"head": {"sha": %q, "ref": "feat"},
+				"base": {"sha": %q, "ref": "main"}
+			},
+			"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+		}`, validHeadSHA, validBaseSHA)
+		payload := []byte(payloadJSON)
+
+		req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Delivery", "deliv-opened-empty")
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rr := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+
+		queued, _ := store.ListQueuedJobs(context.Background())
+		if len(queued) != 3 {
+			t.Fatalf("expected 3 jobs (labels, describe, review), got %d: %+v", len(queued), queued)
+		}
+
+		kinds := []string{queued[0].Kind, queued[1].Kind, queued[2].Kind}
+		expectedKinds := []string{"labels", "describe", "review"}
+		for i, exp := range expectedKinds {
+			if kinds[i] != exp {
+				t.Errorf("job %d expected kind %q, got %q", i, exp, kinds[i])
+			}
+			if queued[i].Trigger != "automatic" {
+				t.Errorf("job %d expected trigger automatic, got %q", i, queued[i].Trigger)
+			}
+		}
+	})
+
+	t.Run("opened with non-empty body selects labels and review only", func(t *testing.T) {
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			GitHubToken:     "test-token",
+			LLMAPIKey:       "test-key",
+			LLMModel:        "test-model",
+			LLMBaseURL:      "http://example.invalid",
+			WebhookSecret:   testSecret,
+			WebhookStateDir: stateDir,
+			AutoActions:     []string{"labels", "describe", "improve", "review"},
+		}
+		srv := NewServer(cfg)
+		defer srv.Stop()
+
+		store, _ := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{BacklogLimit: 10, DeliveryLimit: 10, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour})
+		srv.SetStore(store)
+
+		payloadJSON := fmt.Sprintf(`{
+			"action": "opened",
+			"pull_request": {
+				"number": 2,
+				"body": "Existing detailed PR description",
+				"head": {"sha": %q, "ref": "feat"},
+				"base": {"sha": %q, "ref": "main"}
+			},
+			"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+		}`, validHeadSHA, validBaseSHA)
+		payload := []byte(payloadJSON)
+
+		req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Delivery", "deliv-opened-desc")
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rr := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+
+		queued, _ := store.ListQueuedJobs(context.Background())
+		if len(queued) != 2 {
+			t.Fatalf("expected 2 jobs (labels, review), got %d: %+v", len(queued), queued)
+		}
+		if queued[0].Kind != "labels" || queued[1].Kind != "review" {
+			t.Errorf("expected [labels, review], got [%s, %s]", queued[0].Kind, queued[1].Kind)
+		}
+	})
+
+	t.Run("synchronize and reopened select review only", func(t *testing.T) {
+		for _, action := range []string{"synchronize", "reopened"} {
+			t.Run(action, func(t *testing.T) {
+				stateDir := t.TempDir()
+				cfg := &config.Config{
+					GitHubToken:     "test-token",
+					LLMAPIKey:       "test-key",
+					LLMModel:        "test-model",
+					LLMBaseURL:      "http://example.invalid",
+					WebhookSecret:   testSecret,
+					WebhookStateDir: stateDir,
+					AutoActions:     []string{"labels", "describe", "improve", "review"},
+				}
+				srv := NewServer(cfg)
+				defer srv.Stop()
+
+				store, _ := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{BacklogLimit: 10, DeliveryLimit: 10, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour})
+				srv.SetStore(store)
+
+				payloadJSON := fmt.Sprintf(`{
+					"action": %q,
+					"pull_request": {
+						"number": 3,
+						"body": "",
+						"head": {"sha": %q, "ref": "feat"},
+						"base": {"sha": %q, "ref": "main"}
+					},
+					"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+				}`, action, validHeadSHA, validBaseSHA)
+				payload := []byte(payloadJSON)
+
+				req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+				req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("deliv-%s", action))
+				req.Header.Set("X-GitHub-Event", "pull_request")
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+				rr := httptest.NewRecorder()
+				srv.Routes().ServeHTTP(rr, req)
+
+				if rr.Code != http.StatusOK {
+					t.Fatalf("expected 200, got %d", rr.Code)
+				}
+
+				queued, _ := store.ListQueuedJobs(context.Background())
+				if len(queued) != 1 || queued[0].Kind != "review" {
+					t.Fatalf("expected 1 'review' job for %s, got: %+v", action, queued)
+				}
+			})
+		}
+	})
+}
+
+func TestWebhookCommandReplay(t *testing.T) {
+	const validHeadSHA = "2222222222222222222222222222222222222222"
+	const validBaseSHA = "1111111111111111111111111111111111111111"
+
+	t.Run("distinct authorized comment IDs run independently", func(t *testing.T) {
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/collaborators/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+			case strings.Contains(r.URL.Path, "/pulls/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": 1,
+					"head":   map[string]any{"sha": validHeadSHA, "ref": "feat"},
+					"base":   map[string]any{"sha": validBaseSHA, "ref": "main"},
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer api.Close()
+
+		ghClient, _ := ghclient.NewTestClient(api.URL)
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			GitHubToken:     "test-token",
+			LLMAPIKey:       "test-key",
+			LLMModel:        "test-model",
+			LLMBaseURL:      "http://example.invalid",
+			WebhookSecret:   testSecret,
+			WebhookStateDir: stateDir,
+		}
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		defer srv.Stop()
+
+		store, _ := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{BacklogLimit: 10, DeliveryLimit: 10, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour})
+		srv.SetStore(store)
+
+		for _, commentID := range []int64{5001, 5002} {
+			payloadJSON := fmt.Sprintf(`{
+				"action": "created",
+				"issue": {"number": 1, "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"}},
+				"comment": {"id": %d, "body": "/review", "user": {"login": "dev"}},
+				"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+			}`, commentID)
+			payload := []byte(payloadJSON)
+
+			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("deliv-c-%d", commentID))
+			req.Header.Set("X-GitHub-Event", "issue_comment")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+			rr := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rr.Code)
+			}
+			if !strings.Contains(rr.Body.String(), `"status":"accepted"`) {
+				t.Fatalf("expected accepted, got %s", rr.Body.String())
+			}
+		}
+
+		queued, _ := store.ListQueuedJobs(context.Background())
+		if len(queued) != 2 {
+			t.Fatalf("expected 2 jobs for distinct comment IDs, got %d", len(queued))
+		}
+	})
+
+	t.Run("duplicate comment ID and duplicate delivery replay suppressed", func(t *testing.T) {
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/collaborators/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+			case strings.Contains(r.URL.Path, "/pulls/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": 1,
+					"head":   map[string]any{"sha": validHeadSHA, "ref": "feat"},
+					"base":   map[string]any{"sha": validBaseSHA, "ref": "main"},
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer api.Close()
+
+		ghClient, _ := ghclient.NewTestClient(api.URL)
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			GitHubToken:     "test-token",
+			LLMAPIKey:       "test-key",
+			LLMModel:        "test-model",
+			LLMBaseURL:      "http://example.invalid",
+			WebhookSecret:   testSecret,
+			WebhookStateDir: stateDir,
+		}
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		defer srv.Stop()
+
+		store, _ := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{BacklogLimit: 10, DeliveryLimit: 10, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour})
+		srv.SetStore(store)
+
+		commentID := int64(6001)
+		payloadJSON := fmt.Sprintf(`{
+			"action": "created",
+			"issue": {"number": 1, "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"}},
+			"comment": {"id": %d, "body": "/review", "user": {"login": "dev"}},
+			"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+		}`, commentID)
+		payload := []byte(payloadJSON)
+
+		// 1. Initial delivery: accepted
+		req1 := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req1.Header.Set("X-GitHub-Delivery", "deliv-dup-1")
+		req1.Header.Set("X-GitHub-Event", "issue_comment")
+		req1.Header.Set("Content-Type", "application/json")
+		req1.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rr1 := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr1, req1)
+		if rr1.Code != http.StatusOK || !strings.Contains(rr1.Body.String(), `"status":"accepted"`) {
+			t.Fatalf("expected accepted, got %d: %s", rr1.Code, rr1.Body.String())
+		}
+
+		// 2. Replay with identical delivery ID: duplicate
+		req2 := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req2.Header.Set("X-GitHub-Delivery", "deliv-dup-1")
+		req2.Header.Set("X-GitHub-Event", "issue_comment")
+		req2.Header.Set("Content-Type", "application/json")
+		req2.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rr2 := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr2, req2)
+		if rr2.Code != http.StatusOK || !strings.Contains(rr2.Body.String(), `"status":"duplicate"`) {
+			t.Fatalf("expected duplicate for delivery ID replay, got %d: %s", rr2.Code, rr2.Body.String())
+		}
+
+		// 3. Replay with NEW delivery ID but SAME comment ID: duplicate
+		req3 := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req3.Header.Set("X-GitHub-Delivery", "deliv-dup-2")
+		req3.Header.Set("X-GitHub-Event", "issue_comment")
+		req3.Header.Set("Content-Type", "application/json")
+		req3.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rr3 := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr3, req3)
+		if rr3.Code != http.StatusOK || !strings.Contains(rr3.Body.String(), `"status":"duplicate"`) {
+			t.Fatalf("expected duplicate for comment ID replay, got %d: %s", rr3.Code, rr3.Body.String())
+		}
+
+		// Verify only 1 job in store
+		queued, _ := store.ListQueuedJobs(context.Background())
+		if len(queued) != 1 {
+			t.Fatalf("expected exactly 1 job in store, got %d", len(queued))
+		}
+	})
+
+	t.Run("fresh /review rerun on already reviewed head shows exact notice and reruns LLM", func(t *testing.T) {
+		var llmCalls int32
+		llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&llmCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message:      llm.ChatMessage{Content: `{"score": 95, "summary": "Rerun review passed", "findings": []}`},
+						FinishReason: "stop",
+					},
+				},
+			})
+		}))
+		defer llmServer.Close()
+
+		var createdComments []string
+		var commentsMu sync.Mutex
+		ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/collaborators/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+			case strings.HasSuffix(r.URL.Path, "/pulls/10"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": 10,
+					"head":   map[string]any{"sha": validHeadSHA, "ref": "feat"},
+					"base":   map[string]any{"sha": validBaseSHA, "ref": "main"},
+				})
+			case strings.Contains(r.URL.Path, "/compare/"):
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("diff --git a/main.go b/main.go\n+func Rerun() {}\n"))
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/issues/10/comments"):
+				var bodyMap map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+				commentsMu.Lock()
+				createdComments = append(createdComments, bodyMap["body"])
+				commentsMu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 8888, "body": bodyMap["body"]})
+			case strings.Contains(r.URL.Path, "/comments"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[]`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ghServer.Close()
+
+		ghClient, _ := ghclient.NewTestClient(ghServer.URL)
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			GitHubToken:     "test-token",
+			LLMAPIKey:       "test-key",
+			LLMModel:        "test-model",
+			LLMBaseURL:      llmServer.URL,
+			WebhookSecret:   testSecret,
+			WebhookStateDir: stateDir,
+			EffortLevel:     "lite",
+		}
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+		srv.SetEngine(reviewer.NewEngineWithClients(cfg, ghClient, llmClient, nil))
+		defer srv.Stop()
+
+		store, _ := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{BacklogLimit: 10, DeliveryLimit: 10, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour})
+		srv.SetStore(store)
+
+		prKey, _ := MakePRKey("github.com", 12345, 10)
+
+		// Set PRState showing validHeadSHA was already reviewed
+		_ = store.UpdatePRState(context.Background(), &PRState{
+			PRKey:            prKey,
+			Generation:       1,
+			LastReviewedHead: validHeadSHA,
+		})
+
+		// Send fresh /review command
+		payloadJSON := fmt.Sprintf(`{
+			"action": "created",
+			"issue": {"number": 10, "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/10"}},
+			"comment": {"id": 7001, "body": "/review", "user": {"login": "dev"}},
+			"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+		}`)
+		payload := []byte(payloadJSON)
+
+		req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Delivery", "deliv-rerun-1")
+		req.Header.Set("X-GitHub-Event", "issue_comment")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rr := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+
+		job, err := store.ClaimNextJob(context.Background(), nil)
+		if err != nil || job == nil {
+			t.Fatalf("expected claimable rerun job, got: %v", err)
+		}
+
+		executor := NewServerJobExecutor(srv, store)
+		err = executor.ExecuteJob(context.Background(), job)
+		if err != nil {
+			t.Fatalf("ExecuteJob failed: %v", err)
+		}
+
+		// Verify LLM was actually called for rerun
+		if atomic.LoadInt32(&llmCalls) != 1 {
+			t.Fatalf("expected 1 LLM call for rerun, got %d", atomic.LoadInt32(&llmCalls))
+		}
+
+		// Verify exact rerun notice displayed in created comments
+		commentsMu.Lock()
+		defer commentsMu.Unlock()
+		foundNotice := false
+		const wantNotice = "This commit was already reviewed. Reviewing again."
+		for _, c := range createdComments {
+			if strings.Contains(c, wantNotice) {
+				foundNotice = true
+				break
+			}
+		}
+		if !foundNotice {
+			t.Fatalf("expected comments to contain %q, but got: %v", wantNotice, createdComments)
+		}
+	})
+
+	t.Run("permission revocation/denial fails closed with zero effective action", func(t *testing.T) {
+		var llmCalls int32
+		llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&llmCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(llm.ChatResponse{})
+		}))
+		defer llmServer.Close()
+
+		var permAllowed atomic.Bool
+		permAllowed.Store(true) // allowed at admission
+
+		var commentsCreated int32
+		ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/collaborators/"):
+				w.Header().Set("Content-Type", "application/json")
+				if permAllowed.Load() {
+					_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]string{"permission": "read"})
+				}
+			case strings.HasSuffix(r.URL.Path, "/pulls/20"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": 20,
+					"head":   map[string]any{"sha": validHeadSHA, "ref": "feat"},
+					"base":   map[string]any{"sha": validBaseSHA, "ref": "main"},
+				})
+			case strings.Contains(r.URL.Path, "/comments"):
+				atomic.AddInt32(&commentsCreated, 1)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 999})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ghServer.Close()
+
+		ghClient, _ := ghclient.NewTestClient(ghServer.URL)
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			GitHubToken:     "test-token",
+			LLMAPIKey:       "test-key",
+			LLMModel:        "test-model",
+			LLMBaseURL:      llmServer.URL,
+			WebhookSecret:   testSecret,
+			WebhookStateDir: stateDir,
+		}
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		defer srv.Stop()
+
+		store, _ := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{BacklogLimit: 10, DeliveryLimit: 10, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour})
+		srv.SetStore(store)
+
+		// 1. Admit job when permission is write
+		payloadJSON := fmt.Sprintf(`{
+			"action": "created",
+			"issue": {"number": 20, "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/20"}},
+			"comment": {"id": 8001, "body": "/review", "user": {"login": "dev-revoked"}},
+			"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+		}`)
+		payload := []byte(payloadJSON)
+
+		req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Delivery", "deliv-revoked-1")
+		req.Header.Set("X-GitHub-Event", "issue_comment")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rr := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+
+		job, err := store.ClaimNextJob(context.Background(), nil)
+		if err != nil || job == nil {
+			t.Fatalf("expected job to be claimed, got: %v", err)
+		}
+
+		// 2. Revoke permission before execution
+		permAllowed.Store(false)
+
+		// 3. Execute job
+		executor := NewServerJobExecutor(srv, store)
+		err = executor.ExecuteJob(context.Background(), job)
+		if err == nil {
+			t.Fatal("expected ExecuteJob to fail for revoked actor, but got nil")
+		}
+
+		// 4. Assert zero effective actions performed
+		if atomic.LoadInt32(&llmCalls) != 0 {
+			t.Fatalf("expected 0 LLM calls for revoked actor, got %d", atomic.LoadInt32(&llmCalls))
+		}
+		if atomic.LoadInt32(&commentsCreated) != 0 {
+			t.Fatalf("expected 0 comments created for revoked actor, got %d", atomic.LoadInt32(&commentsCreated))
+		}
+
+		// Check job status in store is failed
+		jobAfter, _ := store.GetJob(context.Background(), job.ID)
+		if jobAfter == nil || jobAfter.Status != "failed" {
+			t.Fatalf("expected job status 'failed', got %+v", jobAfter)
+		}
+		if !strings.Contains(jobAfter.Error, "permission revoked") {
+			t.Fatalf("expected error mentioning permission revoked, got: %s", jobAfter.Error)
+		}
+	})
+}
+
 
 

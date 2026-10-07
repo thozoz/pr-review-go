@@ -30,27 +30,64 @@ func NewServerJobExecutor(s *Server, store JobStore) *ServerJobExecutor {
 }
 
 func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
+	var timeout time.Duration
 	switch job.Kind {
 	case "review":
-		return e.executeReviewJob(ctx, job)
-	case "labels":
-		return e.executeLabelsJob(ctx, job)
-	case "describe":
-		return e.executeDescribeJob(ctx, job)
-	case "improve":
-		return e.executeImproveJob(ctx, job)
-	case "summary":
-		return e.executeSummaryJob(ctx, job)
-	case "changelog":
-		return e.executeChangelogJob(ctx, job)
-	case "docs":
-		return e.executeDocsJob(ctx, job)
+		timeout = 10 * time.Minute
+	case "labels", "summary", "improve":
+		timeout = 2 * time.Minute
+	case "describe", "changelog", "docs":
+		timeout = 3 * time.Minute
 	case "assistant":
-		return e.executeAssistantJob(ctx, job)
+		timeout = 5 * time.Minute
+	default:
+		timeout = 5 * time.Minute
+	}
+
+	jobCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if job.Trigger == "explicit" && job.Author != "" && e.server != nil && e.server.gh != nil {
+		authCtx, authCancel := context.WithTimeout(jobCtx, 5*time.Second)
+		allowed, err := e.server.gh.CanWriteRepository(authCtx, job.Owner, job.Repo, job.Author)
+		authCancel()
+		if err != nil || !allowed {
+			log.Printf("[jobs] Reauthorization failed for explicit command %s by %q on %s/%s: allowed=%v err=%v",
+				job.ID, job.Author, job.Owner, job.Repo, allowed, err)
+			job.Status = "failed"
+			job.Error = "actor permission revoked or unavailable"
+			now := time.Now().UTC()
+			job.FinishedAt = &now
+			_ = e.store.UpdateJob(jobCtx, job)
+			return fmt.Errorf("reauthorization denied: actor %s", job.Author)
+		}
+	}
+
+	if e.server != nil && e.server.dispatchHook != nil {
+		e.server.dispatchHook(job.Kind, job.Owner, job.Repo, job.PRNumber)
+	}
+
+	switch job.Kind {
+	case "review":
+		return e.executeReviewJob(jobCtx, job)
+	case "labels":
+		return e.executeLabelsJob(jobCtx, job)
+	case "describe":
+		return e.executeDescribeJob(jobCtx, job)
+	case "improve":
+		return e.executeImproveJob(jobCtx, job)
+	case "summary":
+		return e.executeSummaryJob(jobCtx, job)
+	case "changelog":
+		return e.executeChangelogJob(jobCtx, job)
+	case "docs":
+		return e.executeDocsJob(jobCtx, job)
+	case "assistant":
+		return e.executeAssistantJob(jobCtx, job)
 	default:
 		job.Status = "failed"
 		job.Error = fmt.Sprintf("unknown job kind: %s", job.Kind)
-		return e.store.UpdateJob(ctx, job)
+		return e.store.UpdateJob(jobCtx, job)
 	}
 }
 
@@ -258,7 +295,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	_ = e.store.UpdateOutputIntent(ctx, reviewIntent)
 
 	// 7. Update status comment to completed
-	if job.StatusCommentID > 0 {
+	if job.StatusCommentID > 0 && !isRerun {
 		_ = gh.EditComment(ctx, job.Owner, job.Repo, job.StatusCommentID, "✅ Review completed.")
 	}
 
@@ -361,7 +398,9 @@ func (e *ServerJobExecutor) executeChangelogJob(ctx context.Context, job *Job) e
 
 func (e *ServerJobExecutor) executeDocsJob(ctx context.Context, job *Job) error {
 	// Reuses server's dispatchAddDocs behavior with context
-	e.server.dispatchAddDocs(job.Owner, job.Repo, job.PRNumber)
+	if e.server != nil {
+		e.server.dispatchAddDocs(ctx, job.Owner, job.Repo, job.PRNumber)
+	}
 	job.Status = "completed"
 	now := time.Now().UTC()
 	job.FinishedAt = &now

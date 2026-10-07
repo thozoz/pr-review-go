@@ -44,6 +44,7 @@ var (
 	bucketPRs        = []byte("prs")
 	bucketIntents    = []byte("intents")
 	bucketCounters   = []byte("counters")
+	bucketComments   = []byte("comments")
 
 	keySchemaVersion = []byte("schema_version")
 )
@@ -99,6 +100,7 @@ type Job struct {
 	Kind            string     `json:"kind"`    // "review", "labels", "describe", "summary", "docs", "changelog", "improve", "assistant"
 	Trigger         string     `json:"trigger"` // "automatic", "explicit"
 	Author          string     `json:"author"`
+	CommentID       int64      `json:"comment_id,omitempty"`
 	PRKey           PRKey      `json:"pr_key"`
 	Owner           string     `json:"owner"`
 	Repo            string     `json:"repo"`
@@ -272,6 +274,9 @@ func (s *BoltJobStore) initSchema() error {
 			if _, err := tx.CreateBucketIfNotExists(bucketCounters); err != nil {
 				return err
 			}
+			if _, err := tx.CreateBucketIfNotExists(bucketComments); err != nil {
+				return err
+			}
 			return nil
 		}
 
@@ -288,7 +293,7 @@ func (s *BoltJobStore) initSchema() error {
 		}
 
 		// Ensure all buckets exist
-		for _, bName := range [][]byte{bucketDeliveries, bucketJobs, bucketPRs, bucketIntents, bucketCounters} {
+		for _, bName := range [][]byte{bucketDeliveries, bucketJobs, bucketPRs, bucketIntents, bucketCounters, bucketComments} {
 			if _, err := tx.CreateBucketIfNotExists(bName); err != nil {
 				return err
 			}
@@ -334,6 +339,18 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 		jobsBucket := tx.Bucket(bucketJobs)
 		prsBucket := tx.Bucket(bucketPRs)
 		countersBucket := tx.Bucket(bucketCounters)
+		commentsBucket := tx.Bucket(bucketComments)
+
+		// 0. Check comment uniqueness (one commentID is one request)
+		for _, j := range jobs {
+			if j.CommentID > 0 {
+				commentKey := fmt.Sprintf("%d/%d/created", j.PRKey.RepoID, j.CommentID)
+				if commentsBucket.Get([]byte(commentKey)) != nil {
+					result = AdmitResult{Status: AdmitDuplicate, Reason: "comment already processed"}
+					return nil
+				}
+			}
+		}
 
 		// 1. Check Delivery uniqueness / collision
 		delivKey := []byte(delivery.Key())
@@ -553,6 +570,14 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 						_ = prsBucket.Put(prStateKey, updatedPRBytes)
 					}
 				}
+			}
+		}
+
+		// 7. Register comment keys
+		for _, j := range jobs {
+			if j.CommentID > 0 {
+				commentKey := fmt.Sprintf("%d/%d/created", j.PRKey.RepoID, j.CommentID)
+				_ = commentsBucket.Put([]byte(commentKey), []byte(j.ID))
 			}
 		}
 
