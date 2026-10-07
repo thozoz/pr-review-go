@@ -123,6 +123,14 @@ func ValidateSnapshotPath(relPath string) error {
 		return fmt.Errorf("%w: absolute path %q", ErrUnsafePathEntry, relPath)
 	}
 
+	normalized := strings.ReplaceAll(relPath, "\\", "/")
+	rawSegments := strings.Split(normalized, "/")
+	for _, seg := range rawSegments {
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("%w: traversal path %q", ErrUnsafePathEntry, relPath)
+		}
+	}
+
 	clean := path.Clean(relPath)
 	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
 		return fmt.Errorf("%w: traversal path %q", ErrUnsafePathEntry, relPath)

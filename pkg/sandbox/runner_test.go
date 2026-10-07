@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/thozoz/pr-review-go/pkg/github"
 )
 
 func TestVerifyProject_GoProject_SkipsExecutionWithoutContainerIsolation(t *testing.T) {
@@ -273,6 +275,75 @@ func TestVerifyProject_GoProject_ReportsIncompleteForUnvendoredDependencies(t *t
 	}
 	if !strings.Contains(report.Reason, "external dependencies require network gateway") {
 		t.Errorf("expected gateway reason, got: %q", report.Reason)
+	}
+}
+
+func TestCustomRules_BoundedHandleStreaming_Truncation(t *testing.T) {
+	tmpDir := t.TempDir()
+	largeRules := strings.Repeat("Rule line here\n", 2000) // ~30,000 bytes
+	if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(largeRules), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(0)
+	report := &VerificationReport{}
+	runner.extractCustomRules(tmpDir, report)
+
+	if !strings.Contains(report.CustomRules, "...[instructions truncated]...") {
+		t.Fatalf("expected custom rules to be truncated, got length %d", len(report.CustomRules))
+	}
+	if len(report.CustomRules) > 15100 {
+		t.Errorf("expected custom rules to be bounded near 15000 bytes, got %d", len(report.CustomRules))
+	}
+	if report.RulesSource != "AGENTS.md" {
+		t.Errorf("expected RulesSource AGENTS.md, got %q", report.RulesSource)
+	}
+}
+
+func TestCustomRules_EscapingSymlinkDenied(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	outsideDir := filepath.Join(baseDir, "outside")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	outsideRules := filepath.Join(outsideDir, "secret-rules.md")
+	if err := os.WriteFile(outsideRules, []byte("secret guidelines"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	linkPath := filepath.Join(workDir, "AGENTS.md")
+	if err := os.Symlink(outsideRules, linkPath); err != nil {
+		t.Skipf("skipping test: symlinks not supported on platform: %v", err)
+	}
+
+	runner := NewRunner(0)
+	report := &VerificationReport{}
+	runner.extractCustomRules(workDir, report)
+
+	if report.CustomRules != "" {
+		t.Fatalf("VULNERABILITY: custom rules extracted from escaping symlink: %q", report.CustomRules)
+	}
+}
+
+func TestPlatform_NewPlatformRunner_ConfiguresSourceProvider(t *testing.T) {
+	ghClient, _ := github.NewTestClient("https://github.com")
+	runner := NewPlatformRunner(nil, ghClient, nil, nil)
+
+	if runner.SourceProvider == nil {
+		t.Fatalf("expected SourceProvider to be configured on NewPlatformRunner")
+	}
+
+	apiSource, ok := runner.SourceProvider.(*APISnapshotSource)
+	if !ok {
+		t.Fatalf("expected APISnapshotSource, got %T", runner.SourceProvider)
+	}
+	if apiSource.Client != ghClient {
+		t.Errorf("expected ghClient to be preserved on APISnapshotSource")
 	}
 }
 

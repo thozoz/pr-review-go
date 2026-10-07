@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
 
 func TestSecurity_WorkspaceSiblingAccessDenied(t *testing.T) {
@@ -571,5 +573,112 @@ func TestSecurity_ReadFile_SwapAfterOpenDoesNotLeakSecret(t *testing.T) {
 		if !strings.Contains(strings.ToLower(swappedResp), "access denied") {
 			t.Errorf("expected access denied after swap, got: %s", swappedResp)
 		}
+	}
+}
+
+type assistantMockSourceProvider struct {
+	snapshot      *sandbox.Snapshot
+	cleanupCalled bool
+	err           error
+}
+
+func (m *assistantMockSourceProvider) PrepareSource(ctx context.Context, cloneURL, headRef, headSHA string) (*sandbox.Snapshot, func(), error) {
+	if m.err != nil {
+		return nil, nil, m.err
+	}
+	return m.snapshot, func() {
+		m.cleanupCalled = true
+	}, nil
+}
+
+func TestAssistant_SealedSourceLifecycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "source")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	testFile := filepath.Join(sourceDir, "example.go")
+	if err := os.WriteFile(testFile, []byte("package example\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	commitSHA := "0123456789abcdef0123456789abcdef01234567"
+	snap := &sandbox.Snapshot{
+		CommitSHA: commitSHA,
+		SourceDir: sourceDir,
+		Manifest: map[string]string{
+			"example.go": "dummy-hash",
+		},
+	}
+
+	mockSP := &assistantMockSourceProvider{
+		snapshot: snap,
+	}
+
+	runner := sandbox.NewRunner(0)
+	runner.SetSourceProvider(mockSP)
+
+	a := &Assistant{
+		sandbox: runner,
+	}
+
+	// Verify PrepareSnapshot contract
+	ctx := context.Background()
+	preparedSnap, cleanup, err := a.sandbox.PrepareSnapshot(ctx, "https://github.com/owner/repo.git", "main", commitSHA)
+	if err != nil {
+		t.Fatalf("PrepareSnapshot failed: %v", err)
+	}
+
+	if preparedSnap.SourceDir != sourceDir {
+		t.Errorf("expected sourceDir %s, got %s", sourceDir, preparedSnap.SourceDir)
+	}
+
+	// Assistant tool read operates on the prepared snapshot
+	resp := a.executeTool(ctx, preparedSnap.SourceDir, &ToolCallRequest{
+		Action: "read_file",
+		Path:   "example.go",
+	})
+	if resp != "package example\n" {
+		t.Errorf("expected file content, got: %s", resp)
+	}
+
+	// Cleanup releases the snapshot lease
+	cleanup()
+	if !mockSP.cleanupCalled {
+		t.Errorf("expected cleanup function to be called on provider")
+	}
+}
+
+func TestSecurity_MutationDisabledEvenWithIsolatedBackend(t *testing.T) {
+	a := &Assistant{}
+	ctx := context.Background()
+	workDir := t.TempDir()
+
+	mutationActions := []struct {
+		action  string
+		payload string
+	}{
+		{"write_file", `{"action":"write_file","path":"test.txt","content":"malicious"}`},
+		{"run_command", `{"action":"run_command","command":"cat /etc/passwd"}`},
+		{"commit_and_push", `{"action":"commit_and_push","commit_msg":"exfiltrate"}`},
+	}
+
+	for _, tc := range mutationActions {
+		t.Run(tc.action, func(t *testing.T) {
+			step, err := parseToolCall(tc.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp := a.executeTool(ctx, workDir, step)
+
+			// Must be explicitly disabled with read-only explanation (D-04)
+			if !strings.Contains(strings.ToLower(resp), "disabled") {
+				t.Fatalf("expected action %q to be disabled, got: %s", tc.action, resp)
+			}
+			if !strings.Contains(strings.ToLower(resp), "read-only") && !strings.Contains(strings.ToLower(resp), "isolation") {
+				t.Fatalf("expected informative read-only policy explanation for %q, got: %s", tc.action, resp)
+			}
+		})
 	}
 }

@@ -223,6 +223,76 @@ func (c *Client) AppAuth() *AppAuth {
 	return c.appAuth
 }
 
+// NewScopedClient returns a new Client configured with the provided access token
+// while preserving custom BaseURL if set on this client.
+func (c *Client) NewScopedClient(token string) *Client {
+	client := NewClient(token)
+	if c != nil && c.gh != nil && c.gh.BaseURL != nil {
+		client.gh.BaseURL = c.gh.BaseURL
+	}
+	return client
+}
+
+// GetCommit retrieves a commit by full SHA from the repository.
+func (c *Client) GetCommit(ctx context.Context, owner, repo, sha string) (*github.RepositoryCommit, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	commit, _, err := ghClient.Repositories.GetCommit(ctx, owner, repo, sha, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get commit %s: %w", sha, err)
+	}
+	return commit, nil
+}
+
+// GetTree retrieves a git tree by SHA, optionally recursive.
+func (c *Client) GetTree(ctx context.Context, owner, repo, sha string, recursive bool) (*github.Tree, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	tree, _, err := ghClient.Git.GetTree(ctx, owner, repo, sha, recursive)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tree for %s: %w", sha, err)
+	}
+	return tree, nil
+}
+
+// GetBlob retrieves a git blob by SHA.
+func (c *Client) GetBlob(ctx context.Context, owner, repo, sha string) (*github.Blob, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	blob, _, err := ghClient.Git.GetBlob(ctx, owner, repo, sha)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get blob %s: %w", sha, err)
+	}
+	return blob, nil
+}
+
+// GetBlobRaw retrieves raw bytes of a git blob by SHA.
+func (c *Client) GetBlobRaw(ctx context.Context, owner, repo, sha string) ([]byte, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := ghClient.Git.GetBlobRaw(ctx, owner, repo, sha)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get raw blob %s: %w", sha, err)
+	}
+	return data, nil
+}
+
 func (c *Client) GetRawDiff(ctx context.Context, owner, repo string, number int) (string, error) {
 	owner = strings.TrimSpace(owner)
 	repo = strings.TrimSpace(repo)

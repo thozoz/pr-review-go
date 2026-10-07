@@ -11,10 +11,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/github"
 )
 
 // VerificationStatus represents the explicit, typed status of PR verification (D-15).
@@ -185,6 +187,23 @@ func NewRunnerWithConfig(cfg *config.Config, backend *PodmanBackend, sm SlotMana
 	return r
 }
 
+// SetSourceProvider configures the source provider for snapshot retrieval.
+func (r *Runner) SetSourceProvider(sp SourceProvider) {
+	r.SourceProvider = sp
+}
+
+// NewPlatformRunner creates a Runner with the appropriate source provider for the current environment.
+// If backend and slot manager are available, it uses PublicGitSource.
+// On non-execution platforms (or when ghClient is provided without container backend),
+// it configures APISnapshotSource for read-only snapshots.
+func NewPlatformRunner(cfg *config.Config, ghClient *github.Client, backend *PodmanBackend, sm SlotManager) *Runner {
+	r := NewRunnerWithConfig(cfg, backend, sm)
+	if r.SourceProvider == nil && ghClient != nil {
+		r.SourceProvider = NewAPISnapshotSource(ghClient, ghClient, 0, false)
+	}
+	return r
+}
+
 func (r *Runner) prepTimeout() time.Duration {
 	if r.Config != nil && r.Config.SandboxTimeoutPrep > 0 {
 		return r.Config.SandboxTimeoutPrep
@@ -245,6 +264,14 @@ func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationRe
 			report.Status = StatusIncomplete
 			report.Reason = "external dependencies require network gateway (Plan 04)"
 			report.Summary = "INCOMPLETE: External dependencies require network gateway."
+			return report, nil
+		}
+
+		// On non-Linux platforms (macOS/Windows), build/test isolation is unavailable (D-02)
+		if runtime.GOOS != "linux" {
+			report.Status = StatusUnavailable
+			report.Reason = fmt.Sprintf("isolated build/test verification is unavailable on %s; Linux rootless container isolation required (D-02)", runtime.GOOS)
+			report.Summary = fmt.Sprintf("UNAVAILABLE: Verification is unavailable on %s (Linux container isolation required).", runtime.GOOS)
 			return report, nil
 		}
 
@@ -313,6 +340,14 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 		report.Status = StatusUnavailable
 		report.Reason = err.Error()
 		report.Summary = fmt.Sprintf("UNAVAILABLE: %v", err)
+		return report, nil
+	}
+
+	// On non-Linux platforms (macOS/Windows), build/test isolation is unavailable (D-02)
+	if runtime.GOOS != "linux" {
+		report.Status = StatusUnavailable
+		report.Reason = fmt.Sprintf("isolated build/test verification is unavailable on %s; Linux rootless container isolation required (D-02)", runtime.GOOS)
+		report.Summary = fmt.Sprintf("UNAVAILABLE: Verification is unavailable on %s (Linux container isolation required).", runtime.GOOS)
 		return report, nil
 	}
 
@@ -625,6 +660,54 @@ func copyDirectory(src, dst string) error {
 }
 
 func (r *Runner) extractCustomRules(dir string, report *VerificationReport) {
+	canonicalDir, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	if evaled, err := filepath.EvalSymlinks(canonicalDir); err == nil {
+		canonicalDir = evaled
+	}
+
+	root, err := os.OpenRoot(canonicalDir)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+
+	readBoundedRule := func(relPath string) (string, bool) {
+		cleanRel := filepath.Clean(relPath)
+		if err := ValidateSnapshotPath(cleanRel); err != nil {
+			return "", false
+		}
+		f, err := root.Open(filepath.FromSlash(cleanRel))
+		if err != nil {
+			return "", false
+		}
+		defer f.Close()
+
+		fi, err := f.Stat()
+		if err != nil || fi.IsDir() || !fi.Mode().IsRegular() {
+			return "", false
+		}
+
+		if err := verifySnapshotFileHandle(f, canonicalDir); err != nil {
+			return "", false
+		}
+
+		// Stream up to 15000 bytes + 1 to detect truncation without unbounded allocation
+		const maxRuleBytes = 15000
+		limited := io.LimitReader(f, maxRuleBytes+1)
+		data, err := io.ReadAll(limited)
+		if err != nil || len(bytes.TrimSpace(data)) == 0 {
+			return "", false
+		}
+
+		if len(data) > maxRuleBytes {
+			return string(data[:maxRuleBytes]) + "\n...[instructions truncated]...", true
+		}
+		return string(data), true
+	}
+
 	priorityList := []string{
 		".github/copilot-instructions.md",
 		".github/instructions.md",
@@ -636,20 +719,23 @@ func (r *Runner) extractCustomRules(dir string, report *VerificationReport) {
 	}
 
 	for _, rel := range priorityList {
-		target := filepath.Join(dir, rel)
-		data, err := os.ReadFile(target)
-		if err == nil && len(bytes.TrimSpace(data)) > 0 {
-			report.CustomRules = truncateString(string(data), 15000)
+		if content, ok := readBoundedRule(rel); ok {
+			report.CustomRules = content
 			report.RulesSource = rel
 			return
 		}
 	}
 
 	keywords := []string{"instruct", "guide", "rule", "contribut", "agent", "standard", "convention"}
-	scanDirs := []string{dir, filepath.Join(dir, ".github")}
+	scanDirs := []string{".", ".github"}
 
-	for _, scanDir := range scanDirs {
-		entries, err := os.ReadDir(scanDir)
+	for _, sDir := range scanDirs {
+		var entries []os.DirEntry
+		if sDir == "." {
+			entries, err = os.ReadDir(canonicalDir)
+		} else {
+			entries, err = os.ReadDir(filepath.Join(canonicalDir, sDir))
+		}
 		if err != nil {
 			continue
 		}
@@ -664,11 +750,12 @@ func (r *Runner) extractCustomRules(dir string, report *VerificationReport) {
 
 			for _, kw := range keywords {
 				if strings.Contains(lowerName, kw) {
-					target := filepath.Join(scanDir, entry.Name())
-					data, err := os.ReadFile(target)
-					if err == nil && len(bytes.TrimSpace(data)) > 0 {
-						rel, _ := filepath.Rel(dir, target)
-						report.CustomRules = truncateString(string(data), 15000)
+					rel := entry.Name()
+					if sDir != "." {
+						rel = sDir + "/" + entry.Name()
+					}
+					if content, ok := readBoundedRule(rel); ok {
+						report.CustomRules = content
 						report.RulesSource = rel
 						return
 					}

@@ -25,10 +25,11 @@ func NewEngine(cfg *config.Config) *Engine {
 	if err := cfg.Validate(); err != nil {
 		panic(fmt.Sprintf("invalid config: %v", err))
 	}
+	gh := github.NewClientFromConfig(cfg)
 	return &Engine{
 		cfg:     cfg,
-		gh:      github.NewClientFromConfig(cfg),
-		sandbox: sandbox.NewRunner(0),
+		gh:      gh,
+		sandbox: sandbox.NewPlatformRunner(cfg, gh, nil, nil),
 		llm:     llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
 }
