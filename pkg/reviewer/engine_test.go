@@ -494,7 +494,7 @@ func TestPromptAndReportFormattingForAllVerificationStatuses(t *testing.T) {
 	}
 }
 
-func TestReviewPRAtHead_HeadValidationAndCompare(t *testing.T) {
+func TestReviewHeadBinding(t *testing.T) {
 	const (
 		validBaseSHA = "1111111111111111111111111111111111111111"
 		validHeadSHA = "2222222222222222222222222222222222222222"
@@ -520,6 +520,8 @@ func TestReviewPRAtHead_HeadValidationAndCompare(t *testing.T) {
 	defer llmServer.Close()
 
 	compareCalls := 0
+	currentPRBaseSHA := validBaseSHA
+	currentPRHeadSHA := validHeadSHA
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/pulls/42"):
@@ -528,8 +530,8 @@ func TestReviewPRAtHead_HeadValidationAndCompare(t *testing.T) {
 				"number": 42,
 				"title":  "Head test PR",
 				"body":   "Testing head binding",
-				"head":   map[string]any{"sha": validHeadSHA, "ref": "feat-x"},
-				"base":   map[string]any{"sha": validBaseSHA, "ref": "main"},
+				"head":   map[string]any{"sha": currentPRHeadSHA, "ref": "feat-x"},
+				"base":   map[string]any{"sha": currentPRBaseSHA, "ref": "main"},
 				"user":   map[string]any{"login": "dev"},
 			})
 		case strings.Contains(r.URL.Path, "/compare/"):
@@ -581,7 +583,7 @@ func TestReviewPRAtHead_HeadValidationAndCompare(t *testing.T) {
 		t.Fatalf("expected 0 LLM/compare calls for mismatched SHA, got llm=%d, compare=%d", llmCalls, compareCalls)
 	}
 
-	// 3. Matching expectedHead succeeds and uses compare endpoint
+	// 3. Matching expectedHead succeeds, uses compare endpoint, report strictly binds to expected head
 	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, validHeadSHA)
 	if err != nil {
 		t.Fatalf("ReviewPRAtHead failed: %v", err)
@@ -595,6 +597,25 @@ func TestReviewPRAtHead_HeadValidationAndCompare(t *testing.T) {
 	if llmCalls != 1 {
 		t.Fatalf("expected 1 LLM call, got %d", llmCalls)
 	}
+
+	// 4. Malformed BaseSHA on PR rejected
+	currentPRBaseSHA = "invalid-base-oid"
+	_, err = eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, validHeadSHA)
+	if err == nil {
+		t.Fatal("expected error for malformed PR base SHA")
+	}
+	currentPRBaseSHA = validBaseSHA
+
+	// 5. Malformed HeadSHA on PR rejected
+	currentPRHeadSHA = "invalid-head-oid"
+	_, err = eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, validHeadSHA)
+	if err == nil {
+		t.Fatal("expected error for malformed PR head SHA")
+	}
+}
+
+func TestReviewPRAtHead_HeadValidationAndCompare(t *testing.T) {
+	TestReviewHeadBinding(t)
 }
 
 

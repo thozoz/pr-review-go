@@ -80,7 +80,14 @@ func (e *Engine) ReviewPRAtHead(ctx context.Context, owner, repo string, number 
 		return nil, fmt.Errorf("failed to fetch diff at commits: %w", err)
 	}
 
-	return e.executeReview(ctx, pr, diff)
+	report, err := e.executeReview(ctx, pr, diff)
+	if err != nil {
+		return nil, err
+	}
+	if report.HeadSHA != expectedHead {
+		return nil, fmt.Errorf("report head SHA %s does not match expected head %s", report.HeadSHA, expectedHead)
+	}
+	return report, nil
 }
 
 func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (*ReviewReport, error) {

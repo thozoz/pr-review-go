@@ -691,4 +691,661 @@ func TestWebhookAdmissionBounds(t *testing.T) {
 	})
 }
 
+func TestAutomaticReviewCoalescing(t *testing.T) {
+	const (
+		testSecret = "coalesce-secret"
+		repoID     = int64(8888)
+		prNum      = 42
+		baseSHA    = "1111111111111111111111111111111111111111"
+		shaA       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		shaB       = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		shaC       = "cccccccccccccccccccccccccccccccccccccccc"
+		shaD       = "dddddddddddddddddddddddddddddddddddddddd"
+		shaE       = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	)
+
+	t.Run("block active review A, accept B C D, finish A without cancelling, post only D", func(t *testing.T) {
+		var (
+			currentHeadMu sync.Mutex
+			currentHead   = shaA
+			publishedHead = ""
+			reportsPosted []string
+			reportsMu     sync.Mutex
+			blockAChan    = make(chan struct{})
+			startedAChan  = make(chan struct{})
+			startedAOnce  sync.Once
+			activeJobsMu  sync.Mutex
+			activeJobs    = 0
+			maxActiveJobs = 0
+		)
+
+		llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			currentHeadMu.Lock()
+			headAtReview := currentHead
+			currentHeadMu.Unlock()
+
+			if headAtReview == shaA {
+				startedAOnce.Do(func() {
+					close(startedAChan)
+				})
+				// Block active review A
+				<-blockAChan
+			}
+
+			resp := llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message: llm.ChatMessage{
+							Content: fmt.Sprintf(`{"score": 90, "summary": "Review for %s", "findings": []}`, headAtReview),
+						},
+						FinishReason: "stop",
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		defer llmServer.Close()
+
+		ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, fmt.Sprintf("/pulls/%d", prNum)):
+				currentHeadMu.Lock()
+				head := currentHead
+				currentHeadMu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": prNum,
+					"title":  "Coalescing PR",
+					"body":   "Initial body",
+					"head":   map[string]any{"sha": head, "ref": "feat-coalesce"},
+					"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+					"user":   map[string]any{"login": "developer"},
+				})
+			case strings.Contains(r.URL.Path, "/compare/"):
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("diff --git a/f.go b/f.go\n+new line\n"))
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+				var bodyMap map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+				body := bodyMap["body"]
+
+				// Track published review report (not status comments)
+				if strings.Contains(body, "Review for ") {
+					reportsMu.Lock()
+					reportsPosted = append(reportsPosted, body)
+					if strings.Contains(body, shaD) {
+						publishedHead = shaD
+					}
+					reportsMu.Unlock()
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":   1001,
+					"body": body,
+				})
+			case strings.Contains(r.URL.Path, "/issues/comments/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":   1001,
+					"body": "edited",
+				})
+			case strings.Contains(r.URL.Path, "/comments"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[]`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ghServer.Close()
+
+		ghClient, err := ghclient.NewTestClient(ghServer.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			WebhookSecret:        testSecret,
+			WebhookStateDir:      stateDir,
+			WebhookWorkers:       2,
+			WebhookBacklog:       10,
+			WebhookDeliveryTTL:   24 * time.Hour,
+			WebhookDeliveryLimit: 100,
+			WebhookStateMaxBytes: 16777216,
+			WebhookBodyMaxBytes:  1048576,
+			EffortLevel:          "lite",
+			EnableSandbox:        false,
+			LLMBaseURL:           llmServer.URL,
+			LLMAPIKey:            "test-key",
+			LLMModel:             "test-model",
+			GitHubToken:          "test-token",
+			AutoActions:          []string{"review"},
+		}
+
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+		srv.SetEngine(reviewer.NewEngineWithClients(cfg, ghClient, llmClient, nil))
+
+		dbPath := filepath.Join(stateDir, "jobs.db")
+		store, err := OpenJobStore(dbPath, StoreOptions{
+			BacklogLimit:  10,
+			DeliveryLimit: 100,
+			StateMaxBytes: 16777216,
+			DeliveryTTL:   24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.SetStore(store)
+
+		// Create a wrapped executor to observe concurrent PR executions
+		baseExecutor := NewServerJobExecutor(srv, store)
+		type trackingExecutor struct {
+			JobExecutor
+		}
+		wrapExec := &trackingExecutor{
+			JobExecutor: JobExecutorFunc(func(ctx context.Context, j *Job) error {
+				activeJobsMu.Lock()
+				activeJobs++
+				if activeJobs > maxActiveJobs {
+					maxActiveJobs = activeJobs
+				}
+				activeJobsMu.Unlock()
+
+				err := baseExecutor.ExecuteJob(ctx, j)
+
+				activeJobsMu.Lock()
+				activeJobs--
+				activeJobsMu.Unlock()
+				return err
+			}),
+		}
+
+		sched := NewScheduler(store, wrapExec, 2)
+		srv.SetScheduler(sched)
+		if err := sched.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer sched.Stop()
+
+		postWebhook := func(delivID, action, head string) {
+			payloadJSON := fmt.Sprintf(`{
+				"action": %q,
+				"pull_request": {
+					"number": %d,
+					"head": {"sha": %q, "ref": "feat-coalesce"},
+					"base": {"sha": %q, "ref": "main"}
+				},
+				"repository": {
+					"id": %d,
+					"name": "repo",
+					"owner": {"login": "org"}
+				}
+			}`, action, prNum, head, baseSHA, repoID)
+			payload := []byte(payloadJSON)
+
+			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Delivery", delivID)
+			req.Header.Set("X-GitHub-Event", "pull_request")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+			rr := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("webhook %s failed: %d (%s)", delivID, rr.Code, rr.Body.String())
+			}
+		}
+
+		// 1. Deliver A
+		postWebhook("deliv-A", "opened", shaA)
+
+		// Await review A reaching blocked state
+		select {
+		case <-startedAChan:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for review A to start")
+		}
+
+		// 2. While A is active/blocked, deliver B, C, D
+		currentHeadMu.Lock()
+		currentHead = shaB
+		currentHeadMu.Unlock()
+		postWebhook("deliv-B", "synchronize", shaB)
+
+		currentHeadMu.Lock()
+		currentHead = shaC
+		currentHeadMu.Unlock()
+		postWebhook("deliv-C", "synchronize", shaC)
+
+		currentHeadMu.Lock()
+		currentHead = shaD
+		currentHeadMu.Unlock()
+		postWebhook("deliv-D", "synchronize", shaD)
+
+		// Assert that in store, only at most 1 queued successor review exists
+		queued, err := store.ListQueuedJobs(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(queued) != 1 {
+			t.Fatalf("expected exactly 1 coalesced successor job queued, got %d", len(queued))
+		}
+		if queued[0].HeadSHA != shaD {
+			t.Fatalf("expected queued successor to be head D (%s), got %s", shaD, queued[0].HeadSHA)
+		}
+
+		// 3. Unblock A
+		close(blockAChan)
+
+		// Await publication of D
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			reportsMu.Lock()
+			done := (publishedHead == shaD)
+			reportsMu.Unlock()
+			if done {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		reportsMu.Lock()
+		defer reportsMu.Unlock()
+		if publishedHead != shaD {
+			t.Fatalf("expected published report for %s, got: %v", shaD, reportsPosted)
+		}
+
+		// Verify no report for A was ever posted!
+		for _, r := range reportsPosted {
+			if strings.Contains(r, shaA) {
+				t.Fatalf("report for superseded head A was published: %s", r)
+			}
+			if strings.Contains(r, shaB) || strings.Contains(r, shaC) {
+				t.Fatalf("intermediate report for B or C was published: %s", r)
+			}
+		}
+
+		// 4. Verify no two effective actions overlapped for one PR
+		activeJobsMu.Lock()
+		if maxActiveJobs > 1 {
+			t.Fatalf("expected at most 1 active job per PR, observed %d", maxActiveJobs)
+		}
+		activeJobsMu.Unlock()
+	})
+
+	t.Run("full queue still retains an already-reserved successor", func(t *testing.T) {
+		stateDir := t.TempDir()
+		dbPath := filepath.Join(stateDir, "full_queue.db")
+		// Backlog limit of 2
+		store, err := OpenJobStore(dbPath, StoreOptions{
+			BacklogLimit:  2,
+			DeliveryLimit: 100,
+			StateMaxBytes: 16777216,
+			DeliveryTTL:   24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		prKey1, _ := MakePRKey("github.com", 101, 1)
+		prKey2, _ := MakePRKey("github.com", 102, 2)
+		prKey3, _ := MakePRKey("github.com", 103, 3)
+
+		// 1. Admit automatic review for PR 1
+		res1, err := store.Admit(context.Background(), Delivery{
+			Host: "github.com", RepoID: 101, DeliveryID: "d-1", PayloadHash: "h1", ReceivedAt: time.Now(),
+		}, []Job{
+			{Kind: "review", Trigger: "automatic", PRKey: prKey1, Owner: "o", Repo: "r", PRNumber: 1, HeadSHA: shaA},
+		})
+		if err != nil || res1.Status != AdmitAccepted {
+			t.Fatalf("admit PR1 failed: %v, status=%v", err, res1.Status)
+		}
+
+		// 2. Claim PR1: starts running and reserves 1 successor slot
+		claimed1, err := store.ClaimNextJob(context.Background(), nil)
+		if err != nil || claimed1 == nil {
+			t.Fatalf("claim PR1 failed: %v", err)
+		}
+		prState1, _ := store.GetPRState(context.Background(), prKey1)
+		if !prState1.HasReservedSuccessor || prState1.ActiveJobID == "" {
+			t.Fatalf("PR1 should have reserved successor: %+v", prState1)
+		}
+
+		// 3. Admit job for PR 2: fills the 1 remaining backlog slot (1 queued + 1 reserved = 2 backlog)
+		res2, err := store.Admit(context.Background(), Delivery{
+			Host: "github.com", RepoID: 102, DeliveryID: "d-2", PayloadHash: "h2", ReceivedAt: time.Now(),
+		}, []Job{
+			{Kind: "labels", Trigger: "automatic", PRKey: prKey2, Owner: "o", Repo: "r", PRNumber: 2},
+		})
+		if err != nil || res2.Status != AdmitAccepted {
+			t.Fatalf("admit PR2 failed: %v, status=%v", err, res2.Status)
+		}
+
+		// 4. PR1 sends update (head B): uses ALREADY-RESERVED successor slot, succeeds even when ordinary queue is full!
+		res1Update, err := store.Admit(context.Background(), Delivery{
+			Host: "github.com", RepoID: 101, DeliveryID: "d-1-up", PayloadHash: "h1-up", ReceivedAt: time.Now(),
+		}, []Job{
+			{Kind: "review", Trigger: "automatic", PRKey: prKey1, Owner: "o", Repo: "r", PRNumber: 1, HeadSHA: shaB},
+		})
+		if err != nil || res1Update.Status != AdmitAccepted {
+			t.Fatalf("admit PR1 update using reserved slot failed: %v, status=%v, reason=%s", err, res1Update.Status, res1Update.Reason)
+		}
+
+		// 5. Try to admit job for unreserved PR 3: rejected with 503 capacity full
+		res3, err := store.Admit(context.Background(), Delivery{
+			Host: "github.com", RepoID: 103, DeliveryID: "d-3", PayloadHash: "h3", ReceivedAt: time.Now(),
+		}, []Job{
+			{Kind: "review", Trigger: "automatic", PRKey: prKey3, Owner: "o", Repo: "r", PRNumber: 3, HeadSHA: shaC},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res3.Status != AdmitCapacityFull {
+			t.Fatalf("expected PR3 to be rejected for capacity full, got status=%v", res3.Status)
+		}
+	})
+
+	t.Run("delayed delivery cannot revert latest GitHub head", func(t *testing.T) {
+		var reviewedHeads []string
+		var headsMu sync.Mutex
+
+		llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			resp := llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message: llm.ChatMessage{
+							Content: `{"score": 90, "summary": "Review", "findings": []}`,
+						},
+						FinishReason: "stop",
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		defer llmServer.Close()
+
+		ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, fmt.Sprintf("/pulls/%d", prNum)):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": prNum,
+					"title":  "Delayed test PR",
+					"body":   "Initial body",
+					"head":   map[string]any{"sha": shaD, "ref": "feat-d"},
+					"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+					"user":   map[string]any{"login": "developer"},
+				})
+			case strings.Contains(r.URL.Path, "/compare/"):
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("diff --git a/f.go b/f.go\n+new line\n"))
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":   1001,
+					"body": "comment",
+				})
+			case strings.Contains(r.URL.Path, "/issues/comments/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":   1001,
+					"body": "edited",
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ghServer.Close()
+
+		ghClient, err := ghclient.NewTestClient(ghServer.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			EffortLevel:   "lite",
+			EnableSandbox: false,
+			LLMBaseURL:    llmServer.URL,
+			LLMAPIKey:     "test-key",
+			LLMModel:      "test-model",
+			GitHubToken:   "test-token",
+		}
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+		srv.SetEngine(reviewer.NewEngineWithClients(cfg, ghClient, llmClient, nil))
+
+		dbPath := filepath.Join(stateDir, "delayed.db")
+		store, err := OpenJobStore(dbPath, StoreOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		srv.SetStore(store)
+
+		prKey, _ := MakePRKey("github.com", repoID, prNum)
+
+		// Set last reviewed head to shaD
+		_ = store.UpdatePRState(context.Background(), &PRState{
+			PRKey:            prKey,
+			Owner:            "o",
+			Repo:             "r",
+			Number:           prNum,
+			Generation:       5,
+			LastReviewedHead: shaD,
+		})
+
+		// Job arrives with delayed old head A
+		res, err := store.Admit(context.Background(), Delivery{
+			Host: "github.com", RepoID: repoID, DeliveryID: "deliv-delayed-1", PayloadHash: "h-del", ReceivedAt: time.Now(),
+		}, []Job{
+			{
+				Kind:       "review",
+				Trigger:    "automatic",
+				PRKey:      prKey,
+				Owner:      "o",
+				Repo:       "r",
+				PRNumber:   prNum,
+				HeadSHA:    shaA,
+				BaseSHA:    baseSHA,
+			},
+		})
+		if err != nil || res.Status != AdmitAccepted {
+			t.Fatalf("admit failed: %v, status=%v", err, res.Status)
+		}
+
+		delayedJob, err := store.ClaimNextJob(context.Background(), nil)
+		if err != nil || delayedJob == nil {
+			t.Fatalf("claim failed: %v", err)
+		}
+
+		executor := NewServerJobExecutor(srv, store)
+		err = executor.ExecuteJob(context.Background(), delayedJob)
+		if err != nil {
+			t.Fatalf("executor failed: %v", err)
+		}
+
+		// Verify that delayed job was superseded without re-reviewing or reverting D to A
+		delayedJobAfter, _ := store.GetJob(context.Background(), delayedJob.ID)
+		if delayedJobAfter.Status != "superseded" {
+			t.Fatalf("expected delayed job to be superseded, got status %s", delayedJobAfter.Status)
+		}
+
+		headsMu.Lock()
+		for _, h := range reviewedHeads {
+			if h == shaA {
+				t.Fatalf("delayed SHA A was reviewed: %s", h)
+			}
+		}
+		headsMu.Unlock()
+	})
+
+	t.Run("head changes without delivered event still suppress stale output and retain latest-head intent", func(t *testing.T) {
+		var (
+			currentHeadMu sync.Mutex
+			currentHead   = shaA
+			postedReports []string
+			reportsMu     sync.Mutex
+		)
+
+		llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Simulate developer pushing head E while LLM is running
+			currentHeadMu.Lock()
+			currentHead = shaE
+			currentHeadMu.Unlock()
+
+			resp := llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message: llm.ChatMessage{
+							Content: `{"score": 90, "summary": "Review for A", "findings": []}`,
+						},
+						FinishReason: "stop",
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		defer llmServer.Close()
+
+		ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, fmt.Sprintf("/pulls/%d", prNum)):
+				currentHeadMu.Lock()
+				head := currentHead
+				currentHeadMu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": prNum,
+					"title":  "Undelivered push PR",
+					"body":   "Initial body",
+					"head":   map[string]any{"sha": head, "ref": "feat-e"},
+					"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+					"user":   map[string]any{"login": "developer"},
+				})
+			case strings.Contains(r.URL.Path, "/compare/"):
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("diff --git a/f.go b/f.go\n+new line\n"))
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+				var bodyMap map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+				if strings.Contains(bodyMap["body"], "Review for") {
+					reportsMu.Lock()
+					postedReports = append(postedReports, bodyMap["body"])
+					reportsMu.Unlock()
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":   1001,
+					"body": bodyMap["body"],
+				})
+			case strings.Contains(r.URL.Path, "/issues/comments/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":   1001,
+					"body": "edited",
+				})
+			case strings.Contains(r.URL.Path, "/comments"):
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[]`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ghServer.Close()
+
+		ghClient, err := ghclient.NewTestClient(ghServer.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			EffortLevel:   "lite",
+			EnableSandbox: false,
+			LLMBaseURL:    llmServer.URL,
+			LLMAPIKey:     "test-key",
+			LLMModel:      "test-model",
+			GitHubToken:   "test-token",
+		}
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+		srv.SetEngine(reviewer.NewEngineWithClients(cfg, ghClient, llmClient, nil))
+
+		dbPath := filepath.Join(stateDir, "undelivered.db")
+		store, err := OpenJobStore(dbPath, StoreOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		srv.SetStore(store)
+
+		prKey, _ := MakePRKey("github.com", repoID, prNum)
+		res, err := store.Admit(context.Background(), Delivery{
+			Host: "github.com", RepoID: repoID, DeliveryID: "deliv-a", PayloadHash: "ha", ReceivedAt: time.Now(),
+		}, []Job{
+			{
+				Kind:       "review",
+				Trigger:    "automatic",
+				PRKey:      prKey,
+				Owner:      "o",
+				Repo:       "r",
+				PRNumber:   prNum,
+				HeadSHA:    shaA,
+				BaseSHA:    baseSHA,
+			},
+		})
+		if err != nil || res.Status != AdmitAccepted {
+			t.Fatalf("admit failed: %v, status=%v", err, res.Status)
+		}
+
+		jobA, err := store.ClaimNextJob(context.Background(), nil)
+		if err != nil || jobA == nil {
+			t.Fatalf("claim failed: %v", err)
+		}
+
+		executor := NewServerJobExecutor(srv, store)
+		err = executor.ExecuteJob(context.Background(), jobA)
+		if err != nil {
+			t.Fatalf("executor failed: %v", err)
+		}
+
+		// 1. Verify stale report A was suppressed
+		reportsMu.Lock()
+		if len(postedReports) != 0 {
+			t.Fatalf("expected 0 published reports, got: %v", postedReports)
+		}
+		reportsMu.Unlock()
+
+		jobAAfter, _ := store.GetJob(context.Background(), jobA.ID)
+		if jobAAfter == nil || jobAAfter.Status != "superseded" {
+			t.Fatalf("expected job A to be superseded, got %+v", jobAAfter)
+		}
+
+		// 2. Verify fresh successor review for E was scheduled in store
+		queued, _ := store.ListQueuedJobs(context.Background())
+		if len(queued) != 1 {
+			t.Fatalf("expected 1 successor job queued, got %d", len(queued))
+		}
+		if queued[0].HeadSHA != shaE {
+			t.Fatalf("expected successor job to have head E (%s), got %s", shaE, queued[0].HeadSHA)
+		}
+	})
+}
+
+type JobExecutorFunc func(ctx context.Context, job *Job) error
+
+func (f JobExecutorFunc) ExecuteJob(ctx context.Context, job *Job) error {
+	return f(ctx, job)
+}
+
 

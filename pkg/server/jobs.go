@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
+
+	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 )
 
 // JobExecutor defines the execution contract for individual scheduled jobs.
@@ -55,7 +58,70 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	gh := e.server.gh
 	engine := e.server.engine
 
-	// 1. Visible queued status comment with marker
+	// 1. Initial head check before expensive generation
+	livePR, prErr := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
+	if prErr != nil {
+		log.Printf("[jobs] Failed fetching live PR for %s: %v", job.ID, prErr)
+		job.Status = "failed"
+		job.Error = prErr.Error()
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return prErr
+	}
+
+	if err := ghclient.ValidateCommitOID(livePR.HeadSHA); err != nil {
+		job.Status = "failed"
+		job.Error = fmt.Sprintf("invalid live head SHA %s: %v", livePR.HeadSHA, err)
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return fmt.Errorf("invalid live head SHA: %w", err)
+	}
+
+	if err := ghclient.ValidateCommitOID(livePR.BaseSHA); err != nil {
+		job.Status = "failed"
+		job.Error = fmt.Sprintf("invalid live base SHA %s: %v", livePR.BaseSHA, err)
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return fmt.Errorf("invalid live base SHA: %w", err)
+	}
+
+	prState, _ := e.store.GetPRState(ctx, job.PRKey)
+
+	// A job-head mismatch before generation updates/requeues intent without expensive work.
+	if livePR.HeadSHA != job.HeadSHA {
+		log.Printf("[jobs] Head mismatch before generation for %s (job=%s, live=%s)", job.ID, job.HeadSHA, livePR.HeadSHA)
+		if job.Trigger == "automatic" {
+			if prState != nil && prState.LastReviewedHead == livePR.HeadSHA {
+				// Current live head was already reviewed; supersede without expensive work
+				job.Status = "superseded"
+				now := time.Now().UTC()
+				job.FinishedAt = &now
+				_ = e.store.UpdateJob(ctx, job)
+				return nil
+			}
+			job.HeadSHA = livePR.HeadSHA
+			job.BaseSHA = livePR.BaseSHA
+			_ = e.store.UpdateJob(ctx, job)
+		} else {
+			// Explicit review retargets same request
+			job.HeadSHA = livePR.HeadSHA
+			job.BaseSHA = livePR.BaseSHA
+			_ = e.store.UpdateJob(ctx, job)
+		}
+	}
+
+	// 2. Status comment: check if fresh rerun on already reviewed head
+	isRerun := (job.Trigger == "explicit" && prState != nil && prState.LastReviewedHead == job.HeadSHA)
+	var initialStatusBody string
+	if isRerun {
+		initialStatusBody = "This commit was already reviewed. Reviewing again."
+	} else {
+		initialStatusBody = "⏳ Review queued; waiting for capacity"
+	}
+
 	statusMarker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
 	statusIntent := &OutputIntent{
 		Marker:    statusMarker,
@@ -66,7 +132,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		Repo:      job.Repo,
 		PRNumber:  job.PRNumber,
 		ExactHead: job.HeadSHA,
-		Body:      "⏳ Review queued; waiting for capacity",
+		Body:      initialStatusBody,
 		Status:    "pending",
 	}
 
@@ -74,7 +140,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		log.Printf("[jobs] Failed saving initial status intent for %s: %v", job.ID, err)
 	}
 
-	statusCommentID, err := gh.CreateComment(ctx, job.Owner, job.Repo, job.PRNumber, statusIntent.Body)
+	statusCommentID, err := gh.CreateComment(ctx, job.Owner, job.Repo, job.PRNumber, initialStatusBody)
 	if err == nil {
 		statusIntent.CommentID = statusCommentID
 		statusIntent.Status = "in_progress"
@@ -83,13 +149,15 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		job.StatusCommentID = statusCommentID
 		_ = e.store.UpdateJob(ctx, job)
 
-		// Transition status comment to running
-		_ = gh.EditComment(ctx, job.Owner, job.Repo, statusCommentID, "🔄 Review running...")
+		if !isRerun {
+			// Transition status comment to running
+			_ = gh.EditComment(ctx, job.Owner, job.Repo, statusCommentID, "🔄 Review running...")
+		}
 	} else {
 		log.Printf("[jobs] Warning: Failed creating status comment for %s: %v", job.ID, err)
 	}
 
-	// 2. Head-bound review execution
+	// 3. Head-bound review execution
 	report, err := engine.ReviewPRAtHead(ctx, job.Owner, job.Repo, job.PRNumber, job.HeadSHA)
 	if err != nil {
 		log.Printf("[jobs] Review failed for %s: %v", job.ID, err)
@@ -104,21 +172,53 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		return err
 	}
 
-	// 3. Verify live head immediately before posting to prevent stale review publication
-	livePR, prErr := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
-	if prErr == nil && livePR.HeadSHA != job.HeadSHA {
-		log.Printf("[jobs] Head moved from %s to %s for %s; discarding outdated report", job.HeadSHA, livePR.HeadSHA, job.ID)
+	// 4. Verify generation and live head immediately before publication to suppress stale results
+	prState, _ = e.store.GetPRState(ctx, job.PRKey)
+	generationChanged := prState != nil && prState.Generation > job.Generation
+
+	livePR2, prErr2 := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
+	headChanged := prErr2 == nil && livePR2 != nil && livePR2.HeadSHA != job.HeadSHA
+
+	if generationChanged || headChanged {
+		log.Printf("[jobs] Generation or head changed during review of %s (genChanged=%v, headChanged=%v); discarding outdated report",
+			job.ID, generationChanged, headChanged)
 		if job.StatusCommentID > 0 {
 			_ = gh.EditComment(ctx, job.Owner, job.Repo, job.StatusCommentID, "⏭️ Review superseded by newer commit.")
 		}
-		job.Status = "superseded"
-		now := time.Now().UTC()
-		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+
+		if job.Trigger == "explicit" {
+			// Explicit review retargets same request
+			if livePR2 != nil {
+				job.HeadSHA = livePR2.HeadSHA
+				job.BaseSHA = livePR2.BaseSHA
+			}
+			job.Status = "queued"
+			_ = e.store.UpdateJob(ctx, job)
+		} else {
+			job.Status = "superseded"
+			now := time.Now().UTC()
+			job.FinishedAt = &now
+			_ = e.store.UpdateJob(ctx, job)
+
+			// If head changed without a delivered event, schedule latest-head review intent using reserved successor
+			if headChanged && livePR2 != nil {
+				_, _ = e.store.ScheduleSuccessorReview(ctx, job.PRKey, job.Owner, job.Repo, job.PRNumber, livePR2.BaseSHA, livePR2.HeadSHA)
+			}
+		}
 		return nil
 	}
 
-	// 4. Save review output intent before posting
+	// Disagreement between OID, diff, source, and report is a failure before publication
+	if report.HeadSHA != job.HeadSHA || (livePR2 != nil && livePR2.HeadSHA != job.HeadSHA) {
+		job.Status = "failed"
+		job.Error = "OID/diff/source/report disagreement before publication"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return errors.New("OID/diff/source/report disagreement before publication")
+	}
+
+	// 5. Save review output intent before posting
 	reviewMarker := fmt.Sprintf("<!-- pr-review-output:%s -->", job.ID)
 	boundedMarkdown := report.RawMarkdown
 	if len(boundedMarkdown) > MaxReviewBodyBytes {
@@ -141,7 +241,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		log.Printf("[jobs] Failed saving review output intent for %s: %v", job.ID, err)
 	}
 
-	// 5. Post review output
+	// 6. Post review output
 	outputCommentID, err := gh.CreateComment(ctx, job.Owner, job.Repo, job.PRNumber, boundedMarkdown)
 	if err != nil {
 		log.Printf("[jobs] Failed posting review comment for %s: %v", job.ID, err)
@@ -157,13 +257,13 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	reviewIntent.Status = "completed"
 	_ = e.store.UpdateOutputIntent(ctx, reviewIntent)
 
-	// 6. Update status comment to completed
+	// 7. Update status comment to completed
 	if job.StatusCommentID > 0 {
 		_ = gh.EditComment(ctx, job.Owner, job.Repo, job.StatusCommentID, "✅ Review completed.")
 	}
 
-	// 7. Update PR state last reviewed head and mark job completed
-	prState, _ := e.store.GetPRState(ctx, job.PRKey)
+	// 8. Update PR state last reviewed head and mark job completed
+	prState, _ = e.store.GetPRState(ctx, job.PRKey)
 	if prState != nil {
 		prState.LastReviewedHead = job.HeadSHA
 		_ = e.store.UpdatePRState(ctx, prState)
@@ -373,36 +473,19 @@ func (s *Scheduler) claimNextJob(ctx context.Context) *Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	queuedJobs, err := s.store.ListQueuedJobs(ctx)
-	if err != nil || len(queuedJobs) == 0 {
+	target, err := s.store.ClaimNextJob(ctx, s.activePRs)
+	if err != nil || target == nil {
 		return nil
 	}
 
-	// Find the oldest eligible job whose PRKey is not currently active
-	var target *Job
-	for _, j := range queuedJobs {
-		prKeyStr := j.PRKey.String()
-		if !s.activePRs[prKeyStr] {
-			target = j
-			s.activePRs[prKeyStr] = true
-			break
-		}
-	}
-
-	if target == nil {
-		return nil
-	}
-
-	target.Status = "running"
-	now := time.Now().UTC()
-	target.StartedAt = &now
-	_ = s.store.UpdateJob(ctx, target)
+	s.activePRs[target.PRKey.String()] = true
 	return target
 }
 
 func (s *Scheduler) releaseJob(job *Job) {
 	s.mu.Lock()
 	delete(s.activePRs, job.PRKey.String())
+	_ = s.store.ReleasePR(context.Background(), job.PRKey)
 	s.mu.Unlock()
 	s.Wake()
 }

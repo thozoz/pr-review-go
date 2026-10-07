@@ -139,13 +139,16 @@ type OutputIntent struct {
 
 // PRState tracks PR-level generation and active execution.
 type PRState struct {
-	PRKey            PRKey  `json:"pr_key"`
-	Owner            string `json:"owner"`
-	Repo             string `json:"repo"`
-	Number           int    `json:"number"`
-	Generation       uint64 `json:"generation"`
-	LastReviewedHead string `json:"last_reviewed_head,omitempty"`
-	ActiveJobID      string `json:"active_job_id,omitempty"`
+	PRKey                PRKey  `json:"pr_key"`
+	Owner                string `json:"owner"`
+	Repo                 string `json:"repo"`
+	Number               int    `json:"number"`
+	Generation           uint64 `json:"generation"`
+	LastReviewedHead     string `json:"last_reviewed_head,omitempty"`
+	ActiveJobID          string `json:"active_job_id,omitempty"`
+	HasReservedSuccessor bool   `json:"has_reserved_successor,omitempty"`
+	PendingAutoJobID     string `json:"pending_auto_job_id,omitempty"`
+	LatestHeadSHA        string `json:"latest_head_sha,omitempty"`
 }
 
 type AdmitStatus int
@@ -184,6 +187,9 @@ type JobStore interface {
 	GetOutputIntent(ctx context.Context, marker string) (*OutputIntent, error)
 	UpdateOutputIntent(ctx context.Context, intent *OutputIntent) error
 	RecoverInterruptedJobs(ctx context.Context) ([]*Job, error)
+	ClaimNextJob(ctx context.Context, activePRs map[string]bool) (*Job, error)
+	ReleasePR(ctx context.Context, prKey PRKey) error
+	ScheduleSuccessorReview(ctx context.Context, prKey PRKey, owner, repo string, prNum int, baseSHA, headSHA string) (*Job, error)
 }
 
 type BoltJobStore struct {
@@ -350,8 +356,9 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 			return nil
 		}
 
-		// 3. Count currently queued jobs to enforce Backlog limit
+		// 3. Count currently queued jobs, reserved successors, and estimated bytes
 		queuedCount := 0
+		reservedSuccessorCount := 0
 		estimatedBytes := int64(0)
 		cursor := jobsBucket.Cursor()
 		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
@@ -364,16 +371,72 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 			}
 		}
 
-		if queuedCount+len(jobs) > s.opts.BacklogLimit {
+		prCursor := prsBucket.Cursor()
+		for k, v := prCursor.First(); k != nil; k, v = prCursor.Next() {
+			var st PRState
+			if err := json.Unmarshal(v, &st); err == nil {
+				if st.HasReservedSuccessor && st.ActiveJobID != "" {
+					reservedSuccessorCount++
+					estimatedBytes += EstimatedJobStorageReserve
+				}
+			}
+		}
+
+		// Check which jobs can coalesce or use reserved successor
+		netNewQueued := 0
+		type coalescedTarget struct {
+			key []byte
+			job Job
+		}
+		coalescedJobs := make(map[int]coalescedTarget) // index in jobs -> target
+		usesReservedSlot := make(map[int]bool)
+
+		for i, j := range jobs {
+			if j.Trigger == "automatic" && j.Kind == "review" {
+				prKeyStr := j.PRKey.String()
+				var state PRState
+				if prBytes := prsBucket.Get([]byte(prKeyStr)); prBytes != nil {
+					_ = json.Unmarshal(prBytes, &state)
+				}
+
+				// Check if there is an existing queued automatic review for this PR
+				foundExisting := false
+				c := jobsBucket.Cursor()
+				for k, v := c.First(); k != nil; k, v = c.Next() {
+					var qj Job
+					if err := json.Unmarshal(v, &qj); err == nil {
+						if qj.PRKey == j.PRKey && qj.Trigger == "automatic" && qj.Kind == "review" && qj.Status == "queued" {
+							coalescedJobs[i] = coalescedTarget{
+								key: append([]byte(nil), k...),
+								job: qj,
+							}
+							foundExisting = true
+							break
+						}
+					}
+				}
+
+				if !foundExisting {
+					if state.ActiveJobID != "" && state.HasReservedSuccessor {
+						// Uses the already reserved successor slot
+						usesReservedSlot[i] = true
+					} else {
+						netNewQueued++
+					}
+				}
+			} else {
+				netNewQueued++
+			}
+		}
+
+		// Enforce Backlog capacity (only for net new jobs not using reservations or coalescing)
+		if queuedCount+netNewQueued > s.opts.BacklogLimit {
 			result = AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("queue backlog capacity %d reached", s.opts.BacklogLimit)}
 			return nil
 		}
 
 		// 4. Check State Max Bytes (logical retained values + reservations)
-		neededBytes := int64(0)
-		for range jobs {
-			neededBytes += EstimatedJobStorageReserve
-		}
+		neededBytes := int64(netNewQueued) * EstimatedJobStorageReserve
 		if estimatedBytes+neededBytes > s.opts.StateMaxBytes {
 			result = AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("state max bytes limit %d reached", s.opts.StateMaxBytes)}
 			return nil
@@ -413,6 +476,10 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 				gen = state.Generation
 				prGenerations[prKeyStr] = gen
 
+				if job.HeadSHA != "" {
+					state.LatestHeadSHA = job.HeadSHA
+				}
+
 				updatedPRBytes, err := json.Marshal(state)
 				if err != nil {
 					return err
@@ -420,6 +487,33 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 				if err := prsBucket.Put(prStateKey, updatedPRBytes); err != nil {
 					return err
 				}
+			}
+
+			// If this job coalesces into an existing queued job:
+			if target, ok := coalescedJobs[i]; ok {
+				target.job.HeadSHA = job.HeadSHA
+				target.job.BaseSHA = job.BaseSHA
+				target.job.Generation = gen
+				jobBytes, err := json.Marshal(target.job)
+				if err != nil {
+					return err
+				}
+				if err := jobsBucket.Put(target.key, jobBytes); err != nil {
+					return err
+				}
+
+				// Update PR state pending auto job ID
+				prStateKey := []byte(prKeyStr)
+				var state PRState
+				if prBytes := prsBucket.Get(prStateKey); prBytes != nil {
+					_ = json.Unmarshal(prBytes, &state)
+					state.PendingAutoJobID = target.job.ID
+					state.LatestHeadSHA = job.HeadSHA
+					if updatedPRBytes, err := json.Marshal(state); err == nil {
+						_ = prsBucket.Put(prStateKey, updatedPRBytes)
+					}
+				}
+				continue
 			}
 
 			seq, err := countersBucket.NextSequence()
@@ -443,6 +537,22 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 			binary.BigEndian.PutUint64(jobKey, seq)
 			if err := jobsBucket.Put(jobKey, jobBytes); err != nil {
 				return err
+			}
+
+			if job.Trigger == "automatic" && job.Kind == "review" {
+				prStateKey := []byte(prKeyStr)
+				var state PRState
+				if prBytes := prsBucket.Get(prStateKey); prBytes != nil {
+					_ = json.Unmarshal(prBytes, &state)
+					state.PendingAutoJobID = job.ID
+					state.LatestHeadSHA = job.HeadSHA
+					if usesReservedSlot[i] {
+						state.HasReservedSuccessor = true
+					}
+					if updatedPRBytes, err := json.Marshal(state); err == nil {
+						_ = prsBucket.Put(prStateKey, updatedPRBytes)
+					}
+				}
 			}
 		}
 
@@ -702,4 +812,295 @@ func (s *BoltJobStore) RecoverInterruptedJobs(ctx context.Context) ([]*Job, erro
 		return nil
 	})
 	return recovered, err
+}
+
+// ClaimNextJob claims the oldest eligible queued job while respecting per-PR exclusion
+// and reserving a successor slot when starting an automatic review.
+func (s *BoltJobStore) ClaimNextJob(ctx context.Context, activePRs map[string]bool) (*Job, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return nil, ErrStoreClosed
+	}
+
+	var claimed *Job
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		jobsBucket := tx.Bucket(bucketJobs)
+		prsBucket := tx.Bucket(bucketPRs)
+
+		// 1. Calculate current capacity metrics
+		queuedCount := 0
+		reservedCount := 0
+		estimatedBytes := int64(0)
+		c := jobsBucket.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err == nil {
+				estimatedBytes += int64(len(v)) + j.Reservations
+				if j.Status == "queued" {
+					queuedCount++
+				}
+			}
+		}
+
+		prCursor := prsBucket.Cursor()
+		for k, v := prCursor.First(); k != nil; k, v = prCursor.Next() {
+			var st PRState
+			if err := json.Unmarshal(v, &st); err == nil {
+				if st.HasReservedSuccessor && st.ActiveJobID != "" {
+					reservedCount++
+					estimatedBytes += EstimatedJobStorageReserve
+				}
+			}
+		}
+
+		// 2. Scan queued jobs in FIFO sequence order
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err != nil || j.Status != "queued" {
+				continue
+			}
+
+			prKeyStr := j.PRKey.String()
+			if activePRs[prKeyStr] {
+				continue
+			}
+
+			// Fetch PR state
+			var state PRState
+			if stBytes := prsBucket.Get([]byte(prKeyStr)); stBytes != nil {
+				_ = json.Unmarshal(stBytes, &state)
+			} else {
+				state = PRState{
+					PRKey:  j.PRKey,
+					Owner:  j.Owner,
+					Repo:   j.Repo,
+					Number: j.PRNumber,
+				}
+			}
+
+			if state.ActiveJobID != "" {
+				continue
+			}
+
+			// If automatic review, reserve 1 successor slot and storage
+			if j.Trigger == "automatic" && j.Kind == "review" {
+				// Capacity check: since j was queued and becomes running,
+				// queuedCount becomes queuedCount - 1, and reservedCount becomes reservedCount + 1.
+				if queuedCount+reservedCount > s.opts.BacklogLimit ||
+					estimatedBytes+EstimatedJobStorageReserve > s.opts.StateMaxBytes {
+					// Cannot acquire reservation; leave review queued
+					continue
+				}
+
+				state.ActiveJobID = j.ID
+				state.HasReservedSuccessor = true
+				if state.PendingAutoJobID == j.ID {
+					state.PendingAutoJobID = ""
+				}
+			} else {
+				state.ActiveJobID = j.ID
+			}
+
+			now := time.Now().UTC()
+			j.Status = "running"
+			j.StartedAt = &now
+
+			// Update job and PR state
+			jBytes, err := json.Marshal(j)
+			if err != nil {
+				return err
+			}
+			if err := jobsBucket.Put(k, jBytes); err != nil {
+				return err
+			}
+
+			stBytes, err := json.Marshal(state)
+			if err != nil {
+				return err
+			}
+			if err := prsBucket.Put([]byte(prKeyStr), stBytes); err != nil {
+				return err
+			}
+
+			copyJob := j
+			claimed = &copyJob
+			return nil
+		}
+		return nil
+	})
+
+	return claimed, err
+}
+
+// ReleasePR releases active execution for a PR, transferring or releasing successor reservations.
+func (s *BoltJobStore) ReleasePR(ctx context.Context, prKey PRKey) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return ErrStoreClosed
+	}
+
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		prsBucket := tx.Bucket(bucketPRs)
+		jobsBucket := tx.Bucket(bucketJobs)
+
+		prKeyBytes := []byte(prKey.String())
+		v := prsBucket.Get(prKeyBytes)
+		if v == nil {
+			return nil
+		}
+
+		var state PRState
+		if err := json.Unmarshal(v, &state); err != nil {
+			return err
+		}
+
+		state.ActiveJobID = ""
+
+		// Check if a queued automatic review successor exists
+		hasQueuedSuccessor := false
+		if state.PendingAutoJobID != "" {
+			c := jobsBucket.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var j Job
+				if err := json.Unmarshal(v, &j); err == nil {
+					if j.ID == state.PendingAutoJobID && j.Status == "queued" {
+						hasQueuedSuccessor = true
+						break
+					}
+				}
+			}
+		}
+
+		if hasQueuedSuccessor {
+			// Transfer unused/newly-used reservation on succession
+			state.HasReservedSuccessor = true
+		} else {
+			// Release when no follow-up is necessary
+			state.HasReservedSuccessor = false
+			state.PendingAutoJobID = ""
+		}
+
+		raw, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+		return prsBucket.Put(prKeyBytes, raw)
+	})
+}
+
+// ScheduleSuccessorReview creates or updates a queued automatic review intent for the latest head,
+// using the reserved successor capacity.
+func (s *BoltJobStore) ScheduleSuccessorReview(ctx context.Context, prKey PRKey, owner, repo string, prNum int, baseSHA, headSHA string) (*Job, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return nil, ErrStoreClosed
+	}
+
+	var scheduled *Job
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		prsBucket := tx.Bucket(bucketPRs)
+		jobsBucket := tx.Bucket(bucketJobs)
+		countersBucket := tx.Bucket(bucketCounters)
+
+		prKeyBytes := []byte(prKey.String())
+		var state PRState
+		if v := prsBucket.Get(prKeyBytes); v != nil {
+			_ = json.Unmarshal(v, &state)
+		} else {
+			state = PRState{
+				PRKey:  prKey,
+				Owner:  owner,
+				Repo:   repo,
+				Number: prNum,
+			}
+		}
+
+		// Check if queued automatic review already exists
+		c := jobsBucket.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err == nil {
+				if j.PRKey == prKey && j.Trigger == "automatic" && j.Kind == "review" && j.Status == "queued" {
+					j.HeadSHA = headSHA
+					j.BaseSHA = baseSHA
+					state.Generation++
+					j.Generation = state.Generation
+					jBytes, err := json.Marshal(j)
+					if err != nil {
+						return err
+					}
+					if err := jobsBucket.Put(k, jBytes); err != nil {
+						return err
+					}
+					state.PendingAutoJobID = j.ID
+					state.LatestHeadSHA = headSHA
+					state.HasReservedSuccessor = true
+					stBytes, err := json.Marshal(state)
+					if err != nil {
+						return err
+					}
+					if err := prsBucket.Put(prKeyBytes, stBytes); err != nil {
+						return err
+					}
+					copyJob := j
+					scheduled = &copyJob
+					return nil
+				}
+			}
+		}
+
+		// Create fresh latest-head review intent using reserved successor
+		state.Generation++
+		seq, err := countersBucket.NextSequence()
+		if err != nil {
+			return err
+		}
+
+		job := Job{
+			ID:           fmt.Sprintf("job-%08d", seq),
+			Sequence:     seq,
+			Kind:         "review",
+			Trigger:      "automatic",
+			PRKey:        prKey,
+			Owner:        owner,
+			Repo:         repo,
+			PRNumber:     prNum,
+			BaseSHA:      baseSHA,
+			HeadSHA:      headSHA,
+			Generation:   state.Generation,
+			Status:       "queued",
+			CreatedAt:    time.Now().UTC(),
+			Reservations: EstimatedJobStorageReserve,
+		}
+
+		jobBytes, err := json.Marshal(job)
+		if err != nil {
+			return err
+		}
+		jobKey := make([]byte, 8)
+		binary.BigEndian.PutUint64(jobKey, seq)
+		if err := jobsBucket.Put(jobKey, jobBytes); err != nil {
+			return err
+		}
+
+		state.PendingAutoJobID = job.ID
+		state.LatestHeadSHA = headSHA
+		state.HasReservedSuccessor = true
+
+		stBytes, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+		if err := prsBucket.Put(prKeyBytes, stBytes); err != nil {
+			return err
+		}
+
+		scheduled = &job
+		return nil
+	})
+
+	return scheduled, err
 }
