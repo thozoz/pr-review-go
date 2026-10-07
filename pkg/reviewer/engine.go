@@ -130,8 +130,18 @@ func (e *Engine) executeReview(ctx context.Context, pr *github.PRDetails, diff s
 	if e.cfg.EnableSandbox && e.sandbox != nil {
 		snapshot, cleanup, err := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 		if err == nil {
-			defer cleanup()
+			var cleaned bool
+			cleanOnce := func() {
+				if !cleaned && cleanup != nil {
+					cleaned = true
+					cleanup()
+				}
+			}
+			defer cleanOnce()
+
 			verReport, err := e.sandbox.RunSnapshot(ctx, snapshot)
+			cleanOnce() // Immediate post-verification snapshot cleanup before completion request
+
 			if err == nil {
 				verificationStatus = verReport.Status
 				verificationReason = verReport.Reason

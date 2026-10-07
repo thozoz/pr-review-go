@@ -112,6 +112,15 @@ func (s *Server) Start(ctx context.Context) error {
 		s.scheduler.SetLLMGate(llmGate)
 	}
 
+	if s.scheduler.SandboxGate() == nil && s.cfg != nil {
+		sGate, err := sandbox.NewAdmissionGate(s.cfg.SandboxConcurrency)
+		if err != nil {
+			s.runtimeErr = err
+			return err
+		}
+		s.scheduler.SetSandboxGate(sGate)
+	}
+
 	if err := s.scheduler.Start(ctx); err != nil {
 		s.runtimeErr = err
 		return err

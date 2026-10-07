@@ -20,6 +20,7 @@ import (
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
+	"github.com/thozoz/pr-review-go/pkg/sandbox"
 	"go.etcd.io/bbolt"
 )
 
@@ -2339,6 +2340,227 @@ func TestSharedActionCapacity(t *testing.T) {
 		}
 	})
 }
+
+func TestWorkerFairness(t *testing.T) {
+	t.Run("independent worker snapshot and llm limits with post-verification cleanup", func(t *testing.T) {
+		stateDir := t.TempDir()
+		store, err := OpenJobStore(filepath.Join(stateDir, "fairness.db"), StoreOptions{
+			BacklogLimit: 20, DeliveryLimit: 100, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		var (
+			workersActive      int64
+			maxWorkersActive   int64
+			snapshotsActive    int64
+			maxSnapshotsActive int64
+			llmActive          int64
+			maxLLMActive       int64
+			mu                 sync.Mutex
+		)
+
+		updateMax := func(val int64, max *int64) {
+			mu.Lock()
+			if val > *max {
+				*max = val
+			}
+			mu.Unlock()
+		}
+
+		llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cur := atomic.AddInt64(&llmActive, 1)
+			updateMax(cur, &maxLLMActive)
+			time.Sleep(20 * time.Millisecond)
+			atomic.AddInt64(&llmActive, -1)
+
+			resp := llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{Message: llm.ChatMessage{Role: "assistant", Content: `{"score": 90, "summary": "Review", "findings": []}`}},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		defer llmServer.Close()
+
+		ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.Contains(r.URL.Path, "/pulls/"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"number": 1,
+					"title":  "Test PR",
+					"head":   map[string]any{"sha": "1111111111111111111111111111111111111111", "ref": "feat"},
+					"base":   map[string]any{"sha": "2222222222222222222222222222222222222222", "ref": "main"},
+					"user":   map[string]any{"login": "dev"},
+				})
+			case strings.Contains(r.URL.Path, "/compare/"):
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n+new line\n"))
+			case strings.Contains(r.URL.Path, "/comments"):
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 100})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ghServer.Close()
+
+		ghClient, _ := ghclient.NewTestClient(ghServer.URL)
+		cfg := &config.Config{
+			WebhookWorkers:      2,
+			SandboxConcurrency:  1,
+			LLMConcurrency:      2,
+			LLMMinInterval:      1 * time.Millisecond,
+			LLMResponseMaxBytes: 1048576,
+			EffortLevel:         "balanced",
+			EnableSandbox:       true,
+			LLMBaseURL:          llmServer.URL,
+			LLMAPIKey:           "key",
+			LLMModel:            "model",
+			GitHubToken:         "token",
+		}
+
+		srv := NewServer(cfg)
+		srv.gh = ghClient
+		srv.SetStore(store)
+
+		runner := sandbox.NewRunner(1 * time.Minute)
+		runner.Config = cfg
+		mockSP := &mockSourceProviderWithTracker{
+			onPrep: func() {
+				cur := atomic.AddInt64(&snapshotsActive, 1)
+				updateMax(cur, &maxSnapshotsActive)
+			},
+			onClean: func() {
+				atomic.AddInt64(&snapshotsActive, -1)
+			},
+		}
+		runner.SetSourceProvider(mockSP)
+
+		llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+		srv.SetEngine(reviewer.NewEngineWithClients(cfg, ghClient, llmClient, runner))
+
+		baseExec := NewServerJobExecutor(srv, store)
+		trackingExec := JobExecutorFunc(func(ctx context.Context, job *Job) error {
+			cur := atomic.AddInt64(&workersActive, 1)
+			updateMax(cur, &maxWorkersActive)
+			err := baseExec.ExecuteJob(ctx, job)
+			atomic.AddInt64(&workersActive, -1)
+			return err
+		})
+
+		sched := NewScheduler(store, trackingExec, 2)
+		llmGate, _ := llm.NewRequestGate(cfg.LLMConcurrency, cfg.LLMMinInterval, cfg.LLMResponseMaxBytes, nil)
+		sandboxGate, _ := sandbox.NewAdmissionGate(cfg.SandboxConcurrency)
+		sched.SetLLMGate(llmGate)
+		sched.SetSandboxGate(sandboxGate)
+
+		if err := sched.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer sched.Stop()
+
+		prKey1, _ := MakePRKey("github.com", 1, 1)
+		prKey2, _ := MakePRKey("github.com", 1, 2)
+
+		_, _ = store.Admit(context.Background(), Delivery{Host: "github.com", RepoID: 1, DeliveryID: "d1", PayloadHash: "h1", ReceivedAt: time.Now()}, []Job{
+			{Kind: "review", Trigger: "automatic", PRKey: prKey1, Owner: "o", Repo: "r", PRNumber: 1, HeadSHA: "1111111111111111111111111111111111111111"},
+		})
+		_, _ = store.Admit(context.Background(), Delivery{Host: "github.com", RepoID: 1, DeliveryID: "d2", PayloadHash: "h2", ReceivedAt: time.Now()}, []Job{
+			{Kind: "review", Trigger: "automatic", PRKey: prKey2, Owner: "o", Repo: "r", PRNumber: 2, HeadSHA: "1111111111111111111111111111111111111111"},
+		})
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			queued, _ := store.ListQueuedJobs(context.Background())
+			if len(queued) == 0 && atomic.LoadInt64(&workersActive) == 0 {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		mu.Lock()
+		maxSnap := maxSnapshotsActive
+		maxWk := maxWorkersActive
+		mu.Unlock()
+
+		if maxSnap > 1 {
+			t.Fatalf("expected snapshot concurrency <= 1, observed %d", maxSnap)
+		}
+		if maxWk == 0 {
+			t.Fatalf("expected workers to run, but maxWorkersActive was 0")
+		}
+	})
+
+	t.Run("fair progress with blocked PR and old accepted jobs retained", func(t *testing.T) {
+		stateDir := t.TempDir()
+		store, err := OpenJobStore(filepath.Join(stateDir, "blocked_pr.db"), StoreOptions{
+			BacklogLimit: 20, DeliveryLimit: 100, StateMaxBytes: 16777216, DeliveryTTL: 24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		prKey1, _ := MakePRKey("github.com", 10, 1)
+		prKey2, _ := MakePRKey("github.com", 10, 2)
+
+		_ = store.UpdatePRState(ctx, &PRState{
+			PRKey:            prKey1,
+			Owner:            "o",
+			Repo:             "r",
+			Number:           1,
+			HasBlockedAction: true,
+		})
+
+		_, _ = store.Admit(ctx, Delivery{Host: "github.com", RepoID: 10, DeliveryID: "d-block", PayloadHash: "hb", ReceivedAt: time.Now()}, []Job{
+			{Kind: "review", Trigger: "automatic", Status: "queued", PRKey: prKey1, Owner: "o", Repo: "r", PRNumber: 1},
+		})
+		_, _ = store.Admit(ctx, Delivery{Host: "github.com", RepoID: 10, DeliveryID: "d-fair", PayloadHash: "hf", ReceivedAt: time.Now()}, []Job{
+			{Kind: "review", Trigger: "automatic", Status: "queued", PRKey: prKey2, Owner: "o", Repo: "r", PRNumber: 2},
+		})
+
+		claimed, err := store.ClaimNextJob(ctx, nil)
+		if err != nil || claimed == nil {
+			t.Fatalf("expected eligible PR 2 to be claimed, got: %v", err)
+		}
+		if claimed.PRNumber != 2 {
+			t.Fatalf("expected PR 2 to be claimed while PR 1 is blocked, got PR %d", claimed.PRNumber)
+		}
+
+		queued, _ := store.ListQueuedJobs(ctx)
+		if len(queued) != 1 || queued[0].PRNumber != 1 {
+			t.Fatalf("expected PR 1 job to remain queued without being discarded, got: %+v", queued)
+		}
+	})
+}
+
+type mockSourceProviderWithTracker struct {
+	onPrep  func()
+	onClean func()
+}
+
+func (m *mockSourceProviderWithTracker) PrepareSource(ctx context.Context, cloneURL, headRef, headSHA string) (*sandbox.Snapshot, func(), error) {
+	if m.onPrep != nil {
+		m.onPrep()
+	}
+	snap := &sandbox.Snapshot{
+		CommitSHA: headSHA,
+		SourceDir: "/tmp/mock-tracked",
+	}
+	cleanup := func() {
+		if m.onClean != nil {
+			m.onClean()
+		}
+	}
+	return snap, cleanup, nil
+}
+
 
 
 

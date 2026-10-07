@@ -10,6 +10,7 @@ import (
 
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
+	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
 
 // JobExecutor defines the execution contract for individual scheduled jobs.
@@ -402,16 +403,17 @@ func (e *ServerJobExecutor) executeAssistantJob(ctx context.Context, job *Job) e
 
 // Scheduler coordinates FIFO job execution with per-PR serialisation and fixed workers.
 type Scheduler struct {
-	store     JobStore
-	executor  JobExecutor
-	workers   int
-	activePRs map[string]bool
-	llmGate   llm.RequestGate
-	mu        sync.Mutex
-	wakeCh    chan struct{}
-	stopCh    chan struct{}
-	stopped   bool
-	wg        sync.WaitGroup
+	store       JobStore
+	executor    JobExecutor
+	workers     int
+	activePRs   map[string]bool
+	llmGate     llm.RequestGate
+	sandboxGate sandbox.AdmissionGate
+	mu          sync.Mutex
+	wakeCh      chan struct{}
+	stopCh      chan struct{}
+	stopped     bool
+	wg          sync.WaitGroup
 }
 
 func NewScheduler(store JobStore, executor JobExecutor, workers int) *Scheduler {
@@ -440,6 +442,20 @@ func (s *Scheduler) LLMGate() llm.RequestGate {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.llmGate
+}
+
+// SetSandboxGate assigns a shared sandbox AdmissionGate to the scheduler.
+func (s *Scheduler) SetSandboxGate(gate sandbox.AdmissionGate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sandboxGate = gate
+}
+
+// SandboxGate returns the scheduler's shared sandbox AdmissionGate.
+func (s *Scheduler) SandboxGate() sandbox.AdmissionGate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sandboxGate
 }
 
 func (s *Scheduler) Start(ctx context.Context) error {
@@ -521,9 +537,13 @@ func (s *Scheduler) workerLoop(ctx context.Context, workerID int) {
 		execCtx := ctx
 		s.mu.Lock()
 		gate := s.llmGate
+		sGate := s.sandboxGate
 		s.mu.Unlock()
 		if gate != nil {
 			execCtx = llm.WithAdmission(execCtx, gate)
+		}
+		if sGate != nil {
+			execCtx = sandbox.WithAdmission(execCtx, sGate)
 		}
 
 		_ = s.executor.ExecuteJob(execCtx, job)
