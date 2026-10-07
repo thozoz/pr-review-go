@@ -25,6 +25,7 @@ var (
 	ErrPRNotFound           = errors.New("pr state not found")
 	ErrIntentNotFound       = errors.New("output intent not found")
 	ErrDatabaseLocked       = errors.New("database is locked by another process")
+	ErrGenerationChanged    = errors.New("pr generation changed before publication outcome commit")
 )
 
 const (
@@ -122,21 +123,26 @@ type Job struct {
 
 // OutputIntent records intent before external GitHub mutations.
 type OutputIntent struct {
-	Marker        string    `json:"marker"`
-	JobID         string    `json:"job_id"`
-	Action        string    `json:"action"`
-	PRKey         PRKey     `json:"pr_key"`
-	Owner         string    `json:"owner"`
-	Repo          string    `json:"repo"`
-	PRNumber      int       `json:"pr_number"`
-	ExactHead     string    `json:"exact_head"`
-	BodyDigest    string    `json:"body_digest"` // hex SHA-256
-	Body          string    `json:"body"`
-	VerifiedActor string    `json:"verified_actor"`
-	Status        string    `json:"status"` // "pending", "in_progress", "completed", "uncertain", "needs_attention"
-	CommentID     int64     `json:"comment_id,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	Marker        string `json:"marker"`
+	JobID         string `json:"job_id"`
+	Action        string `json:"action"`
+	PRKey         PRKey  `json:"pr_key"`
+	Owner         string `json:"owner"`
+	Repo          string `json:"repo"`
+	PRNumber      int    `json:"pr_number"`
+	ExactHead     string `json:"exact_head"`
+	BodyDigest    string `json:"body_digest"` // hex SHA-256
+	Body          string `json:"body"`
+	VerifiedActor string `json:"verified_actor"`
+	Status        string `json:"status"` // "pending", "in_progress", "completed", "uncertain", "needs_attention"
+	CommentID     int64  `json:"comment_id,omitempty"`
+	// SupersededBody/SupersededDigest record the intended updated body of an owned
+	// comment before it is edited as superseded, so restart can match either the
+	// original or the updated owned content (additive, optional; schema stays v1).
+	SupersededBody   string    `json:"superseded_body,omitempty"`
+	SupersededDigest string    `json:"superseded_digest,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // PRState tracks PR-level generation and active execution.
@@ -198,6 +204,12 @@ type JobStore interface {
 	SaveOutputIntent(ctx context.Context, intent *OutputIntent) error
 	GetOutputIntent(ctx context.Context, marker string) (*OutputIntent, error)
 	UpdateOutputIntent(ctx context.Context, intent *OutputIntent) error
+	// CommitPublicationOutcome atomically commits intent, job and (for confirmed
+	// current-head review publication) PRState.LastReviewedHead in one transaction.
+	CommitPublicationOutcome(ctx context.Context, intent *OutputIntent, job *Job, prState *PRState) error
+	// CommitSupersededOutcome atomically commits a superseded outcome and the
+	// latest-head successor obligation (when successor head is non-empty).
+	CommitSupersededOutcome(ctx context.Context, intent *OutputIntent, job *Job, successorBaseSHA, successorHeadSHA string) error
 	RecoverInterruptedJobs(ctx context.Context) ([]*Job, error)
 	RecoverJobs(ctx context.Context) ([]*Job, error)
 	InspectJobs(ctx context.Context) ([]*Job, error)
@@ -1284,6 +1296,17 @@ func (s *BoltJobStore) ScheduleSuccessorReview(ctx context.Context, prKey PRKey,
 
 	var scheduled *Job
 	err := s.db.Update(func(tx *bbolt.Tx) error {
+		j, err := scheduleSuccessorTx(tx, prKey, owner, repo, prNum, baseSHA, headSHA)
+		scheduled = j
+		return err
+	})
+	return scheduled, err
+}
+
+// scheduleSuccessorTx is the transactional core of ScheduleSuccessorReview.
+func scheduleSuccessorTx(tx *bbolt.Tx, prKey PRKey, owner, repo string, prNum int, baseSHA, headSHA string) (*Job, error) {
+	var scheduled *Job
+	err := func() error {
 		prsBucket := tx.Bucket(bucketPRs)
 		jobsBucket := tx.Bucket(bucketJobs)
 		countersBucket := tx.Bucket(bucketCounters)
@@ -1383,7 +1406,127 @@ func (s *BoltJobStore) ScheduleSuccessorReview(ctx context.Context, prKey PRKey,
 
 		scheduled = &job
 		return nil
-	})
-
+	}()
 	return scheduled, err
+}
+
+// CommitPublicationOutcome atomically commits a publication outcome: the saved
+// intent, the job and — only for a confirmed current-head review publication —
+// PRState.LastReviewedHead. It reads the current persisted job and PR generation
+// inside the same transaction, rejects stale success after generation movement and
+// preserves active/latest/pending-successor fields rather than overwriting them
+// from a stale PRState copy.
+func (s *BoltJobStore) CommitPublicationOutcome(ctx context.Context, intent *OutputIntent, job *Job, prState *PRState) error {
+	return s.commitOutcome(ctx, intent, job, prState, "", "")
+}
+
+// CommitSupersededOutcome commits a superseded outcome together with the durable
+// latest-head successor obligation in one transaction, so a failed successor save
+// can never leave a terminal job without a recoverable latest-head review.
+func (s *BoltJobStore) CommitSupersededOutcome(ctx context.Context, intent *OutputIntent, job *Job, successorBaseSHA, successorHeadSHA string) error {
+	return s.commitOutcome(ctx, intent, job, nil, successorBaseSHA, successorHeadSHA)
+}
+
+func (s *BoltJobStore) commitOutcome(ctx context.Context, intent *OutputIntent, job *Job, prState *PRState, succBase, succHead string) error {
+	if intent == nil || job == nil {
+		return errors.New("nil intent or job for publication outcome")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return ErrStoreClosed
+	}
+
+	intentCopy := *intent
+	if intentCopy.BodyDigest == "" && intentCopy.Body != "" {
+		h := sha256.Sum256([]byte(intentCopy.Body))
+		intentCopy.BodyDigest = hex.EncodeToString(h[:])
+	}
+	if intentCopy.CreatedAt.IsZero() {
+		intentCopy.CreatedAt = time.Now().UTC()
+	}
+	intentCopy.UpdatedAt = time.Now().UTC()
+
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		jobsBucket := tx.Bucket(bucketJobs)
+		prsBucket := tx.Bucket(bucketPRs)
+		prKeyBytes := []byte(job.PRKey.String())
+
+		// Locate the persisted job.
+		jobKey := make([]byte, 8)
+		binary.BigEndian.PutUint64(jobKey, job.Sequence)
+		if jobsBucket.Get(jobKey) == nil {
+			found := false
+			c := jobsBucket.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var j Job
+				if err := json.Unmarshal(v, &j); err == nil && j.ID == job.ID {
+					copy(jobKey, k)
+					found = true
+					break
+				}
+			}
+			if !found {
+				return ErrJobNotFound
+			}
+		}
+
+		var current *PRState
+		if v := prsBucket.Get(prKeyBytes); v != nil {
+			var st PRState
+			if err := json.Unmarshal(v, &st); err != nil {
+				return err
+			}
+			current = &st
+		}
+
+		if job.Status == "completed" && current != nil && current.Generation > job.Generation {
+			return ErrGenerationChanged
+		}
+
+		jobRaw, err := json.Marshal(job)
+		if err != nil {
+			return err
+		}
+		if err := jobsBucket.Put(jobKey, jobRaw); err != nil {
+			return err
+		}
+		intentRaw, err := json.Marshal(&intentCopy)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bucket(bucketIntents).Put([]byte(intentCopy.Marker), intentRaw); err != nil {
+			return err
+		}
+
+		if job.Status == "completed" && intentCopy.Action == "review_output" {
+			head := intentCopy.ExactHead
+			if prState != nil && prState.LastReviewedHead != "" {
+				head = prState.LastReviewedHead
+			}
+			next := PRState{PRKey: job.PRKey, Owner: job.Owner, Repo: job.Repo, Number: job.PRNumber, Generation: job.Generation}
+			if current != nil {
+				next = *current
+			}
+			next.LastReviewedHead = head
+			raw, err := json.Marshal(&next)
+			if err != nil {
+				return err
+			}
+			if err := prsBucket.Put(prKeyBytes, raw); err != nil {
+				return err
+			}
+		}
+
+		if succHead != "" {
+			if _, err := scheduleSuccessorTx(tx, job.PRKey, job.Owner, job.Repo, job.PRNumber, succBase, succHead); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		*intent = intentCopy
+	}
+	return err
 }

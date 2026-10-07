@@ -102,17 +102,15 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	// If output was already generated before a crash, reconcile durable saved output
 	// before scheduling regeneration — known stored output never reruns generation.
 	reviewMarker := fmt.Sprintf("<!-- pr-review-output:%s -->", job.ID)
-	existingIntent, _ := e.store.GetOutputIntent(ctx, reviewMarker)
-	if existingIntent != nil && existingIntent.Body != "" {
+	existingIntent, intentErr := e.store.GetOutputIntent(ctx, reviewMarker)
+	if intentErr != nil && !errors.Is(intentErr, ErrIntentNotFound) {
+		// An unreadable ledger must never start paid generation.
+		log.Printf("[jobs] Failed reading saved review intent for %s: %v", job.ID, intentErr)
+		return fmt.Errorf("read saved review intent: %w", intentErr)
+	}
+	if intentErr == nil && existingIntent != nil && existingIntent.Body != "" {
 		log.Printf("[jobs] Reconciling existing stored review output for %s without regeneration", job.ID)
-		res, err := pub.ReconcileOutput(ctx, existingIntent)
-		if err != nil {
-			return err
-		}
-		if res != nil && res.Status == "completed" && job.StatusCommentID > 0 {
-			_, _ = pub.PublishStatus(ctx, job, "✅ Review completed.")
-		}
-		return nil
+		return e.reconcileAndFinish(ctx, pub, job, existingIntent, false)
 	}
 
 	// 1. Initial head check before expensive generation
@@ -179,10 +177,14 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		initialStatusBody = "⏳ Review queued; waiting for capacity"
 	}
 
-	_, _ = pub.PublishStatus(ctx, job, initialStatusBody)
+	if err := e.publishStatus(ctx, pub, job, initialStatusBody); err != nil {
+		return err
+	}
 	if !isRerun {
 		// Transition status comment to running
-		_, _ = pub.PublishStatus(ctx, job, "🔄 Review running...")
+		if err := e.publishStatus(ctx, pub, job, "🔄 Review running..."); err != nil {
+			return err
+		}
 	}
 
 	// 3. Head-bound review execution
@@ -266,27 +268,64 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		Status:    "pending",
 	}
 	if err := e.store.SaveOutputIntent(ctx, reviewIntent); err != nil {
+		// No remote review write without a committed recoverable intent. The job
+		// stays nonterminal (never completed) so restart recovery owns it.
 		log.Printf("[jobs] Failed saving review output intent for %s: %v", job.ID, err)
+		return fmt.Errorf("save review output intent: %w", err)
 	}
 
 	// 6. Reconcile review output publication across crash windows & in-flight head movement
-	res, recErr := pub.ReconcileOutput(ctx, reviewIntent)
-	if recErr != nil || (res != nil && res.Status == "uncertain") {
+	return e.reconcileAndFinish(ctx, pub, job, reviewIntent, isRerun)
+}
+
+// publishStatus publishes a status transition. Durable-ledger failures abort the
+// job (nonterminal, preserved for recovery); remote-only status failures are
+// logged since the comment is cosmetic and the saved intent keeps it recoverable.
+func (e *ServerJobExecutor) publishStatus(ctx context.Context, pub *Publication, job *Job, text string) error {
+	if _, err := pub.PublishStatus(ctx, job, text); err != nil {
+		if errors.Is(err, ErrPublicationPersistence) {
+			log.Printf("[jobs] Status publication ledger failure for %s: %v", job.ID, err)
+			return err
+		}
+		log.Printf("[jobs] Status publication for %s failed (continuing): %v", job.ID, err)
+	}
+	return nil
+}
+
+// reconcileAndFinish reconciles a saved review output and propagates every
+// persistence/uncertainty error instead of treating it as success.
+func (e *ServerJobExecutor) reconcileAndFinish(ctx context.Context, pub *Publication, job *Job, intent *OutputIntent, isRerun bool) error {
+	res, recErr := pub.ReconcileOutput(ctx, intent)
+	if recErr != nil {
 		return recErr
 	}
-
-	if res != nil && res.Status == "superseded" {
+	if res == nil {
+		return errors.New("publication reconcile returned no result")
+	}
+	// Refresh terminal fields so later status writes cannot clobber the committed job.
+	if fresh, err := e.store.GetJob(ctx, job.ID); err == nil && fresh != nil {
+		job.Status = fresh.Status
+		job.FinishedAt = fresh.FinishedAt
+		job.Error = fresh.Error
+		if fresh.StatusCommentID > 0 {
+			job.StatusCommentID = fresh.StatusCommentID
+		}
+	}
+	switch res.Status {
+	case "uncertain":
+		if res.Error != nil {
+			return fmt.Errorf("review publication uncertain: %w", res.Error)
+		}
+		return errors.New("review publication uncertain")
+	case "superseded":
 		if job.StatusCommentID > 0 {
-			_, _ = pub.PublishStatus(ctx, job, "⏭️ Review superseded by newer commit.")
+			return e.publishStatus(ctx, pub, job, "⏭️ Review superseded by newer commit.")
 		}
 		return nil
 	}
-
-	// 7. Update status comment to completed
 	if job.StatusCommentID > 0 && !isRerun {
-		_, _ = pub.PublishStatus(ctx, job, "✅ Review completed.")
+		return e.publishStatus(ctx, pub, job, "✅ Review completed.")
 	}
-
 	return nil
 }
 

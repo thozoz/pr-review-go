@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -243,18 +245,28 @@ func TestPublicationRecovery(t *testing.T) {
 
 		var createCalls int32
 		var editCalls int32
+		var lastStatusBody atomic.Value
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			switch {
 			case r.URL.Path == "/user":
 				json.NewEncoder(w).Encode(map[string]any{"id": 100, "login": "bot-user"})
+			case strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/comments/703") && r.Method == http.MethodGet:
+				body, _ := lastStatusBody.Load().(string)
+				json.NewEncoder(w).Encode(map[string]any{"id": 703, "body": body, "user": map[string]any{"id": 100, "login": "bot-user"}})
 			case strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/1/comments") && r.Method == http.MethodGet:
 				json.NewEncoder(w).Encode([]any{})
 			case strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/1/comments") && r.Method == http.MethodPost:
 				atomic.AddInt32(&createCalls, 1)
+				var cb map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&cb)
+				lastStatusBody.Store(cb["body"])
 				json.NewEncoder(w).Encode(map[string]any{"id": 703})
 			case strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/comments/703") && r.Method == http.MethodPatch:
 				atomic.AddInt32(&editCalls, 1)
+				var eb map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&eb)
+				lastStatusBody.Store(eb["body"])
 				json.NewEncoder(w).Encode(map[string]any{"id": 703})
 			default:
 				http.NotFound(w, r)
@@ -431,6 +443,8 @@ func TestPublicationRecovery(t *testing.T) {
 				})
 			case strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/comments/901") && r.Method == http.MethodPatch:
 				json.NewEncoder(w).Encode(map[string]any{"id": 901})
+			case r.URL.Path == "/repos/owner/repo/pulls/1":
+				json.NewEncoder(w).Encode(map[string]any{"number": 1, "base": map[string]any{"sha": baseSHA}, "head": map[string]any{"sha": headSHA}})
 			default:
 				http.NotFound(w, r)
 			}
@@ -769,4 +783,620 @@ func TestGracefulShutdown(t *testing.T) {
 	if err := setupSrv.Shutdown(context.Background()); err != nil {
 		t.Fatalf("setup mode Shutdown error: %v", err)
 	}
+}
+
+// ---- F-01/F-02 durable-intent and head-recovery regressions (plan 02-06) ----
+
+const (
+	pubBaseSHA = "1111111111111111111111111111111111111111"
+	pubHeadSHA = "2222222222222222222222222222222222222222"
+	pubNewHead = "3333333333333333333333333333333333333333"
+)
+
+type pubComment struct {
+	body string
+	uid  int64
+}
+
+// pubFake is a local httptest GitHub with request counters (no live credentials).
+type pubFake struct {
+	mu        sync.Mutex
+	comments  map[int64]pubComment
+	next      int64
+	posts     atomic.Int32
+	patches   atomic.Int32
+	prReads   atomic.Int32
+	unknown   atomic.Int32 // requests to endpoints a generation would hit
+	userFail  atomic.Bool
+	listFail  atomic.Bool
+	patchFail atomic.Bool
+	headFn    func(read int32) (int, string)
+	patchBody atomic.Value
+	srv       *httptest.Server
+}
+
+func newPubFake(t *testing.T) *pubFake {
+	f := &pubFake{comments: map[int64]pubComment{}, next: 500}
+	f.headFn = func(int32) (int, string) { return 200, pubHeadSHA }
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		p := r.URL.Path
+		switch {
+		case p == "/user":
+			if f.userFail.Load() {
+				http.Error(w, "boom", 500)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"id": 100, "login": "bot-user"})
+		case p == "/repos/owner/repo/pulls/1":
+			code, sha := f.headFn(f.prReads.Add(1))
+			if code != 200 {
+				http.Error(w, "head unavailable", code)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"number": 1, "base": map[string]any{"sha": pubBaseSHA}, "head": map[string]any{"sha": sha}})
+		case p == "/repos/owner/repo/issues/1/comments" && r.Method == http.MethodGet:
+			if f.listFail.Load() {
+				http.Error(w, "boom", 500)
+				return
+			}
+			f.mu.Lock()
+			list := []any{}
+			for id, c := range f.comments {
+				list = append(list, map[string]any{"id": id, "body": c.body, "user": map[string]any{"id": c.uid, "login": fmt.Sprintf("u%d", c.uid)}})
+			}
+			f.mu.Unlock()
+			json.NewEncoder(w).Encode(list)
+		case p == "/repos/owner/repo/issues/1/comments" && r.Method == http.MethodPost:
+			f.posts.Add(1)
+			var b map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			f.mu.Lock()
+			f.next++
+			id := f.next
+			f.comments[id] = pubComment{body: b["body"], uid: 100}
+			f.mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{"id": id})
+		case strings.HasPrefix(p, "/repos/owner/repo/issues/comments/"):
+			id, _ := strconv.ParseInt(strings.TrimPrefix(p, "/repos/owner/repo/issues/comments/"), 10, 64)
+			f.mu.Lock()
+			c, ok := f.comments[id]
+			f.mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method == http.MethodPatch {
+				f.patches.Add(1)
+				if f.patchFail.Load() {
+					http.Error(w, "boom", 500)
+					return
+				}
+				var b map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&b)
+				f.patchBody.Store(b["body"])
+				f.mu.Lock()
+				f.comments[id] = pubComment{body: b["body"], uid: c.uid}
+				f.mu.Unlock()
+				json.NewEncoder(w).Encode(map[string]any{"id": id})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"id": id, "body": c.body, "user": map[string]any{"id": c.uid, "login": fmt.Sprintf("u%d", c.uid)}})
+		default:
+			f.unknown.Add(1)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *pubFake) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.comments)
+}
+
+// faultStore injects failures at chosen persistence boundaries.
+type faultStore struct {
+	JobStore
+	saveIntent      func(*OutputIntent) error
+	getIntent       func(string) error
+	updateIntent    func(*OutputIntent) error
+	updateJob       func(*Job) error
+	commitOutcome   func(*OutputIntent, *Job, *PRState) error
+	commitSuperseded func(*OutputIntent, *Job) error
+}
+
+func (s *faultStore) SaveOutputIntent(ctx context.Context, i *OutputIntent) error {
+	if s.saveIntent != nil {
+		if err := s.saveIntent(i); err != nil {
+			return err
+		}
+	}
+	return s.JobStore.SaveOutputIntent(ctx, i)
+}
+func (s *faultStore) GetOutputIntent(ctx context.Context, m string) (*OutputIntent, error) {
+	if s.getIntent != nil {
+		if err := s.getIntent(m); err != nil {
+			return nil, err
+		}
+	}
+	return s.JobStore.GetOutputIntent(ctx, m)
+}
+func (s *faultStore) UpdateOutputIntent(ctx context.Context, i *OutputIntent) error {
+	if s.updateIntent != nil {
+		if err := s.updateIntent(i); err != nil {
+			return err
+		}
+	}
+	return s.JobStore.UpdateOutputIntent(ctx, i)
+}
+func (s *faultStore) UpdateJob(ctx context.Context, j *Job) error {
+	if s.updateJob != nil {
+		if err := s.updateJob(j); err != nil {
+			return err
+		}
+	}
+	return s.JobStore.UpdateJob(ctx, j)
+}
+func (s *faultStore) CommitPublicationOutcome(ctx context.Context, i *OutputIntent, j *Job, p *PRState) error {
+	if s.commitOutcome != nil {
+		if err := s.commitOutcome(i, j, p); err != nil {
+			return err
+		}
+	}
+	return s.JobStore.CommitPublicationOutcome(ctx, i, j, p)
+}
+func (s *faultStore) CommitSupersededOutcome(ctx context.Context, i *OutputIntent, j *Job, b, h string) error {
+	if s.commitSuperseded != nil {
+		if err := s.commitSuperseded(i, j); err != nil {
+			return err
+		}
+	}
+	return s.JobStore.CommitSupersededOutcome(ctx, i, j, b, h)
+}
+
+type pubEnv struct {
+	t      *testing.T
+	path   string
+	store  *BoltJobStore
+	fake   *pubFake
+	gh     *ghclient.Client
+	job    *Job
+	prKey  PRKey
+}
+
+func newPubEnv(t *testing.T) *pubEnv {
+	e := &pubEnv{t: t, path: filepath.Join(t.TempDir(), "jobs.db"), fake: newPubFake(t)}
+	e.prKey, _ = MakePRKey("github.com", 1234, 1)
+	e.open()
+	e.job = seedTestJob(t, e.store, e.prKey, pubBaseSHA, pubHeadSHA)
+	gh, err := ghclient.NewTestClient(e.fake.srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.gh = gh
+	t.Cleanup(func() { e.store.Close() })
+	return e
+}
+
+func (e *pubEnv) open() {
+	s, err := OpenJobStore(e.path, StoreOptions{BacklogLimit: 10})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.store = s
+}
+
+// reopen simulates a process restart against the same bbolt file.
+func (e *pubEnv) reopen() {
+	if err := e.store.Close(); err != nil {
+		e.t.Fatal(err)
+	}
+	e.open()
+	j, err := e.store.GetJob(context.Background(), e.job.ID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.job = j
+}
+
+func (e *pubEnv) saveReview(body string) *OutputIntent {
+	in := &OutputIntent{
+		Marker: fmt.Sprintf("<!-- pr-review-output:%s -->", e.job.ID), JobID: e.job.ID, Action: "review_output",
+		PRKey: e.prKey, Owner: "owner", Repo: "repo", PRNumber: 1, ExactHead: pubHeadSHA, Body: body, Status: "pending",
+	}
+	if err := e.store.SaveOutputIntent(context.Background(), in); err != nil {
+		e.t.Fatal(err)
+	}
+	return in
+}
+
+func (e *pubEnv) jobStatus() string {
+	j, err := e.store.GetJob(context.Background(), e.job.ID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return j.Status
+}
+
+func (e *pubEnv) executor() (*ServerJobExecutor, JobStore) {
+	engine := reviewer.NewEngineWithClients(&config.Config{}, e.gh, nil, nil)
+	srv := &Server{gh: e.gh, engine: engine, store: e.store}
+	return NewServerJobExecutor(srv, e.store), e.store
+}
+
+func TestPublicationDurability(t *testing.T) {
+	ctx := context.Background()
+	failSave := func(*OutputIntent) error { return errors.New("injected save failure") }
+
+	t.Run("StatusIntentSaveFailureWritesNothing", func(t *testing.T) {
+		e := newPubEnv(t)
+		pub := NewPublication(&faultStore{JobStore: e.store, saveIntent: failSave}, e.gh)
+		if _, err := pub.PublishStatus(ctx, e.job, "queued"); err == nil || !errors.Is(err, ErrPublicationPersistence) {
+			t.Fatalf("want persistence error, got %v", err)
+		}
+		if e.fake.posts.Load() != 0 || e.fake.patches.Load() != 0 {
+			t.Fatalf("remote writes after failed intent save: posts=%d patches=%d", e.fake.posts.Load(), e.fake.patches.Load())
+		}
+	})
+
+	t.Run("StatusEditIntentSaveFailureWritesNothing", func(t *testing.T) {
+		e := newPubEnv(t)
+		if _, err := NewPublication(e.store, e.gh).PublishStatus(ctx, e.job, "queued"); err != nil {
+			t.Fatal(err)
+		}
+		pub := NewPublication(&faultStore{JobStore: e.store, saveIntent: failSave}, e.gh)
+		if _, err := pub.PublishStatus(ctx, e.job, "running"); err == nil {
+			t.Fatal("expected error")
+		}
+		if e.fake.patches.Load() != 0 || e.fake.posts.Load() != 1 {
+			t.Fatalf("unexpected writes: posts=%d patches=%d", e.fake.posts.Load(), e.fake.patches.Load())
+		}
+	})
+
+	t.Run("ActorAndScanFailureAuthorizeNoWrites", func(t *testing.T) {
+		e := newPubEnv(t)
+		pub := NewPublication(e.store, e.gh)
+		e.fake.userFail.Store(true)
+		if _, err := pub.PublishStatus(ctx, e.job, "queued"); err == nil {
+			t.Fatal("actor failure must error")
+		}
+		in := e.saveReview("report")
+		res, _ := pub.ReconcileOutput(ctx, in)
+		if res.Status != "uncertain" {
+			t.Fatalf("actor failure => %s", res.Status)
+		}
+		e.fake.userFail.Store(false)
+		e.fake.listFail.Store(true)
+		if _, err := pub.PublishStatus(ctx, e.job, "queued"); err == nil {
+			t.Fatal("scan failure must error")
+		}
+		res, _ = pub.ReconcileOutput(ctx, in)
+		if res.Status != "uncertain" || e.jobStatus() == "completed" {
+			t.Fatalf("scan failure => %s job=%s", res.Status, e.jobStatus())
+		}
+		if e.fake.posts.Load() != 0 || e.fake.patches.Load() != 0 {
+			t.Fatalf("writes authorized after actor/scan failure")
+		}
+	})
+
+	t.Run("ReconcileRejectsAbsentOrMismatchedIntent", func(t *testing.T) {
+		e := newPubEnv(t)
+		pub := NewPublication(e.store, e.gh)
+		ghost := &OutputIntent{Marker: "<!-- pr-review-output:" + e.job.ID + " -->", JobID: e.job.ID, Action: "review_output",
+			PRKey: e.prKey, Owner: "owner", Repo: "repo", PRNumber: 1, ExactHead: pubHeadSHA, Body: "never saved"}
+		if res, _ := pub.ReconcileOutput(ctx, ghost); res.Status != "uncertain" || e.fake.posts.Load() != 0 {
+			t.Fatalf("absent intent: %s posts=%d", res.Status, e.fake.posts.Load())
+		}
+		saved := e.saveReview("saved body")
+		tampered := *saved
+		tampered.Body = "different body"
+		if res, _ := pub.ReconcileOutput(ctx, &tampered); res.Status != "uncertain" || e.fake.posts.Load() != 0 {
+			t.Fatalf("mismatched intent: %s", res.Status)
+		}
+		failRead := NewPublication(&faultStore{JobStore: e.store, getIntent: func(string) error { return errors.New("read fail") }}, e.gh)
+		if res, _ := failRead.ReconcileOutput(ctx, saved); res.Status != "uncertain" || e.fake.posts.Load() != 0 {
+			t.Fatalf("read-failed intent: %s", res.Status)
+		}
+	})
+
+	t.Run("IntentReadFailureStartsNoGeneration", func(t *testing.T) {
+		e := newPubEnv(t)
+		engine := reviewer.NewEngineWithClients(&config.Config{}, e.gh, nil, nil)
+		fs := &faultStore{JobStore: e.store, getIntent: func(string) error { return errors.New("read fail") }}
+		exec := NewServerJobExecutor(&Server{gh: e.gh, engine: engine, store: fs}, fs)
+		if err := exec.executeReviewJob(ctx, e.job); err == nil {
+			t.Fatal("expected error when intent read fails")
+		}
+		if e.fake.unknown.Load() != 0 || e.fake.posts.Load() != 0 {
+			t.Fatalf("generation/writes started: unknown=%d posts=%d", e.fake.unknown.Load(), e.fake.posts.Load())
+		}
+	})
+
+	t.Run("RemoteSuccessThenIDSaveFailureRecoversAfterRestart", func(t *testing.T) {
+		e := newPubEnv(t)
+		fs := &faultStore{JobStore: e.store, updateIntent: func(i *OutputIntent) error {
+			if i.CommentID > 0 {
+				return errors.New("injected id save failure")
+			}
+			return nil
+		}}
+		in := e.saveReview("## Review\nAll good")
+		res, _ := NewPublication(fs, e.gh).ReconcileOutput(ctx, in)
+		if res.Status != "uncertain" || e.jobStatus() == "completed" {
+			t.Fatalf("want uncertain nonterminal, got %s job=%s", res.Status, e.jobStatus())
+		}
+		if e.fake.posts.Load() != 1 {
+			t.Fatalf("posts=%d", e.fake.posts.Load())
+		}
+
+		// Restart: reopen database, real executor, zero generation, zero duplicate POST.
+		e.reopen()
+		saved, err := e.store.GetOutputIntent(ctx, in.Marker)
+		if err != nil || saved.Body == "" || saved.CommentID != 0 {
+			t.Fatalf("reopened intent not recoverable: %+v err=%v", saved, err)
+		}
+		exec, _ := e.executor()
+		if err := exec.executeReviewJob(ctx, e.job); err != nil {
+			t.Fatalf("restart reconcile: %v", err)
+		}
+		if e.fake.posts.Load() != 1 || e.fake.count() != 1 {
+			t.Fatalf("duplicate remote comment: posts=%d comments=%d", e.fake.posts.Load(), e.fake.count())
+		}
+		if e.fake.unknown.Load() != 0 {
+			t.Fatalf("restart triggered generation requests: %d", e.fake.unknown.Load())
+		}
+		if e.jobStatus() != "completed" {
+			t.Fatalf("job=%s", e.jobStatus())
+		}
+		done, _ := e.store.GetOutputIntent(ctx, in.Marker)
+		if done.Status != "completed" || done.CommentID == 0 {
+			t.Fatalf("intent after restart: %+v", done)
+		}
+	})
+
+	t.Run("StatusRemoteSuccessThenJobSaveFailureNoDuplicateOnRetry", func(t *testing.T) {
+		e := newPubEnv(t)
+		fs := &faultStore{JobStore: e.store, updateJob: func(*Job) error { return errors.New("job save failure") }}
+		if _, err := NewPublication(fs, e.gh).PublishStatus(ctx, e.job, "queued"); err == nil || !errors.Is(err, ErrPublicationPersistence) {
+			t.Fatalf("want persistence error, got %v", err)
+		}
+		e.reopen()
+		if _, err := NewPublication(e.store, e.gh).PublishStatus(ctx, e.job, "running"); err != nil {
+			t.Fatal(err)
+		}
+		if e.fake.posts.Load() != 1 || e.fake.count() != 1 {
+			t.Fatalf("duplicate status comment: posts=%d", e.fake.posts.Load())
+		}
+	})
+
+	t.Run("ForeignKnownIDIsNeverEdited", func(t *testing.T) {
+		e := newPubEnv(t)
+		e.fake.comments[900] = pubComment{body: "<!-- pr-review-status:" + e.job.ID + " -->", uid: 7}
+		e.job.StatusCommentID = 900
+		if _, err := NewPublication(e.store, e.gh).PublishStatus(ctx, e.job, "queued"); err != nil {
+			t.Fatal(err)
+		}
+		if e.fake.patches.Load() != 0 {
+			t.Fatal("foreign comment was edited")
+		}
+	})
+
+	t.Run("StoreCommitRejectsStaleGenerationAtomically", func(t *testing.T) {
+		e := newPubEnv(t)
+		in := e.saveReview("body")
+		st, _ := e.store.GetPRState(ctx, e.prKey)
+		st.Generation = e.job.Generation + 1
+		st.ActiveJobID, st.PendingAutoJobID, st.HasReservedSuccessor = "active-x", "pending-y", true
+		if err := e.store.UpdatePRState(ctx, st); err != nil {
+			t.Fatal(err)
+		}
+		job := *e.job
+		job.Status = "completed"
+		in.Status = "completed"
+		stale := &PRState{PRKey: e.prKey, LastReviewedHead: pubHeadSHA}
+		if err := e.store.CommitPublicationOutcome(ctx, in, &job, stale); !errors.Is(err, ErrGenerationChanged) {
+			t.Fatalf("want ErrGenerationChanged, got %v", err)
+		}
+		e.reopen()
+		if e.job.Status == "completed" {
+			t.Fatal("job committed despite rejected transaction")
+		}
+		got, _ := e.store.GetOutputIntent(ctx, in.Marker)
+		if got.Status == "completed" {
+			t.Fatal("intent committed despite rejected transaction")
+		}
+		after, _ := e.store.GetPRState(ctx, e.prKey)
+		if after.LastReviewedHead != "" || after.ActiveJobID != "active-x" || after.PendingAutoJobID != "pending-y" || !after.HasReservedSuccessor {
+			t.Fatalf("pr state clobbered: %+v", after)
+		}
+		// Same-generation commit preserves successor fields while setting LastReviewedHead.
+		st.Generation = e.job.Generation
+		_ = e.store.UpdatePRState(ctx, st)
+		if err := e.store.CommitPublicationOutcome(ctx, in, &job, stale); err != nil {
+			t.Fatal(err)
+		}
+		after, _ = e.store.GetPRState(ctx, e.prKey)
+		if after.LastReviewedHead != pubHeadSHA || after.ActiveJobID != "active-x" || after.PendingAutoJobID != "pending-y" {
+			t.Fatalf("pr state after commit: %+v", after)
+		}
+	})
+}
+
+func TestPublicationHeadRecovery(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("UnverifiedFinalHeadStaysUncertainThenRecovers", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			code int
+			sha  string
+		}{{"503", 503, ""}, {"blank", 200, ""}, {"malformed", 200, "not-a-sha"}} {
+			t.Run(tc.name, func(t *testing.T) {
+				e := newPubEnv(t)
+				e.fake.headFn = func(n int32) (int, string) {
+					if n >= 2 {
+						return tc.code, tc.sha
+					}
+					return 200, pubHeadSHA
+				}
+				in := e.saveReview("## Review A")
+				res, _ := NewPublication(e.store, e.gh).ReconcileOutput(ctx, in)
+				if res.Status != "uncertain" || res.Error == nil {
+					t.Fatalf("want uncertain, got %+v", res)
+				}
+				e.reopen()
+				if e.job.Status == "completed" || e.job.FinishedAt != nil {
+					t.Fatalf("job terminal despite unverified head: %s", e.job.Status)
+				}
+				saved, _ := e.store.GetOutputIntent(ctx, in.Marker)
+				if saved.Status == "completed" || saved.CommentID == 0 || saved.Body != "## Review A" || saved.Marker != in.Marker {
+					t.Fatalf("saved output not retained: %+v", saved)
+				}
+				if st, _ := e.store.GetPRState(ctx, e.prKey); st.LastReviewedHead != "" {
+					t.Fatalf("LastReviewedHead set without verification: %q", st.LastReviewedHead)
+				}
+				// Head endpoint recovers: real executor completes with zero generation.
+				e.fake.headFn = func(int32) (int, string) { return 200, pubHeadSHA }
+				exec, _ := e.executor()
+				if err := exec.executeReviewJob(ctx, e.job); err != nil {
+					t.Fatal(err)
+				}
+				if e.jobStatus() != "completed" || e.fake.posts.Load() != 1 || e.fake.count() != 1 || e.fake.unknown.Load() != 0 {
+					t.Fatalf("recovery: job=%s posts=%d comments=%d unknown=%d", e.jobStatus(), e.fake.posts.Load(), e.fake.count(), e.fake.unknown.Load())
+				}
+				if st, _ := e.store.GetPRState(ctx, e.prKey); st.LastReviewedHead != pubHeadSHA {
+					t.Fatalf("LastReviewedHead=%q", st.LastReviewedHead)
+				}
+			})
+		}
+	})
+
+	t.Run("ForeignOwnerCommentNeverAdoptedOrEdited", func(t *testing.T) {
+		e := newPubEnv(t)
+		in := e.saveReview("## Review")
+		e.fake.comments[900] = pubComment{body: in.Marker + " forged", uid: 7}
+		in.CommentID = 900
+		_ = e.store.SaveOutputIntent(ctx, in)
+		res, _ := NewPublication(e.store, e.gh).ReconcileOutput(ctx, in)
+		if res.Status != "completed" || res.CommentID == 900 || e.fake.patches.Load() != 0 {
+			t.Fatalf("foreign comment adopted/edited: %+v patches=%d", res, e.fake.patches.Load())
+		}
+	})
+
+	t.Run("IncompleteScanWritesNothing", func(t *testing.T) {
+		e := newPubEnv(t)
+		in := e.saveReview("## Review")
+		e.fake.listFail.Store(true)
+		res, _ := NewPublication(e.store, e.gh).ReconcileOutput(ctx, in)
+		if res.Status != "uncertain" || e.fake.posts.Load() != 0 || e.jobStatus() == "completed" {
+			t.Fatalf("scan failure: %+v posts=%d", res, e.fake.posts.Load())
+		}
+	})
+
+	t.Run("HeadMovedFailedSupersededEditRecoversWithMarkerAndSuccessor", func(t *testing.T) {
+		e := newPubEnv(t)
+		e.fake.headFn = func(n int32) (int, string) {
+			if n >= 2 {
+				return 200, pubNewHead
+			}
+			return 200, pubHeadSHA
+		}
+		e.fake.patchFail.Store(true)
+		in := e.saveReview("## Review of commit A")
+		res, _ := NewPublication(e.store, e.gh).ReconcileOutput(ctx, in)
+		if res.Status != "uncertain" {
+			t.Fatalf("failed superseded edit must be uncertain, got %s", res.Status)
+		}
+		e.reopen()
+		saved, _ := e.store.GetOutputIntent(ctx, in.Marker)
+		if saved.CommentID == 0 || saved.SupersededBody == "" || !strings.Contains(saved.SupersededBody, in.Marker) || saved.SupersededDigest == "" {
+			t.Fatalf("superseded transition not saved: %+v", saved)
+		}
+		if e.job.Status == "superseded" || e.job.Status == "completed" {
+			t.Fatalf("job terminal despite failed edit: %s", e.job.Status)
+		}
+		e.fake.patchFail.Store(false)
+		exec, _ := e.executor()
+		if err := exec.executeReviewJob(ctx, e.job); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := e.fake.patchBody.Load().(string)
+		if !strings.Contains(body, in.Marker) || !strings.Contains(body, "superseded") {
+			t.Fatalf("superseded body lacks marker/note: %q", body)
+		}
+		if e.fake.posts.Load() != 1 || e.fake.count() != 1 || e.fake.unknown.Load() != 0 {
+			t.Fatalf("posts=%d comments=%d unknown=%d", e.fake.posts.Load(), e.fake.count(), e.fake.unknown.Load())
+		}
+		if e.jobStatus() != "superseded" {
+			t.Fatalf("job=%s", e.jobStatus())
+		}
+		queued, _ := e.store.ListQueuedJobs(ctx)
+		found := false
+		for _, q := range queued {
+			if q.HeadSHA == pubNewHead && q.Trigger == "automatic" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("no durable latest-head successor scheduled")
+		}
+		if st, _ := e.store.GetPRState(ctx, e.prKey); st.LastReviewedHead != "" {
+			t.Fatalf("old analysis recorded as reviewed head: %q", st.LastReviewedHead)
+		}
+	})
+
+	t.Run("TerminalCommitFailureLeavesNothingCompleted", func(t *testing.T) {
+		e := newPubEnv(t)
+		fs := &faultStore{JobStore: e.store, commitOutcome: func(*OutputIntent, *Job, *PRState) error { return errors.New("tx failure") }}
+		in := e.saveReview("## Review")
+		res, _ := NewPublication(fs, e.gh).ReconcileOutput(ctx, in)
+		if res.Status != "uncertain" {
+			t.Fatalf("got %s", res.Status)
+		}
+		e.reopen()
+		saved, _ := e.store.GetOutputIntent(ctx, in.Marker)
+		if e.job.Status == "completed" || saved.Status == "completed" {
+			t.Fatalf("partial terminal state: job=%s intent=%s", e.job.Status, saved.Status)
+		}
+		if st, _ := e.store.GetPRState(ctx, e.prKey); st.LastReviewedHead != "" {
+			t.Fatal("LastReviewedHead advanced")
+		}
+	})
+
+	t.Run("GenerationMovesDuringFinalCommitCannotCommitStaleSuccess", func(t *testing.T) {
+		e := newPubEnv(t)
+		fs := &faultStore{JobStore: e.store}
+		fs.commitOutcome = func(i *OutputIntent, j *Job, p *PRState) error {
+			st, _ := e.store.GetPRState(ctx, e.prKey)
+			st.Generation = j.Generation + 5
+			return e.store.UpdatePRState(ctx, st)
+		}
+		in := e.saveReview("## Review")
+		res, _ := NewPublication(fs, e.gh).ReconcileOutput(ctx, in)
+		if res.Status != "uncertain" || e.jobStatus() == "completed" {
+			t.Fatalf("stale success committed: %s job=%s", res.Status, e.jobStatus())
+		}
+		if st, _ := e.store.GetPRState(ctx, e.prKey); st.LastReviewedHead != "" {
+			t.Fatal("LastReviewedHead set from stale generation")
+		}
+	})
+
+	t.Run("SupersededCommitFailureKeepsJobNonterminal", func(t *testing.T) {
+		e := newPubEnv(t)
+		e.fake.headFn = func(n int32) (int, string) {
+			if n >= 2 {
+				return 200, pubNewHead
+			}
+			return 200, pubHeadSHA
+		}
+		fs := &faultStore{JobStore: e.store, commitSuperseded: func(*OutputIntent, *Job) error { return errors.New("successor save failure") }}
+		in := e.saveReview("## Review")
+		res, _ := NewPublication(fs, e.gh).ReconcileOutput(ctx, in)
+		if res.Status != "uncertain" || e.jobStatus() == "superseded" {
+			t.Fatalf("terminal job without durable successor: %s job=%s", res.Status, e.jobStatus())
+		}
+	})
 }

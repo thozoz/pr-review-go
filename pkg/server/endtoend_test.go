@@ -55,6 +55,7 @@ func makeGitHubHandler(
 	headProvider func() string,
 	postCommentCallback func(body string),
 ) http.HandlerFunc {
+	var lastBody atomic.Value // last body written to the fake owned comment
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		path := r.URL.Path
@@ -73,6 +74,7 @@ func makeGitHubHandler(
 		if r.Method == http.MethodPost && strings.Contains(path, "/comments") {
 			var b map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&b)
+			lastBody.Store(b["body"])
 			if postCommentCallback != nil {
 				postCommentCallback(b["body"])
 			}
@@ -82,6 +84,7 @@ func makeGitHubHandler(
 		if (r.Method == http.MethodPatch || r.Method == http.MethodPost) && strings.Contains(path, "/issues/comments/") {
 			var b map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&b)
+			lastBody.Store(b["body"])
 			if postCommentCallback != nil {
 				postCommentCallback(b["body"])
 			}
@@ -89,7 +92,8 @@ func makeGitHubHandler(
 			return
 		}
 		if r.Method == http.MethodGet && strings.Contains(path, "/issues/comments/") {
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001, "body": "existing comment"})
+			body, _ := lastBody.Load().(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001, "body": body, "user": map[string]any{"id": 1001, "login": "test-bot"}})
 			return
 		}
 		if strings.Contains(path, "/comments") {
@@ -496,6 +500,7 @@ func TestWebhookEndToEnd(t *testing.T) {
 		}))
 		defer llmServer.Close()
 
+		var statusBody atomic.Value
 		ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			path := r.URL.Path
@@ -513,6 +518,7 @@ func TestWebhookEndToEnd(t *testing.T) {
 				atomic.AddInt32(&createdStatusComments, 1)
 				var b map[string]string
 				_ = json.NewDecoder(r.Body).Decode(&b)
+				statusBody.Store(b["body"])
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": 4001, "body": b["body"]})
 				return
 			}
@@ -520,11 +526,13 @@ func TestWebhookEndToEnd(t *testing.T) {
 				atomic.AddInt32(&editedStatusComments, 1)
 				var b map[string]string
 				_ = json.NewDecoder(r.Body).Decode(&b)
+				statusBody.Store(b["body"])
 				_ = json.NewEncoder(w).Encode(map[string]any{"id": 4001, "body": b["body"]})
 				return
 			}
 			if r.Method == http.MethodGet && strings.Contains(path, "/issues/comments/") {
-				_ = json.NewEncoder(w).Encode(map[string]any{"id": 4001, "body": "status"})
+				body, _ := statusBody.Load().(string)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 4001, "body": body, "user": map[string]any{"id": 1001, "login": "test-bot"}})
 				return
 			}
 			if strings.Contains(path, "/comments") {

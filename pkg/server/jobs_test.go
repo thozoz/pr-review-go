@@ -92,6 +92,18 @@ func TestWebhookDurableTracer(t *testing.T) {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/issues/comments/"):
+			commentMu.Lock()
+			last := ""
+			if n := len(createdComments); n > 0 {
+				last = createdComments[n-1]
+			}
+			if n := len(editedComments); n > 0 {
+				last = editedComments[n-1]
+			}
+			commentMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1001, "body": last, "user": map[string]any{"id": 1001, "login": "test-bot"}})
 		case strings.Contains(r.URL.Path, "/issues/comments/"):
 			commentMu.Lock()
 			var bodyMap map[string]string
