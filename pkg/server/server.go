@@ -43,6 +43,7 @@ type Server struct {
 
 	store        JobStore
 	scheduler    *Scheduler
+	statusOutbox *StatusOutbox
 	runtimeReady bool
 	shuttingDown bool
 	runtimeErr   error
@@ -142,6 +143,13 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
+	if s.statusOutbox == nil && s.store != nil && s.gh != nil {
+		s.statusOutbox = NewStatusOutbox(s.store, s.gh, NewPublication(s.store, s.gh))
+	}
+	if s.statusOutbox != nil {
+		s.statusOutbox.Start(ctx)
+	}
+
 	s.runtimeReady = true
 	s.runtimeErr = nil
 	return nil
@@ -185,6 +193,10 @@ func (s *Server) ensureStore() error {
 		}
 		s.scheduler = NewScheduler(store, executor, workers)
 	}
+	if s.statusOutbox == nil && store != nil && s.gh != nil {
+		s.statusOutbox = NewStatusOutbox(store, s.gh, NewPublication(store, s.gh))
+		s.statusOutbox.Start(context.Background())
+	}
 	return s.scheduler.Start(context.Background())
 }
 
@@ -201,6 +213,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	var shutdownErr error
+	if s.statusOutbox != nil {
+		s.statusOutbox.Stop()
+	}
 	if s.scheduler != nil {
 		if err := s.scheduler.Shutdown(ctx); err != nil {
 			shutdownErr = err
@@ -527,6 +542,9 @@ func (s *Server) handlePullRequestWebhook(ctx context.Context, w http.ResponseWr
 		if s.scheduler != nil {
 			s.scheduler.Wake()
 		}
+		if s.statusOutbox != nil {
+			s.statusOutbox.Wake()
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"accepted"}`))
 	case AdmitDuplicate:
@@ -637,6 +655,9 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 	case AdmitAccepted:
 		if s.scheduler != nil {
 			s.scheduler.Wake()
+		}
+		if s.statusOutbox != nil {
+			s.statusOutbox.Wake()
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"accepted"}`))

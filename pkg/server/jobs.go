@@ -168,6 +168,12 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		}
 	}
 
+	if job.StatusCommentID == 0 {
+		if fresh, err := e.store.GetJob(ctx, job.ID); err == nil && fresh != nil && fresh.StatusCommentID > 0 {
+			job.StatusCommentID = fresh.StatusCommentID
+		}
+	}
+
 	// 2. Status comment: check if fresh rerun on already reviewed head
 	isRerun := (job.Trigger == "explicit" && prState != nil && prState.LastReviewedHead == job.HeadSHA)
 	var initialStatusBody string
@@ -177,8 +183,10 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		initialStatusBody = "⏳ Review queued; waiting for capacity"
 	}
 
-	if err := e.publishStatus(ctx, pub, job, initialStatusBody); err != nil {
-		return err
+	if job.StatusCommentID == 0 || isRerun {
+		if err := e.publishStatus(ctx, pub, job, initialStatusBody); err != nil {
+			return err
+		}
 	}
 	if !isRerun {
 		// Transition status comment to running
@@ -282,7 +290,11 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 // job (nonterminal, preserved for recovery); remote-only status failures are
 // logged since the comment is cosmetic and the saved intent keeps it recoverable.
 func (e *ServerJobExecutor) publishStatus(ctx context.Context, pub *Publication, job *Job, text string) error {
-	if _, err := pub.PublishStatus(ctx, job, text); err != nil {
+	id, err := pub.PublishStatus(ctx, job, text)
+	if id > 0 {
+		job.StatusCommentID = id
+	}
+	if err != nil {
 		if errors.Is(err, ErrPublicationPersistence) {
 			log.Printf("[jobs] Status publication ledger failure for %s: %v", job.ID, err)
 			return err

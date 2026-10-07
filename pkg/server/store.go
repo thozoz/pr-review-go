@@ -218,6 +218,7 @@ type JobStore interface {
 	ClaimNextJob(ctx context.Context, activePRs map[string]bool) (*Job, error)
 	ReleasePR(ctx context.Context, prKey PRKey) error
 	ScheduleSuccessorReview(ctx context.Context, prKey PRKey, owner, repo string, prNum int, baseSHA, headSHA string) (*Job, error)
+	ListPendingStatusIntents(ctx context.Context, limit int) ([]*OutputIntent, error)
 }
 
 type BoltJobStore struct {
@@ -322,6 +323,44 @@ func (s *BoltJobStore) initSchema() error {
 		for _, bName := range [][]byte{bucketDeliveries, bucketJobs, bucketPRs, bucketIntents, bucketCounters, bucketComments} {
 			if _, err := tx.CreateBucketIfNotExists(bName); err != nil {
 				return err
+			}
+		}
+
+		// Repair missing queued status intents for legacy queued review jobs
+		jobsB := tx.Bucket(bucketJobs)
+		intentsB := tx.Bucket(bucketIntents)
+		if jobsB != nil && intentsB != nil {
+			c := jobsB.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var j Job
+				if err := json.Unmarshal(v, &j); err != nil {
+					continue
+				}
+				if j.Status == "queued" && j.Kind == "review" {
+					marker := fmt.Sprintf("<!-- pr-review-status:%s -->", j.ID)
+					if intentsB.Get([]byte(marker)) == nil {
+						bodyWithMarker := fmt.Sprintf("⏳ Review queued; waiting for capacity\n\n%s", marker)
+						h := sha256.Sum256([]byte(bodyWithMarker))
+						statusIntent := OutputIntent{
+							Marker:     marker,
+							JobID:      j.ID,
+							Action:     "status",
+							PRKey:      j.PRKey,
+							Owner:      j.Owner,
+							Repo:       j.Repo,
+							PRNumber:   j.PRNumber,
+							ExactHead:  j.HeadSHA,
+							Body:       bodyWithMarker,
+							BodyDigest: hex.EncodeToString(h[:]),
+							Status:     "pending",
+							CreatedAt:  time.Now().UTC(),
+							UpdatedAt:  time.Now().UTC(),
+						}
+						if raw, err := json.Marshal(&statusIntent); err == nil {
+							_ = intentsB.Put([]byte(marker), raw)
+						}
+					}
+				}
 			}
 		}
 		return nil
@@ -556,6 +595,19 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 						_ = prsBucket.Put(prStateKey, updatedPRBytes)
 					}
 				}
+
+				// Coalescing updates that same queued intent/head instead of creating another status record
+				marker := fmt.Sprintf("<!-- pr-review-status:%s -->", target.job.ID)
+				if raw := tx.Bucket(bucketIntents).Get([]byte(marker)); raw != nil {
+					var in OutputIntent
+					if err := json.Unmarshal(raw, &in); err == nil {
+						in.ExactHead = job.HeadSHA
+						in.UpdatedAt = time.Now().UTC()
+						if updatedRaw, err := json.Marshal(&in); err == nil {
+							_ = tx.Bucket(bucketIntents).Put([]byte(marker), updatedRaw)
+						}
+					}
+				}
 				continue
 			}
 
@@ -580,6 +632,34 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 			binary.BigEndian.PutUint64(jobKey, seq)
 			if err := jobsBucket.Put(jobKey, jobBytes); err != nil {
 				return err
+			}
+
+			if job.Kind == "review" {
+				marker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
+				bodyWithMarker := fmt.Sprintf("⏳ Review queued; waiting for capacity\n\n%s", marker)
+				h := sha256.Sum256([]byte(bodyWithMarker))
+				statusIntent := OutputIntent{
+					Marker:     marker,
+					JobID:      job.ID,
+					Action:     "status",
+					PRKey:      job.PRKey,
+					Owner:      job.Owner,
+					Repo:       job.Repo,
+					PRNumber:   job.PRNumber,
+					ExactHead:  job.HeadSHA,
+					Body:       bodyWithMarker,
+					BodyDigest: hex.EncodeToString(h[:]),
+					Status:     "pending",
+					CreatedAt:  time.Now().UTC(),
+					UpdatedAt:  time.Now().UTC(),
+				}
+				intentRaw, err := json.Marshal(&statusIntent)
+				if err != nil {
+					return err
+				}
+				if err := tx.Bucket(bucketIntents).Put([]byte(marker), intentRaw); err != nil {
+					return err
+				}
 			}
 
 			if job.Trigger == "automatic" && job.Kind == "review" {
@@ -826,6 +906,42 @@ func (s *BoltJobStore) GetOutputIntent(ctx context.Context, marker string) (*Out
 
 func (s *BoltJobStore) UpdateOutputIntent(ctx context.Context, intent *OutputIntent) error {
 	return s.SaveOutputIntent(ctx, intent)
+}
+
+// ListPendingStatusIntents returns up to limit pending status output intents.
+func (s *BoltJobStore) ListPendingStatusIntents(ctx context.Context, limit int) ([]*OutputIntent, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return nil, ErrStoreClosed
+	}
+
+	var results []*OutputIntent
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketIntents)
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var in OutputIntent
+			if err := json.Unmarshal(v, &in); err != nil {
+				continue
+			}
+			if in.Action == "status" && in.Status == "pending" {
+				copyIn := in
+				results = append(results, &copyIn)
+				if len(results) >= limit {
+					break
+				}
+			}
+		}
+		return nil
+	})
+	return results, err
 }
 
 // RecoverJobs inspects uncompleted jobs on startup and sets their recovery phase:
@@ -1351,6 +1467,20 @@ func scheduleSuccessorTx(tx *bbolt.Tx, prKey PRKey, owner, repo string, prNum in
 					if err := prsBucket.Put(prKeyBytes, stBytes); err != nil {
 						return err
 					}
+
+					// Update status intent head
+					marker := fmt.Sprintf("<!-- pr-review-status:%s -->", j.ID)
+					if raw := tx.Bucket(bucketIntents).Get([]byte(marker)); raw != nil {
+						var in OutputIntent
+						if err := json.Unmarshal(raw, &in); err == nil {
+							in.ExactHead = headSHA
+							in.UpdatedAt = time.Now().UTC()
+							if updatedRaw, err := json.Marshal(&in); err == nil {
+								_ = tx.Bucket(bucketIntents).Put([]byte(marker), updatedRaw)
+							}
+						}
+					}
+
 					copyJob := j
 					scheduled = &copyJob
 					return nil
@@ -1390,6 +1520,28 @@ func scheduleSuccessorTx(tx *bbolt.Tx, prKey PRKey, owner, repo string, prNum in
 		binary.BigEndian.PutUint64(jobKey, seq)
 		if err := jobsBucket.Put(jobKey, jobBytes); err != nil {
 			return err
+		}
+
+		marker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
+		bodyWithMarker := fmt.Sprintf("⏳ Review queued; waiting for capacity\n\n%s", marker)
+		h := sha256.Sum256([]byte(bodyWithMarker))
+		statusIntent := OutputIntent{
+			Marker:     marker,
+			JobID:      job.ID,
+			Action:     "status",
+			PRKey:      job.PRKey,
+			Owner:      job.Owner,
+			Repo:       job.Repo,
+			PRNumber:   job.PRNumber,
+			ExactHead:  job.HeadSHA,
+			Body:       bodyWithMarker,
+			BodyDigest: hex.EncodeToString(h[:]),
+			Status:     "pending",
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}
+		if intentRaw, err := json.Marshal(&statusIntent); err == nil {
+			_ = tx.Bucket(bucketIntents).Put([]byte(marker), intentRaw)
 		}
 
 		state.PendingAutoJobID = job.ID

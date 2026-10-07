@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v68/github"
@@ -19,8 +20,9 @@ import (
 // are persisted before external writes, and ambiguous writes are safely reconciled
 // without duplicating comments or repeating expensive LLM review generation.
 type Publication struct {
-	store JobStore
-	gh    *ghclient.Client
+	store       JobStore
+	gh          *ghclient.Client
+	markerLocks sync.Map
 }
 
 // NewPublication creates a new Publication reconciler.
@@ -110,6 +112,22 @@ func (p *Publication) PublishStatus(ctx context.Context, job *Job, statusText st
 	}
 
 	marker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
+	val, _ := p.markerLocks.LoadOrStore(marker, &sync.Mutex{})
+	mu := val.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if job.StatusCommentID == 0 {
+		if curJob, err := p.store.GetJob(ctx, job.ID); err == nil && curJob != nil && curJob.StatusCommentID > 0 {
+			job.StatusCommentID = curJob.StatusCommentID
+		}
+	}
+	if job.StatusCommentID == 0 {
+		if existingIntent, err := p.store.GetOutputIntent(ctx, marker); err == nil && existingIntent != nil && existingIntent.CommentID > 0 {
+			job.StatusCommentID = existingIntent.CommentID
+		}
+	}
+
 	bodyWithMarker := statusText
 	if !strings.Contains(bodyWithMarker, marker) {
 		bodyWithMarker = fmt.Sprintf("%s\n\n%s", statusText, marker)

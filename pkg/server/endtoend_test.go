@@ -1224,3 +1224,228 @@ func TestWebhookEndToEnd(t *testing.T) {
 		srv.Shutdown(shutdownCtx)
 	})
 }
+
+func TestWebhookQueuedWhileBusy(t *testing.T) {
+	const (
+		secret  = "test-webhook-secret-32-bytes-long!"
+		repoID  = 1234
+		shaBase = "0000000000000000000000000000000000000000"
+		shaPR1  = "1111111111111111111111111111111111111111"
+		shaPR2  = "2222222222222222222222222222222222222222"
+		shaPR3  = "3333333333333333333333333333333333333333"
+	)
+
+	workerBarrier := make(chan struct{})
+	var (
+		pr3LLMCalls      atomic.Int32
+		pr3QueuedPosted  atomic.Int32
+		pr3RunningEdited atomic.Int32
+	)
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		isPR3 := false
+		for _, m := range req.Messages {
+			if strings.Contains(m.Content, shaPR3) {
+				isPR3 = true
+				break
+			}
+		}
+
+		if !isPR3 {
+			// Workers 1 and 2 block on barrier
+			<-workerBarrier
+		} else {
+			pr3LLMCalls.Add(1)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{Message: llm.ChatMessage{Role: "assistant", Content: `{"score": 90, "summary": "OK", "findings": []}`}},
+			},
+		})
+	}))
+	defer llmServer.Close()
+
+	var (
+		commentsMu sync.Mutex
+		comments   = make(map[int64]string)
+		nextCID    int64 = 3000
+	)
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+
+		if r.URL.Path == "/user" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "login": "test-bot"})
+			return
+		}
+		if strings.Contains(path, "/collaborators/") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"permission": "write"})
+			return
+		}
+		if strings.Contains(path, "/compare/") {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/f.go b/f.go\n+1\n"))
+			return
+		}
+		if r.Method == http.MethodPost && strings.Contains(path, "/issues/") && strings.Contains(path, "/comments") {
+			var b map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			commentsMu.Lock()
+			nextCID++
+			cid := nextCID
+			comments[cid] = b["body"]
+			commentsMu.Unlock()
+			if strings.Contains(path, "/issues/30/comments") && strings.Contains(b["body"], "waiting for capacity") {
+				pr3QueuedPosted.Add(1)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": cid, "body": b["body"], "user": map[string]any{"id": 100, "login": "test-bot"}})
+			return
+		}
+		if (r.Method == http.MethodPatch || r.Method == http.MethodPost) && strings.Contains(path, "/issues/comments/") {
+			parts := strings.Split(path, "/")
+			idStr := parts[len(parts)-1]
+			var cid int64
+			_, _ = fmt.Sscanf(idStr, "%d", &cid)
+			var b map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			commentsMu.Lock()
+			comments[cid] = b["body"]
+			commentsMu.Unlock()
+			if strings.Contains(b["body"], "Review running") {
+				pr3RunningEdited.Add(1)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": cid, "body": b["body"], "user": map[string]any{"id": 100, "login": "test-bot"}})
+			return
+		}
+		if r.Method == http.MethodGet && strings.Contains(path, "/issues/comments/") {
+			parts := strings.Split(path, "/")
+			idStr := parts[len(parts)-1]
+			var cid int64
+			_, _ = fmt.Sscanf(idStr, "%d", &cid)
+			commentsMu.Lock()
+			body := comments[cid]
+			commentsMu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": cid, "body": body, "user": map[string]any{"id": 100, "login": "test-bot"}})
+			return
+		}
+		if strings.Contains(path, "/comments") {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		if strings.Contains(path, "/pulls/10") {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 10, "title": "P10", "body": "B",
+				"head": map[string]any{"sha": shaPR1, "ref": "f1"},
+				"base": map[string]any{"sha": shaBase, "ref": "main"},
+				"user": map[string]any{"login": "alice"},
+			})
+			return
+		}
+		if strings.Contains(path, "/pulls/20") {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 20, "title": "P20", "body": "B",
+				"head": map[string]any{"sha": shaPR2, "ref": "f2"},
+				"base": map[string]any{"sha": shaBase, "ref": "main"},
+				"user": map[string]any{"login": "bob"},
+			})
+			return
+		}
+		if strings.Contains(path, "/pulls/30") {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 30, "title": "P30", "body": "B",
+				"head": map[string]any{"sha": shaPR3, "ref": "f3"},
+				"base": map[string]any{"sha": shaBase, "ref": "main"},
+				"user": map[string]any{"login": "charlie"},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ghServer.Close()
+
+	cfg := &config.Config{
+		Port:                 3000,
+		WebhookSecret:        secret,
+		WebhookStateDir:      t.TempDir(),
+		WebhookWorkers:       2,
+		WebhookBacklog:       10,
+		WebhookDeliveryTTL:   24 * time.Hour,
+		WebhookDeliveryLimit: 100,
+		WebhookStateMaxBytes: 16777216,
+		WebhookBodyMaxBytes:  1048576,
+		EffortLevel:          "lite",
+		EnableSandbox:        false,
+		LLMBaseURL:           llmServer.URL,
+		LLMAPIKey:            "test-key",
+		LLMModel:             "test-model",
+		GitHubToken:          "test-token",
+		AutoActions:          []string{"review"},
+	}
+
+	ghClient, _ := ghclient.NewTestClient(ghServer.URL)
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	srv := NewServerWithClients(cfg, ghClient, llmClient)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// Admit PR 10 and PR 20; both occupy the 2 workers
+	r1 := sendSignedWebhook(srv.Routes(), secret, "pull_request", "deliv-pr-10", makePROpenedPayload(repoID, 10, shaBase, shaPR1, "alice"))
+	if r1.Code != http.StatusOK {
+		t.Fatalf("pr 10 admit: %d", r1.Code)
+	}
+	r2 := sendSignedWebhook(srv.Routes(), secret, "pull_request", "deliv-pr-20", makePROpenedPayload(repoID, 20, shaBase, shaPR2, "bob"))
+	if r2.Code != http.StatusOK {
+		t.Fatalf("pr 20 admit: %d", r2.Code)
+	}
+
+	// Wait briefly for both workers to pick up PR 10 and PR 20 and block in LLM
+	time.Sleep(150 * time.Millisecond)
+
+	// Now admit PR 30 while all workers are busy!
+	r3 := sendSignedWebhook(srv.Routes(), secret, "pull_request", "deliv-pr-30", makePROpenedPayload(repoID, 30, shaBase, shaPR3, "charlie"))
+	if r3.Code != http.StatusOK {
+		t.Fatalf("pr 30 admit: %d", r3.Code)
+	}
+
+	// PR 30 should receive queued status through StatusOutbox BEFORE workers are released!
+	for i := 0; i < 50; i++ {
+		if pr3QueuedPosted.Load() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if pr3QueuedPosted.Load() != 1 {
+		t.Fatalf("expected PR 30 to receive queued status while workers are busy; got %d", pr3QueuedPosted.Load())
+	}
+
+	// Assert zero PR 30 LLM calls occurred while workers are busy
+	if calls := pr3LLMCalls.Load(); calls != 0 {
+		t.Fatalf("expected zero PR 30 LLM calls while workers are busy; got %d", calls)
+	}
+
+	// Release workers
+	close(workerBarrier)
+
+	// Wait for PR 30 to run and edit the status comment
+	for i := 0; i < 100; i++ {
+		if pr3RunningEdited.Load() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if pr3RunningEdited.Load() < 1 {
+		t.Fatalf("expected PR 30 status comment to be edited across running transition; got %d", pr3RunningEdited.Load())
+	}
+}
