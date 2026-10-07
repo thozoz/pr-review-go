@@ -1,0 +1,35 @@
+# Stage 1: Build the trusted sandbox helper binary
+FROM golang:1.26-alpine AS helper-builder
+
+WORKDIR /build
+COPY go.mod go.sum* ./
+RUN go mod download 2>/dev/null || true
+COPY cmd/pr-review-sandbox-helper cmd/pr-review-sandbox-helper
+COPY pkg/sandbox pkg/sandbox
+COPY pkg/config pkg/config
+
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /usr/local/bin/pr-review-sandbox-helper ./cmd/pr-review-sandbox-helper
+
+# Stage 2: Runtime image containing trusted Go toolchain, git, and sandbox helper
+FROM golang:1.26-alpine
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+COPY --from=helper-builder /usr/local/bin/pr-review-sandbox-helper /usr/local/bin/pr-review-sandbox-helper
+RUN chmod 755 /usr/local/bin/pr-review-sandbox-helper
+
+# Enforce clean git environment: no system gitconfig, no hooks
+ENV GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_TEMPLATE_DIR=/dev/null \
+    GOPROXY=off \
+    GOTOOLCHAIN=local \
+    GOVCS=off \
+    GOWORK=off \
+    GOENV=off \
+    HOME=/tmp \
+    TMPDIR=/tmp
+
+USER 1000:1000
+WORKDIR /work

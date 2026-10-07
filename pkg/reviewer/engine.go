@@ -33,6 +33,10 @@ func NewEngine(cfg *config.Config) *Engine {
 	}
 }
 
+func (e *Engine) SetSandbox(s *sandbox.Runner) {
+	e.sandbox = s
+}
+
 func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (*ReviewReport, error) {
 	// 1. Fetch PR details
 	pr, err := e.gh.GetPR(ctx, owner, repo, number)
@@ -61,11 +65,11 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	// 4. Sandbox Verification (Optional/Configurable)
 	var verificationSummary = "Sandbox verification skipped."
 	sandboxVerified := false
-	if e.cfg.EnableSandbox {
-		workDir, cleanup, err := e.sandbox.PrepareWorkspace(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+	if e.cfg.EnableSandbox && e.sandbox != nil {
+		snapshot, cleanup, err := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 		if err == nil {
 			defer cleanup()
-			verReport, err := e.sandbox.VerifyProject(ctx, workDir)
+			verReport, err := e.sandbox.RunSnapshot(ctx, snapshot)
 			if err == nil {
 				verificationSummary = verReport.Summary
 				if verReport.Status == sandbox.StatusPassed {

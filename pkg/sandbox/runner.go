@@ -68,9 +68,11 @@ type VerificationReport struct {
 
 // Snapshot owns the immutable repository snapshot and its complete identity manifest.
 type Snapshot struct {
-	CommitSHA string            `json:"commit_sha"`
-	SourceDir string            `json:"source_dir"`
-	Manifest  map[string]string `json:"manifest,omitempty"` // path -> sha256
+	CommitSHA        string            `json:"commit_sha"`
+	SourceDir        string            `json:"source_dir"`
+	Manifest         map[string]string `json:"manifest,omitempty"` // path -> sha256
+	IsIncomplete     bool              `json:"is_incomplete,omitempty"`
+	IncompleteReason string            `json:"incomplete_reason,omitempty"`
 }
 
 // Validate ensures the snapshot has a complete, valid commit SHA and a clean source tree.
@@ -144,14 +146,15 @@ func (s *Snapshot) Validate() error {
 
 // SourceProvider is the typed seam for repository source retrieval.
 type SourceProvider interface {
-	PrepareSource(ctx context.Context, cloneURL, headRef, headSHA string) (*Snapshot, error)
+	PrepareSource(ctx context.Context, cloneURL, headRef, headSHA string) (*Snapshot, func(), error)
 }
 
 type Runner struct {
-	Timeout     time.Duration
-	Config      *config.Config
-	Backend     *PodmanBackend
-	SlotManager SlotManager
+	Timeout        time.Duration
+	Config         *config.Config
+	Backend        *PodmanBackend
+	SlotManager    SlotManager
+	SourceProvider SourceProvider
 }
 
 func NewRunner(timeout time.Duration) *Runner {
@@ -168,12 +171,16 @@ func NewRunnerWithConfig(cfg *config.Config, backend *PodmanBackend, sm SlotMana
 	if cfg != nil && cfg.SandboxTimeoutExecution > 0 {
 		timeout = cfg.SandboxTimeoutExecution
 	}
-	return &Runner{
+	r := &Runner{
 		Timeout:     timeout,
 		Config:      cfg,
 		Backend:     backend,
 		SlotManager: sm,
 	}
+	if backend != nil && sm != nil {
+		r.SourceProvider = NewPublicGitSource(backend, sm, cfg)
+	}
+	return r
 }
 
 func (r *Runner) executionTimeout() time.Duration {
@@ -193,10 +200,21 @@ func (r *Runner) cleanupTimeout() time.Duration {
 	return 15 * time.Second
 }
 
-// PrepareWorkspace disables host git clone/checkout in compliance with D-01 and D-09.
-// Remote source preparation is explicitly unavailable until Plan 02.
+// PrepareSnapshot retrieves a verified source snapshot using the configured SourceProvider.
+func (r *Runner) PrepareSnapshot(ctx context.Context, cloneURL, headRef, headSHA string) (*Snapshot, func(), error) {
+	if r.SourceProvider == nil {
+		return nil, nil, ErrSourceProviderUnavailable
+	}
+	return r.SourceProvider.PrepareSource(ctx, cloneURL, headRef, headSHA)
+}
+
+// PrepareWorkspace adapts the legacy workspace preparation method to the safe snapshot model.
 func (r *Runner) PrepareWorkspace(ctx context.Context, cloneURL, headRef, headSHA string) (string, func(), error) {
-	return "", nil, ErrSourceProviderUnavailable
+	snap, cleanup, err := r.PrepareSnapshot(ctx, cloneURL, headRef, headSHA)
+	if err != nil {
+		return "", nil, err
+	}
+	return snap.SourceDir, cleanup, nil
 }
 
 // VerifyProject inspects the project, enforces custom rule limits, and executes Go verification
@@ -276,6 +294,13 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 		r.extractCustomRules(snapshot.SourceDir, report)
 	}
 
+	if snapshot.IsIncomplete {
+		report.Status = StatusIncomplete
+		report.Reason = snapshot.IncompleteReason
+		report.Summary = fmt.Sprintf("INCOMPLETE: %s", snapshot.IncompleteReason)
+		return report, nil
+	}
+
 	if err := snapshot.Validate(); err != nil {
 		report.Status = StatusUnavailable
 		report.Reason = err.Error()
@@ -318,11 +343,13 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 	}()
 
 	// 2. Populate sealed snapshot directory and writable work directory
-	if err := copyDirectory(snapshot.SourceDir, lease.SnapshotDir); err != nil {
-		report.Status = StatusUnavailable
-		report.Reason = fmt.Sprintf("failed to populate snapshot directory: %v", err)
-		report.Summary = fmt.Sprintf("UNAVAILABLE: %v", err)
-		return report, nil
+	if snapshot.SourceDir != lease.SnapshotDir {
+		if err := copyDirectory(snapshot.SourceDir, lease.SnapshotDir); err != nil {
+			report.Status = StatusUnavailable
+			report.Reason = fmt.Sprintf("failed to populate snapshot directory: %v", err)
+			report.Summary = fmt.Sprintf("UNAVAILABLE: %v", err)
+			return report, nil
+		}
 	}
 	if err := copyDirectory(snapshot.SourceDir, lease.WorkDir); err != nil {
 		report.Status = StatusUnavailable

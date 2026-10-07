@@ -288,3 +288,120 @@ func TestSuggestionGateRequiresActualResults(t *testing.T) {
 		t.Fatalf("unexpected suggestion details: %#v", report.Suggestions[0])
 	}
 }
+
+type mockSourceProvider struct {
+	snapshot *sandbox.Snapshot
+	err      error
+}
+
+func (m *mockSourceProvider) PrepareSource(ctx context.Context, cloneURL, headRef, headSHA string) (*sandbox.Snapshot, func(), error) {
+	if m.err != nil {
+		return nil, nil, m.err
+	}
+	return m.snapshot, func() {}, nil
+}
+
+func TestReviewPR_SourceProviderAndIncompleteStatusGating(t *testing.T) {
+	// Mock LLM server
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{
+					Message: llm.ChatMessage{
+						Role: "assistant",
+						Content: `{
+							"score": 85,
+							"summary": "Looks okay.",
+							"findings": [
+								{
+									"file": "main.go",
+									"line": 1,
+									"severity": "NOTE",
+									"title": "Style",
+									"description": "Naming",
+									"suggested_code": "func Test() {}"
+								}
+							]
+						}`,
+					},
+					FinishReason: "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	// Mock GitHub server
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/1"):
+			if r.Header.Get("Accept") == "application/vnd.github.v3.diff" {
+				_, _ = w.Write([]byte("+++ b/main.go\n@@ -0,0 +1 @@\n+func test() {}\n"))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"number": 1,
+				"title": "PR with submodule",
+				"body": "Test PR",
+				"head": {"sha": "0123456789abcdef0123456789abcdef01234567", "ref": "submodule-branch"},
+				"base": {"ref": "main"},
+				"user": {"login": "dev"}
+			}`))
+		case strings.Contains(r.URL.Path, "/issues/1/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pulls/1/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "balanced",
+		EnableSandbox: true,
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+
+	eng := &Engine{
+		cfg: cfg,
+		gh:  ghClient,
+		llm: llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
+	}
+
+	// 1. Incomplete snapshot: should report incomplete, sandboxVerified=false, suggestions=0
+	incompleteSnap := &sandbox.Snapshot{
+		CommitSHA:        "0123456789abcdef0123456789abcdef01234567",
+		SourceDir:        t.TempDir(),
+		IsIncomplete:     true,
+		IncompleteReason: "gitlink/submodule detected at vendor/submod",
+	}
+
+	runner := sandbox.NewRunner(0)
+	runner.SourceProvider = &mockSourceProvider{snapshot: incompleteSnap}
+	eng.SetSandbox(runner)
+
+	report, err := eng.ReviewPR(context.Background(), "owner", "repo", 1)
+	if err != nil {
+		t.Fatalf("ReviewPR failed: %v", err)
+	}
+
+	if !strings.Contains(report.VerificationSummary, "INCOMPLETE") {
+		t.Errorf("expected VerificationSummary to report INCOMPLETE, got: %q", report.VerificationSummary)
+	}
+	if len(report.Suggestions) != 0 {
+		t.Errorf("expected 0 inline suggestions for incomplete verification, got: %d", len(report.Suggestions))
+	}
+}
