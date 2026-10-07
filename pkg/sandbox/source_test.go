@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/thozoz/pr-review-go/pkg/github"
 )
 
 func TestValidateCommitOID(t *testing.T) {
@@ -375,5 +379,264 @@ func TestPublicGitSource_ValidationAndMissingBackend(t *testing.T) {
 	_, _, err = src.PrepareSource(context.Background(), "-oProxyCommand=calc", "main", validSHA)
 	if !errors.Is(err, ErrInvalidRepoURL) {
 		t.Fatalf("expected ErrInvalidRepoURL for option-like URL, got: %v", err)
+	}
+}
+
+type mockCredentialProvider struct {
+	token       string
+	createCalls int
+	revokeCalls int
+	createErr   error
+	revokeErr   error
+	lastRepoID  int64
+	lastOwner   string
+	lastRepo    string
+	createdCred *github.RetrievalCredential
+}
+
+func (m *mockCredentialProvider) CreateRetrievalCredential(ctx context.Context, owner, repo string, repoID int64) (*github.RetrievalCredential, error) {
+	m.createCalls++
+	m.lastOwner = owner
+	m.lastRepo = repo
+	m.lastRepoID = repoID
+	if m.createErr != nil {
+		return nil, m.createErr
+	}
+	cred := &github.RetrievalCredential{
+		Token:        m.token,
+		ExpiresAt:    time.Now().Add(1 * time.Hour),
+		RepositoryID: repoID,
+		RepoOwner:    owner,
+		RepoName:     repo,
+		Permissions:  map[string]string{"contents": "read"},
+	}
+	m.createdCred = cred
+	return cred, nil
+}
+
+func (m *mockCredentialProvider) RevokeRetrievalCredential(ctx context.Context, cred *github.RetrievalCredential) error {
+	m.revokeCalls++
+	if cred != nil {
+		cred.Zeroize()
+	}
+	return m.revokeErr
+}
+
+type mockSlotManager struct {
+	slotDir    string
+	controlDir string
+}
+
+func newMockSlotManager(t *testing.T) *mockSlotManager {
+	dir := t.TempDir()
+	slotDir := filepath.Join(dir, "slot")
+	ctrlDir := filepath.Join(dir, "ctrl")
+	_ = os.MkdirAll(slotDir, 0755)
+	_ = os.MkdirAll(ctrlDir, 0755)
+	return &mockSlotManager{slotDir: slotDir, controlDir: ctrlDir}
+}
+
+func (m *mockSlotManager) AcquireSlot(ctx context.Context, jobID string) (*SlotLease, error) {
+	snapDir := filepath.Join(m.slotDir, "snapshot")
+	tmpDir := filepath.Join(m.slotDir, "tmp")
+	_ = os.MkdirAll(snapDir, 0755)
+	_ = os.MkdirAll(tmpDir, 0755)
+	return &SlotLease{
+		JobID:       jobID,
+		SlotDir:     m.slotDir,
+		ControlDir:  m.controlDir,
+		SnapshotDir: snapDir,
+		TmpDir:      tmpDir,
+	}, nil
+}
+
+func (m *mockSlotManager) ReleaseSlot(lease *SlotLease) error          { return nil }
+func (m *mockSlotManager) QuarantineSlot(slotDir, reason string) error { return nil }
+func (m *mockSlotManager) IsQuarantined(slotDir string) bool           { return false }
+func (m *mockSlotManager) ReconcileSlots(ctx context.Context) error    { return nil }
+
+func TestPrivateGitSource_ValidationAndMissingBackend(t *testing.T) {
+	validSHA := "0123456789abcdef0123456789abcdef01234567"
+	mockCreds := &mockCredentialProvider{token: "dummy-token"}
+
+	// 1. Missing backend returns ErrSourceProviderUnavailable
+	srcNoBackend := NewPrivateGitSource(nil, nil, nil, mockCreds, 123)
+	_, _, err := srcNoBackend.PrepareSource(context.Background(), "https://github.com/owner/repo", "main", validSHA)
+	if !errors.Is(err, ErrSourceProviderUnavailable) {
+		t.Fatalf("expected ErrSourceProviderUnavailable when backend is nil, got: %v", err)
+	}
+
+	// 2. Missing Auth returns ErrRetrievalAuthUnavailable
+	sm := newMockSlotManager(t)
+	dummyBackend := &PodmanBackend{}
+	srcNoAuth := NewPrivateGitSource(dummyBackend, sm, nil, nil, 123)
+	_, _, err = srcNoAuth.PrepareSource(context.Background(), "https://github.com/owner/repo", "main", validSHA)
+	if !errors.Is(err, ErrRetrievalAuthUnavailable) {
+		t.Fatalf("expected ErrRetrievalAuthUnavailable when Auth is nil, got: %v", err)
+	}
+
+	// 3. Short commit prefix rejected (D-09)
+	src := NewPrivateGitSource(dummyBackend, sm, nil, mockCreds, 123)
+	_, _, err = src.PrepareSource(context.Background(), "https://github.com/owner/repo", "main", "abc1234")
+	if !errors.Is(err, ErrInvalidCommitOID) {
+		t.Fatalf("expected ErrInvalidCommitOID for prefix SHA, got: %v", err)
+	}
+
+	// 4. Option-like clone URL rejected
+	_, _, err = src.PrepareSource(context.Background(), "-oProxyCommand=evil", "main", validSHA)
+	if !errors.Is(err, ErrInvalidRepoURL) {
+		t.Fatalf("expected ErrInvalidRepoURL for option-like URL, got: %v", err)
+	}
+
+	// 5. Option-like headRef rejected
+	_, _, err = src.PrepareSource(context.Background(), "https://github.com/owner/repo", "--upload-pack=evil", validSHA)
+	if !errors.Is(err, ErrInvalidSnapshot) {
+		t.Fatalf("expected ErrInvalidSnapshot for option-like headRef, got: %v", err)
+	}
+}
+
+func TestPrivateGitSource_CredentialCreationFailure(t *testing.T) {
+	validSHA := "0123456789abcdef0123456789abcdef01234567"
+	sm := newMockSlotManager(t)
+	dummyBackend := &PodmanBackend{}
+	mockCreds := &mockCredentialProvider{
+		createErr: errors.New("github app not installed on head repository (status 404)"),
+	}
+
+	src := NewPrivateGitSource(dummyBackend, sm, nil, mockCreds, 999)
+	_, _, err := src.PrepareSource(context.Background(), "https://github.com/headowner/headrepo", "main", validSHA)
+	if err == nil {
+		t.Fatalf("expected error when credential creation fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to create retrieval credential") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+	if mockCreds.createCalls != 1 {
+		t.Errorf("expected exactly 1 create call, got: %d", mockCreds.createCalls)
+	}
+	if mockCreds.revokeCalls != 0 {
+		t.Errorf("expected 0 revoke calls on create failure, got: %d", mockCreds.revokeCalls)
+	}
+}
+
+func TestPrivateGitSource_SentinelSecretConfinementAndZeroization(t *testing.T) {
+	sentinelToken := "sentinel-vault-secret-token-xyz987654321"
+	validSHA := "0123456789abcdef0123456789abcdef01234567"
+
+	testDir := t.TempDir()
+	logArgsPath := filepath.Join(testDir, "captured_args.txt")
+	logEnvPath := filepath.Join(testDir, "captured_env.txt")
+
+	// Create a mock podman binary that records its arguments and environment,
+	// and creates a valid snapshot file.
+	mockPodmanScript := filepath.Join(testDir, "mock-podman.sh")
+	scriptContent := fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "info" ]; then
+        echo '{"host":{"rootless":true,"cgroupVersion":"v2","security":{"rootless":true}}}'
+        exit 0
+    fi
+    if [ "$arg" = "/sys/fs/cgroup/memory.max" ]; then
+        echo '2147483648'
+        exit 0
+    fi
+    if [ "$arg" = "rm" ] || [ "$arg" = "kill" ]; then
+        exit 0
+    fi
+done
+
+# Record all arguments
+echo "$@" >> %q
+
+# Record all environment variables
+env >> %q
+
+# Create dummy regular file in /snapshot mount if found in arguments
+# In our test, the mounted snapshot path is passed as -v <host_snap>:/snapshot:rw
+for arg in "$@"; do
+    case "$arg" in
+        *:/snapshot:rw)
+            SNAP_DIR=$(echo "$arg" | cut -d: -f1)
+            echo "package main" > "$SNAP_DIR/main.go"
+            ;;
+    esac
+done
+
+exit 0
+`, logArgsPath, logEnvPath)
+
+	if err := os.WriteFile(mockPodmanScript, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("failed to write mock podman script: %v", err)
+	}
+
+	mockCreds := &mockCredentialProvider{token: sentinelToken}
+	sm := newMockSlotManager(t)
+
+	backendCfg := PodmanConfig{
+		BinaryPath:  mockPodmanScript,
+		ImageDigest: "test-image:latest",
+		CPUs:        2.0,
+		MemoryBytes: 2 * 1024 * 1024 * 1024,
+		PidsLimit:   256,
+	}
+	backend := NewPodmanBackend(backendCfg)
+
+	src := NewPrivateGitSource(backend, sm, nil, mockCreds, 54321)
+	src.GatewayBaseURL = "http://127.0.0.1:1" // unreachable upstream, container won't hit it directly
+
+	ctx := context.Background()
+	snap, cleanup, err := src.PrepareSource(ctx, "https://github.com/privowner/privrepo", "feature", validSHA)
+	if err != nil {
+		t.Fatalf("PrepareSource failed: %v", err)
+	}
+	defer cleanup()
+
+	// 1. Verify snapshot was returned and validated
+	if snap == nil || snap.CommitSHA != validSHA {
+		t.Fatalf("unexpected snapshot: %+v", snap)
+	}
+
+	// 2. SCAN CHECK: Verify sentinel token NEVER appears in container arguments (D-10, D-11)
+	argsData, err := os.ReadFile(logArgsPath)
+	if err != nil {
+		t.Fatalf("failed to read captured args: %v", err)
+	}
+	argsStr := string(argsData)
+	if strings.Contains(argsStr, sentinelToken) {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: sentinel token leaked into container argv!\nCaptured argv: %s", argsStr)
+	}
+
+	// 3. SCAN CHECK: Verify sentinel token NEVER appears in container environment (D-10, D-11)
+	envData, err := os.ReadFile(logEnvPath)
+	if err != nil {
+		t.Fatalf("failed to read captured env: %v", err)
+	}
+	envStr := string(envData)
+	if strings.Contains(envStr, sentinelToken) {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: sentinel token leaked into container environment!\nCaptured env: %s", envStr)
+	}
+
+	// 4. SCAN CHECK: Verify sentinel token NEVER appears in snapshot files or manifest
+	filepath.Walk(snap.SourceDir, func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			data, _ := os.ReadFile(p)
+			if strings.Contains(string(data), sentinelToken) {
+				t.Fatalf("CRITICAL SECURITY VIOLATION: sentinel token found in snapshot file %s", p)
+			}
+		}
+		return nil
+	})
+
+	// 5. Assert token was revoked before snapshot handoff! (D-10, key_links)
+	if mockCreds.revokeCalls < 1 {
+		t.Fatalf("expected token revocation to occur before snapshot handoff, got %d calls", mockCreds.revokeCalls)
+	}
+
+	// 6. Assert token was zeroized in memory
+	if mockCreds.createdCred == nil || mockCreds.createdCred.Token != "" {
+		t.Fatalf("expected credential to be zeroized, token: %q", mockCreds.createdCred.Token)
+	}
+	if !mockCreds.createdCred.IsRevoked() {
+		t.Fatalf("expected credential to report IsRevoked() == true")
 	}
 }

@@ -296,3 +296,109 @@ func TestGitGateway_LifecycleAndSocketCleanup(t *testing.T) {
 		t.Fatalf("socket file should be removed after Close(), got: %v", err)
 	}
 }
+
+// TestGitGateway_RetrievalTokenInjectionAndIsolation verifies that the gateway strictly owns
+// the App retrieval token, injects it only on approved canonical read routes, denies all
+// out-of-repo or receive-pack routes, and securely erases the token upon closure (D-10, SAFE-01).
+func TestGitGateway_RetrievalTokenInjectionAndIsolation(t *testing.T) {
+	sentinelToken := "sentinel-app-retrieval-token-12345"
+	var (
+		receivedAuthHeader string
+		upstreamCallCount  int
+	)
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCallCount++
+		receivedAuthHeader = r.Header.Get("Authorization")
+
+		if strings.HasSuffix(r.URL.Path, "/info/refs") {
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+			_, _ = w.Write([]byte("001e# service=git-upload-pack\n0000"))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/git-upload-pack") {
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+			_, _ = w.Write([]byte("PACK..."))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstreamServer.Close()
+
+	sockDir := t.TempDir()
+	sockPath := filepath.Join(sockDir, "git-priv.sock")
+
+	var onCloseCalled bool
+	gw, err := StartGitGateway(GitGatewayConfig{
+		SocketPath:        sockPath,
+		RepoOwner:         "canonowner",
+		RepoName:          "canonrepo",
+		UpstreamBaseURL:   upstreamServer.URL,
+		AllowTestLoopback: true,
+		RetrievalToken:    sentinelToken,
+		OnClose: func() {
+			onCloseCalled = true
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to start git gateway: %v", err)
+	}
+
+	client := newUnixClient(sockPath)
+
+	// 1. Authorized read route injects token and strips client-supplied auth header
+	req1, _ := http.NewRequest(http.MethodGet, "http://unix/canonowner/canonrepo/info/refs?service=git-upload-pack", nil)
+	req1.Header.Set("Authorization", "Bearer attacker-spoofed-token")
+	req1.Header.Set("Proxy-Authorization", "Basic evil")
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("request 1 failed: %v", err)
+	}
+	defer resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got: %d", resp1.StatusCode)
+	}
+	if receivedAuthHeader != "Bearer "+sentinelToken {
+		t.Errorf("expected gateway to inject sentinel token, got upstream header: %q", receivedAuthHeader)
+	}
+
+	// 2. Out-of-repo route must be denied with 403 Forbidden without contacting upstream
+	callsBefore := upstreamCallCount
+	req2, _ := http.NewRequest(http.MethodGet, "http://unix/otherowner/otherrepo/info/refs?service=git-upload-pack", nil)
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("request 2 failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for out-of-repo request, got: %d", resp2.StatusCode)
+	}
+	if upstreamCallCount != callsBefore {
+		t.Errorf("upstream was contacted for out-of-repo request!")
+	}
+
+	// 3. Receive-pack (write/push mutation) must be denied with 403 Forbidden
+	req3, _ := http.NewRequest(http.MethodPost, "http://unix/canonowner/canonrepo/git-receive-pack", strings.NewReader("evil-pack"))
+	resp3, err := client.Do(req3)
+	if err != nil {
+		t.Fatalf("request 3 failed: %v", err)
+	}
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for git-receive-pack, got: %d", resp3.StatusCode)
+	}
+	if upstreamCallCount != callsBefore {
+		t.Errorf("upstream was contacted for git-receive-pack request!")
+	}
+
+	// 4. Verify Close erases token and invokes OnClose
+	if err := gw.Close(); err != nil {
+		t.Fatalf("failed to close gateway: %v", err)
+	}
+	if !onCloseCalled {
+		t.Errorf("expected OnClose hook to be invoked on gateway Close")
+	}
+	if gw.retrievalToken != "" {
+		t.Errorf("expected retrievalToken to be erased after Close, got: %q", gw.retrievalToken)
+	}
+}

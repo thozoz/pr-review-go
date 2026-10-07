@@ -145,6 +145,7 @@ func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PR
 
 	var headRepoOwner string
 	var headRepoName string
+	var headRepoID int64
 	var cloneURL string
 	var headRef string
 	var headSHA string
@@ -155,6 +156,7 @@ func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PR
 		if hr := head.GetRepo(); hr != nil {
 			cloneURL = hr.GetCloneURL()
 			headRepoName = hr.GetName()
+			headRepoID = hr.GetID()
 			if hrOwner := hr.GetOwner(); hrOwner != nil {
 				headRepoOwner = hrOwner.GetLogin()
 			}
@@ -173,9 +175,52 @@ func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PR
 		HeadSHA:       headSHA,
 		HeadRepoOwner: headRepoOwner,
 		HeadRepoName:  headRepoName,
+		HeadRepoID:    headRepoID,
 		CloneURL:      cloneURL,
 		CreatedAt:     pr.GetCreatedAt().Time,
 	}, nil
+}
+
+// GetRepoID returns the numeric GitHub repository ID for owner/repo.
+func (c *Client) GetRepoID(ctx context.Context, owner, repo string) (int64, error) {
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return 0, err
+	}
+	r, _, err := ghClient.Repositories.Get(ctx, owner, repo)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get repository %s/%s: %w", owner, repo, err)
+	}
+	if r.GetID() == 0 {
+		return 0, fmt.Errorf("%w: repository %s/%s has zero ID", ErrInvalidRepoID, owner, repo)
+	}
+	return r.GetID(), nil
+}
+
+// CreateRetrievalCredential creates a short-lived App token scoped to exactly one head repository
+// with contents:read permission. If the client is configured with a PAT instead of a GitHub App,
+// it returns ErrRetrievalAuthUnavailable; broad PAT substitution is explicitly denied (D-10, SAFE-01).
+func (c *Client) CreateRetrievalCredential(ctx context.Context, owner, repo string, repoID int64) (*RetrievalCredential, error) {
+	if c.appAuth == nil {
+		return nil, ErrRetrievalAuthUnavailable
+	}
+	return c.appAuth.CreateRetrievalCredential(ctx, owner, repo, repoID)
+}
+
+// RevokeRetrievalCredential revokes the scoped App retrieval token and zeroes it in memory.
+func (c *Client) RevokeRetrievalCredential(ctx context.Context, cred *RetrievalCredential) error {
+	if c.appAuth == nil {
+		if cred != nil {
+			cred.Zeroize()
+		}
+		return nil
+	}
+	return c.appAuth.RevokeRetrievalCredential(ctx, cred)
+}
+
+// AppAuth returns the underlying AppAuth instance if configured, or nil.
+func (c *Client) AppAuth() *AppAuth {
+	return c.appAuth
 }
 
 func (c *Client) GetRawDiff(ctx context.Context, owner, repo string, number int) (string, error) {

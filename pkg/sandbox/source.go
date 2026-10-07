@@ -21,14 +21,16 @@ import (
 	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/github"
 )
 
 var (
-	ErrIncompleteGitlink = errors.New("gitlink/submodule detected: submodules are unsupported in Phase 1 (D-13)")
-	ErrIncompleteGitLFS  = errors.New("git LFS pointer detected: LFS is unsupported in Phase 1 (D-13)")
-	ErrInvalidCommitOID  = errors.New("commit SHA must be 40 or 64 hex characters (full OID required)")
-	ErrInvalidRepoURL    = errors.New("repository clone URL must be a valid canonical GitHub HTTPS URL")
-	ErrUnsafePathEntry   = errors.New("unsafe or forbidden filesystem entry in git tree")
+	ErrIncompleteGitlink         = errors.New("gitlink/submodule detected: submodules are unsupported in Phase 1 (D-13)")
+	ErrIncompleteGitLFS          = errors.New("git LFS pointer detected: LFS is unsupported in Phase 1 (D-13)")
+	ErrInvalidCommitOID          = errors.New("commit SHA must be 40 or 64 hex characters (full OID required)")
+	ErrInvalidRepoURL            = errors.New("repository clone URL must be a valid canonical GitHub HTTPS URL")
+	ErrUnsafePathEntry           = errors.New("unsafe or forbidden filesystem entry in git tree")
+	ErrRetrievalAuthUnavailable  = github.ErrRetrievalAuthUnavailable
 )
 
 var validRepoPattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
@@ -518,6 +520,249 @@ func (s *PublicGitSource) PrepareSource(ctx context.Context, cloneURL, headRef, 
 	}
 
 	// 7. Read and validate snapshot manifest and filesystem
+	manifest := make(map[string]string)
+	manifestPath := filepath.Join(lease.SnapshotDir, "manifest.json")
+	if data, err := os.ReadFile(manifestPath); err == nil {
+		var mf struct {
+			CommitSHA string            `json:"commit_sha"`
+			Manifest  map[string]string `json:"manifest"`
+		}
+		if jsonErr := json.Unmarshal(data, &mf); jsonErr == nil && mf.Manifest != nil {
+			manifest = mf.Manifest
+		}
+		_ = os.Remove(manifestPath)
+	}
+
+	snapshot := &Snapshot{
+		CommitSHA: headSHA,
+		SourceDir: lease.SnapshotDir,
+		Manifest:  manifest,
+	}
+
+	if err := snapshot.Validate(); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("prepared snapshot validation failed: %w", err)
+	}
+
+	return snapshot, cleanup, nil
+}
+
+// RetrievalCredentialProvider defines the typed contract for minting and revoking short-lived,
+// least-privilege App credentials for private repository source preparation (D-10, SAFE-01).
+type RetrievalCredentialProvider interface {
+	CreateRetrievalCredential(ctx context.Context, owner, repo string, repoID int64) (*github.RetrievalCredential, error)
+	RevokeRetrievalCredential(ctx context.Context, cred *github.RetrievalCredential) error
+}
+
+// PrivateGitSource provides isolated exact-commit source retrieval for private repositories
+// using a scoped, short-lived GitHub App retrieval credential (D-10, D-11).
+// The credential is held strictly by the Git gateway, injected only on canonical same-repo
+// read requests, and never exposed to container environment, arguments, config, or snapshots.
+// The credential lease is revoked before snapshot handoff.
+type PrivateGitSource struct {
+	Backend        *PodmanBackend
+	SlotManager    SlotManager
+	Config         *config.Config
+	GatewayBaseURL string
+	Auth           RetrievalCredentialProvider
+	HeadRepoID     int64
+}
+
+// NewPrivateGitSource creates a PrivateGitSource configured with container backend, storage slots,
+// and a scoped GitHub App credential provider.
+func NewPrivateGitSource(backend *PodmanBackend, sm SlotManager, cfg *config.Config, auth RetrievalCredentialProvider, headRepoID int64) *PrivateGitSource {
+	baseURL := "https://github.com"
+	return &PrivateGitSource{
+		Backend:        backend,
+		SlotManager:    sm,
+		Config:         cfg,
+		GatewayBaseURL: baseURL,
+		Auth:           auth,
+		HeadRepoID:     headRepoID,
+	}
+}
+
+// PrepareSource implements the SourceProvider interface for private repositories.
+func (s *PrivateGitSource) PrepareSource(ctx context.Context, cloneURL, headRef, headSHA string) (*Snapshot, func(), error) {
+	// 1. Validate canonical repository URL and full commit OID (SAFE-01)
+	owner, repo, err := ValidateCloneURL(cloneURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ValidateCommitOID(headSHA); err != nil {
+		return nil, nil, err
+	}
+	if strings.HasPrefix(headRef, "-") {
+		return nil, nil, fmt.Errorf("%w: option-like headRef rejected: %q", ErrInvalidSnapshot, headRef)
+	}
+
+	// 2. Ensure container isolation backend and storage slots are available (D-01)
+	if s.Backend == nil || s.SlotManager == nil {
+		return nil, nil, ErrSourceProviderUnavailable
+	}
+
+	// 3. Ensure narrow credential provider is configured (D-10)
+	if s.Auth == nil {
+		return nil, nil, ErrRetrievalAuthUnavailable
+	}
+
+	// 4. Acquire exclusive storage slot lease (SAFE-01 concurrency)
+	jobID := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%s-%d", owner, headSHA, time.Now().UnixNano()))))[:12]
+	lease, err := s.SlotManager.AcquireSlot(ctx, jobID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to acquire storage slot: %w", err)
+	}
+
+	// 5. Create scoped, short-lived App retrieval token for this head repo only (D-10)
+	cred, err := s.Auth.CreateRetrievalCredential(ctx, owner, repo, s.HeadRepoID)
+	if err != nil {
+		_ = s.SlotManager.ReleaseSlot(lease)
+		return nil, nil, fmt.Errorf("failed to create retrieval credential for %s/%s: %w", owner, repo, err)
+	}
+
+	var credRevoked bool
+	revokeToken := func() {
+		if !credRevoked && cred != nil {
+			credRevoked = true
+			cleanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = s.Auth.RevokeRetrievalCredential(cleanCtx, cred)
+		}
+	}
+
+	cleanup := func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		revokeToken()
+		_ = s.Backend.StopAndKillJobContainers(cleanCtx, jobID)
+		_ = s.SlotManager.ReleaseSlot(lease)
+	}
+
+	// 6. Start restricted Git data gateway on a dedicated Unix socket (D-05, D-09, D-10)
+	// The gateway owns the token; it is NEVER passed to container specs or files.
+	gwSockPath := filepath.Join(lease.ControlDir, fmt.Sprintf("gw-%s.sock", jobID))
+	gw, err := StartGitGateway(GitGatewayConfig{
+		SocketPath:      gwSockPath,
+		RepoOwner:       owner,
+		RepoName:        repo,
+		UpstreamBaseURL: s.GatewayBaseURL,
+		RetrievalToken:  cred.Token,
+		OnClose:         revokeToken,
+	})
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("failed to start git gateway: %w", err)
+	}
+	defer func() {
+		_ = gw.Close()
+		// Always revoke credential before snapshot handoff (D-10, key_links)
+		revokeToken()
+	}()
+
+	// 7. Attest container runtime capabilities before executing
+	if err := s.Backend.Attest(ctx); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("runtime attestation failed: %w", err)
+	}
+
+	// 8. Execute isolated source retrieval container with --network=none
+	gitScratchDir := filepath.Join(lease.SlotDir, "git")
+	if err := os.MkdirAll(gitScratchDir, 0755); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("failed to create git scratch dir: %w", err)
+	}
+
+	retrievalArgs := []string{
+		"pr-review-sandbox-helper", "retrieve",
+		"-socket", "/run/sandbox/gateway.sock",
+		"-repo-url", fmt.Sprintf("http://127.0.0.1:8080/%s/%s", owner, repo),
+		"-commit", headSHA,
+		"-git-dir", "/git/repo.git",
+		"-dest", "/snapshot",
+		"-manifest", "/snapshot/manifest.json",
+	}
+
+	containerName := fmt.Sprintf("pr-rev-%s-retrieval", jobID)
+	podmanArgs := []string{
+		"run",
+		"--name", containerName,
+		"--label", fmt.Sprintf("pr-review.job_id=%s", jobID),
+		"--label", "pr-review.stage=retrieval",
+		"--network=none",
+		"--cap-drop=ALL",
+		"--security-opt=no-new-privileges",
+		"--pid=private",
+		"--ipc=none",
+		"--cgroupns=private",
+		"--userns=keep-id",
+		"--read-only",
+		"--read-only-tmpfs=false",
+		"--log-driver=none",
+		"--pull=never",
+		fmt.Sprintf("--cpus=%f", s.Backend.cfg.CPUs),
+		fmt.Sprintf("--memory=%d", s.Backend.cfg.MemoryBytes),
+		fmt.Sprintf("--memory-swap=%d", s.Backend.cfg.MemoryBytes),
+		fmt.Sprintf("--pids-limit=%d", s.Backend.cfg.PidsLimit),
+		"-v", fmt.Sprintf("%s:/run/sandbox/gateway.sock:ro", gwSockPath),
+		"-v", fmt.Sprintf("%s:/git:rw", gitScratchDir),
+		"-v", fmt.Sprintf("%s:/snapshot:rw", lease.SnapshotDir),
+		"-v", fmt.Sprintf("%s:/tmp:rw", lease.TmpDir),
+		"-w", "/tmp",
+		"--entrypoint=",
+		"-e", "GIT_CONFIG_NOSYSTEM=1",
+		"-e", "GIT_CONFIG_GLOBAL=/dev/null",
+		"-e", "GIT_CONFIG_SYSTEM=/dev/null",
+		"-e", "GIT_TEMPLATE_DIR=/dev/null",
+		"-e", "HOME=/tmp",
+		"-e", "TMPDIR=/tmp",
+		s.Backend.cfg.ImageDigest,
+	}
+	podmanArgs = append(podmanArgs, retrievalArgs...)
+
+	retrievalTimeout := 2 * time.Minute
+	if s.Config != nil && s.Config.SandboxTimeoutSource > 0 {
+		retrievalTimeout = s.Config.SandboxTimeoutSource
+	}
+	retrievalCtx, cancelRetrieval := context.WithTimeout(ctx, retrievalTimeout)
+	defer cancelRetrieval()
+
+	cmd := exec.CommandContext(retrievalCtx, s.Backend.cfg.BinaryPath, podmanArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
+	// Immediately terminate and remove retrieval container
+	cleanCtx, cancelClean := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelClean()
+	_ = s.Backend.StopAndKillJobContainers(cleanCtx, jobID)
+
+	// Explicitly close gateway and revoke token NOW before touching or handing off snapshot
+	_ = gw.Close()
+	revokeToken()
+
+	if runErr != nil {
+		exitCode := 1
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+
+		if exitCode == 2 || strings.Contains(stderr.String(), "INCOMPLETE:") {
+			reason := strings.TrimSpace(stderr.String())
+			cleanup()
+			return &Snapshot{
+				CommitSHA:        headSHA,
+				SourceDir:        lease.SnapshotDir,
+				IsIncomplete:     true,
+				IncompleteReason: reason,
+			}, func() {}, fmt.Errorf("%w: %s", ErrIncompleteGitlink, reason)
+		}
+
+		cleanup()
+		return nil, nil, fmt.Errorf("source retrieval container failed (exit %d): %v (stderr: %s)", exitCode, runErr, stderr.String())
+	}
+
+	// 9. Read and validate snapshot manifest and filesystem
 	manifest := make(map[string]string)
 	manifestPath := filepath.Join(lease.SnapshotDir, "manifest.json")
 	if data, err := os.ReadFile(manifestPath); err == nil {

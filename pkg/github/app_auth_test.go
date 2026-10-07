@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -887,5 +888,426 @@ func TestClientCacheEvictionAndOrphaningRegression(t *testing.T) {
 	}
 	if atomic.LoadInt32(&tokenCalls) != 1 {
 		t.Errorf("expected exactly 1 token call (shared with G3), got %d", tokenCalls)
+	}
+}
+
+// TestCreateRetrievalCredential_NarrowScopeExactHeadRepo tests that CreateRetrievalCredential
+// sends an uncached POST to /app/installations/{id}/access_tokens with exactly one head repository ID
+// and permissions {"contents": "read"}, validates the response, and successfully revokes the token.
+func TestCreateRetrievalCredential_NarrowScopeExactHeadRepo(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+
+	var (
+		tokenRequestReceived atomic.Bool
+		tokenRevokedReceived atomic.Bool
+		receivedRepoIDs      []int64
+		receivedPermissions  map[string]string
+		receivedAuthHeader   string
+		revokeAuthHeader     string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/repos/head-org/head-repo/installation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 5001})
+			return
+
+		case "/app/installations/5001/access_tokens":
+			tokenRequestReceived.Store(true)
+			receivedAuthHeader = r.Header.Get("Authorization")
+
+			var body struct {
+				RepositoryIDs []int64           `json:"repository_ids"`
+				Permissions   map[string]string `json:"permissions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, fmt.Sprintf("invalid json body: %v", err), http.StatusBadRequest)
+				return
+			}
+			receivedRepoIDs = body.RepositoryIDs
+			receivedPermissions = body.Permissions
+
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token":                "ghs_narrow_head_token_xyz999",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "read"},
+				"repository_selection": "selected",
+				"repositories": []map[string]any{
+					{"id": 887766, "name": "head-repo"},
+				},
+			})
+			return
+
+		case "/installation/token":
+			if r.Method == http.MethodDelete {
+				tokenRevokedReceived.Store(true)
+				revokeAuthHeader = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewTestAppClient(server.URL, 12345, key)
+	if err != nil {
+		t.Fatalf("failed to create app client: %v", err)
+	}
+
+	ctx := context.Background()
+	cred, err := client.CreateRetrievalCredential(ctx, "head-org", "head-repo", 887766)
+	if err != nil {
+		t.Fatalf("CreateRetrievalCredential failed: %v", err)
+	}
+
+	if !tokenRequestReceived.Load() {
+		t.Fatalf("access token request was not received by mock server")
+	}
+
+	// 1. Assert JWT authorization was sent
+	if !strings.HasPrefix(receivedAuthHeader, "Bearer ") {
+		t.Errorf("expected Bearer JWT in token request, got: %q", receivedAuthHeader)
+	}
+
+	// 2. Assert HTTP body contains exactly one head repository ID with contents:read (D-10, SAFE-01)
+	if len(receivedRepoIDs) != 1 || receivedRepoIDs[0] != 887766 {
+		t.Errorf("expected repository_ids to be [887766], got: %v", receivedRepoIDs)
+	}
+	if len(receivedPermissions) != 1 || receivedPermissions["contents"] != "read" {
+		t.Errorf("expected permissions to be {contents: read}, got: %v", receivedPermissions)
+	}
+
+	// 3. Assert returned credential fields
+	if cred.Token != "ghs_narrow_head_token_xyz999" {
+		t.Errorf("unexpected token in cred: %q", cred.Token)
+	}
+	if cred.RepositoryID != 887766 {
+		t.Errorf("unexpected RepositoryID: %d", cred.RepositoryID)
+	}
+	if cred.RepoOwner != "head-org" || cred.RepoName != "head-repo" {
+		t.Errorf("unexpected repo: %s/%s", cred.RepoOwner, cred.RepoName)
+	}
+	if cred.IsRevoked() {
+		t.Errorf("credential should not be revoked yet")
+	}
+
+	// 4. Test RevokeRetrievalCredential
+	if err := client.RevokeRetrievalCredential(ctx, cred); err != nil {
+		t.Fatalf("RevokeRetrievalCredential failed: %v", err)
+	}
+
+	if !tokenRevokedReceived.Load() {
+		t.Fatalf("revocation DELETE request was not received by server")
+	}
+	if revokeAuthHeader != "Bearer ghs_narrow_head_token_xyz999" {
+		t.Errorf("expected revoke authorization header to use token, got: %q", revokeAuthHeader)
+	}
+
+	// 5. Assert token is zeroized in memory
+	if cred.Token != "" {
+		t.Errorf("expected token to be zeroized after revocation, got: %q", cred.Token)
+	}
+	if !cred.IsRevoked() {
+		t.Errorf("credential should report IsRevoked() == true")
+	}
+}
+
+// TestCreateRetrievalCredential_RejectsBroaderOrInvalidScope verifies that overbroad,
+// malformed, or mismatching credentials are strictly rejected (SAFE-01, SAFE-03).
+func TestCreateRetrievalCredential_RejectsBroaderOrInvalidScope(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+
+	cases := []struct {
+		name         string
+		owner        string
+		repo         string
+		repoID       int64
+		statusCode   int
+		responseJSON map[string]any
+		wantErrSub   string
+	}{
+		{
+			name:       "Extra permissions returned (too broad)",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":       "tok-extra",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "read", "issues": "read"},
+			},
+			wantErrSub: "too broad",
+		},
+		{
+			name:       "Contents write permission returned (too broad)",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":       "tok-write",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "write"},
+			},
+			wantErrSub: "only read permitted",
+		},
+		{
+			name:       "Repository selection is all (unscoped)",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":                "tok-all",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "read"},
+				"repository_selection": "all",
+			},
+			wantErrSub: "unsupported repository_selection",
+		},
+		{
+			name:       "Granted multiple repositories (too broad)",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":                "tok-multi",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "read"},
+				"repository_selection": "selected",
+				"repositories": []map[string]any{
+					{"id": 100, "name": "repo"},
+					{"id": 200, "name": "other-repo"},
+				},
+			},
+			wantErrSub: "granted access to 2 repositories",
+		},
+		{
+			name:       "Repository ID mismatch in response",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":                "tok-mismatch",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "read"},
+				"repository_selection": "selected",
+				"repositories": []map[string]any{
+					{"id": 999, "name": "wrong-repo"},
+				},
+			},
+			wantErrSub: "mismatch expected 100",
+		},
+		{
+			name:       "Empty token returned",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":       "",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "read"},
+			},
+			wantErrSub: "empty access token",
+		},
+		{
+			name:       "Expired token returned",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":       "tok-expired",
+				"expires_at":  time.Now().Add(-10 * time.Minute),
+				"permissions": map[string]string{"contents": "read"},
+			},
+			wantErrSub: "already expired",
+		},
+		{
+			name:       "Missing permissions in response",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":       "tok-noperm",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{},
+			},
+			wantErrSub: "missing permissions",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/repos/org/repo/installation":
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 7001})
+					return
+				case "/app/installations/7001/access_tokens":
+					w.WriteHeader(tc.statusCode)
+					_ = json.NewEncoder(w).Encode(tc.responseJSON)
+					return
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client, err := NewTestAppClient(server.URL, 12345, key)
+			if err != nil {
+				t.Fatalf("failed to create app client: %v", err)
+			}
+
+			cred, err := client.CreateRetrievalCredential(context.Background(), tc.owner, tc.repo, tc.repoID)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got success with cred: %+v", tc.wantErrSub, cred)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Errorf("expected error containing %q, got: %v", tc.wantErrSub, err)
+			}
+		})
+	}
+}
+
+// TestCreateRetrievalCredential_CacheIndependence asserts that retrieval credential creation
+// is completely uncached and does not alter or share state with the review client's a.repos cache.
+func TestCreateRetrievalCredential_CacheIndependence(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+
+	var (
+		tokenMintCount atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/cache-test/repo/installation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 8001})
+			return
+		case "/app/installations/8001/access_tokens":
+			count := tokenMintCount.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token":                fmt.Sprintf("tok-uncached-%d", count),
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "read"},
+				"repository_selection": "selected",
+				"repositories": []map[string]any{
+					{"id": 112233, "name": "repo"},
+				},
+			})
+			return
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewTestAppClient(server.URL, 12345, key)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	appAuth := client.AppAuth()
+	if appAuth == nil {
+		t.Fatalf("expected non-nil AppAuth")
+	}
+
+	ctx := context.Background()
+
+	// Call 1: CreateRetrievalCredential
+	cred1, err := client.CreateRetrievalCredential(ctx, "cache-test", "repo", 112233)
+	if err != nil {
+		t.Fatalf("call 1 failed: %v", err)
+	}
+
+	// Verify repos cache in appAuth is still empty!
+	appAuth.mu.Lock()
+	cachedCount := len(appAuth.repos)
+	appAuth.mu.Unlock()
+	if cachedCount != 0 {
+		t.Errorf("expected appAuth.repos to remain empty, got %d entries", cachedCount)
+	}
+
+	// Call 2: Second CreateRetrievalCredential must mint a fresh uncached token
+	cred2, err := client.CreateRetrievalCredential(ctx, "cache-test", "repo", 112233)
+	if err != nil {
+		t.Fatalf("call 2 failed: %v", err)
+	}
+
+	if cred1.Token == cred2.Token {
+		t.Errorf("expected different uncached tokens, got same: %q", cred1.Token)
+	}
+	if tokenMintCount.Load() != 2 {
+		t.Errorf("expected exactly 2 mint calls, got %d", tokenMintCount.Load())
+	}
+}
+
+// TestCreateRetrievalCredential_ForkMissingInstallation verifies that fork source retrieval
+// resolves to its head repo installation; if App is not installed on the fork head repo,
+// it fails closed without substituting other credentials (D-10, SAFE-01).
+func TestCreateRetrievalCredential_ForkMissingInstallation(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// The App is installed on base org, but NOT on fork user
+		if r.URL.Path == "/repos/base-org/main-repo/installation" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001})
+			return
+		}
+		if r.URL.Path == "/repos/contributor/fork-repo/installation" {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client, err := NewTestAppClient(server.URL, 12345, key)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx := context.Background()
+	_, err = client.CreateRetrievalCredential(ctx, "contributor", "fork-repo", 554433)
+	if err == nil {
+		t.Fatalf("expected error for uninstalled fork head repo, got nil")
+	}
+	if !strings.Contains(err.Error(), "github app is not installed on repository contributor/fork-repo") {
+		t.Errorf("expected uninstalled repository error message, got: %v", err)
+	}
+}
+
+// TestClient_DeniesBroadPATSubstitution asserts that when Client is initialized with a PAT,
+// CreateRetrievalCredential refuses to return or substitute the PAT for source retrieval (D-10, SAFE-01).
+func TestClient_DeniesBroadPATSubstitution(t *testing.T) {
+	pat := "ghp_super_secret_pat_token_for_review_12345"
+	client := NewClient(pat)
+
+	cred, err := client.CreateRetrievalCredential(context.Background(), "test-org", "test-repo", 12345)
+	if err == nil {
+		t.Fatalf("expected ErrRetrievalAuthUnavailable for PAT client, got credential: %+v", cred)
+	}
+	if !errors.Is(err, ErrRetrievalAuthUnavailable) {
+		t.Errorf("expected ErrRetrievalAuthUnavailable, got: %v", err)
+	}
+	if cred != nil {
+		t.Errorf("expected cred to be nil, got: %+v", cred)
 	}
 }

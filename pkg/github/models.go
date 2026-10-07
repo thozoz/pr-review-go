@@ -18,6 +18,7 @@ type PRDetails struct {
 	HeadSHA       string
 	HeadRepoOwner string
 	HeadRepoName  string
+	HeadRepoID    int64
 	CloneURL      string
 	CreatedAt     time.Time
 }

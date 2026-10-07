@@ -33,18 +33,21 @@ type GitGatewayConfig struct {
 	MaxBodyBytes      int64         // Maximum request/response body size (default: 100 MiB)
 	RequestTimeout    time.Duration // Timeout for upstream requests (default: 2 minutes)
 	AllowTestLoopback bool          // Allow localhost/loopback destinations ONLY in automated test fixtures
+	RetrievalToken    string        // Narrow, short-lived App retrieval token injected strictly by the gateway (D-10, SAFE-01)
+	OnClose           func()        // Optional cleanup hook invoked on Close (e.g. token revocation)
 }
 
 // GitGateway is a restricted Unix domain socket proxy that forwards ONLY git-upload-pack
 // smart HTTP read routes for a specific canonical repository.
 // It accepts no command or mount operations, prevents SSRF, and rejects redirects and receive-pack.
 type GitGateway struct {
-	cfg      GitGatewayConfig
-	listener net.Listener
-	server   *http.Server
-	client   *http.Client
-	mu       sync.Mutex
-	closed   bool
+	cfg            GitGatewayConfig
+	listener       net.Listener
+	server         *http.Server
+	client         *http.Client
+	mu             sync.Mutex
+	closed         bool
+	retrievalToken string
 }
 
 // isRestrictedIP checks if an IP is a loopback, link-local, private, or multicast address.
@@ -190,9 +193,10 @@ func StartGitGateway(cfg GitGatewayConfig) (*GitGateway, error) {
 	}
 
 	gw := &GitGateway{
-		cfg:      cfg,
-		listener: listener,
-		client:   client,
+		cfg:            cfg,
+		listener:       listener,
+		client:         client,
+		retrievalToken: cfg.RetrievalToken,
 	}
 
 	handler := http.HandlerFunc(gw.handleRequest)
@@ -307,6 +311,14 @@ func (g *GitGateway) handleRequest(w http.ResponseWriter, r *http.Request) {
 	req.Header.Del("Authorization")
 	req.Header.Del("Proxy-Authorization")
 
+	// Inject narrow retrieval token only on canonical same-repo read routes (D-10, SAFE-01)
+	g.mu.Lock()
+	token := g.retrievalToken
+	g.mu.Unlock()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
 	// 6. Forward to upstream
 	resp, err := g.client.Do(req)
 	if err != nil {
@@ -335,6 +347,7 @@ func (g *GitGateway) handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // Close gracefully closes the gateway server, listener, and removes the Unix socket.
+// It immediately erases any stored retrieval token from memory.
 func (g *GitGateway) Close() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -344,6 +357,16 @@ func (g *GitGateway) Close() error {
 	}
 	g.closed = true
 
+	// Immediately erase retrieval token and state (D-10, D-11)
+	g.retrievalToken = ""
+	g.cfg.RetrievalToken = ""
+
+	onClose := g.cfg.OnClose
+	g.cfg.OnClose = nil
+	if onClose != nil {
+		onClose()
+	}
+
 	var err error
 	if g.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -351,7 +374,10 @@ func (g *GitGateway) Close() error {
 		_ = g.server.Shutdown(ctx)
 	}
 	if g.listener != nil {
-		err = g.listener.Close()
+		lErr := g.listener.Close()
+		if lErr != nil && !errors.Is(lErr, net.ErrClosed) && !strings.Contains(lErr.Error(), "use of closed network connection") {
+			err = lErr
+		}
 	}
 
 	if g.cfg.SocketPath != "" {
