@@ -46,20 +46,15 @@ func TestInsertUnreleasedEntryCreatesCategory(t *testing.T) {
 }
 
 func TestRunAndPost_ForkMismatchRegression(t *testing.T) {
-	var diffCalled bool
+	var compareCalled bool
 	var contentCalled bool
 	var updateCalled bool
+	var graphQLCalled bool
 
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/1":
-			if strings.Contains(r.Header.Get("Accept"), "diff") {
-				diffCalled = true
-				w.Header().Set("Content-Type", "text/plain")
-				fmt.Fprint(w, "diff --git a/foo.go b/foo.go\nindex 0000000..1111111 100644\n--- a/foo.go\n+++ b/foo.go\n@@ -0,0 +1 @@\n+// new code\n")
-				return
-			}
 			// PR from fork: head.repo.owner is "fork-user", head.ref is "main" (matches base branch "main")
 			prJSON := map[string]any{
 				"number": 1,
@@ -67,6 +62,7 @@ func TestRunAndPost_ForkMismatchRegression(t *testing.T) {
 				"body":   "PR description",
 				"base": map[string]any{
 					"ref": "main",
+					"sha": "1111111111111111111111111111111111111111",
 					"repo": map[string]any{
 						"owner": map[string]any{"login": "owner"},
 						"name":  "repo",
@@ -74,7 +70,7 @@ func TestRunAndPost_ForkMismatchRegression(t *testing.T) {
 				},
 				"head": map[string]any{
 					"ref": "main",
-					"sha": "forksha123",
+					"sha": "2222222222222222222222222222222222222222",
 					"repo": map[string]any{
 						"owner": map[string]any{"login": "fork-user"},
 						"name":  "repo",
@@ -82,28 +78,14 @@ func TestRunAndPost_ForkMismatchRegression(t *testing.T) {
 				},
 			}
 			json.NewEncoder(w).Encode(prJSON)
+		case strings.HasPrefix(r.URL.Path, "/repos/owner/repo/compare/"):
+			compareCalled = true
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
 			contentCalled = true
-			content := base64.StdEncoding.EncodeToString([]byte("# Changelog\n\n## [Unreleased]\n"))
-			resp := map[string]any{
-				"name":     "CHANGELOG.md",
-				"path":     "CHANGELOG.md",
-				"sha":      "oldsha123",
-				"content":  content,
-				"encoding": "base64",
-			}
-			json.NewEncoder(w).Encode(resp)
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			graphQLCalled = true
 		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
 			updateCalled = true
-			resp := map[string]any{
-				"commit": map[string]any{
-					"sha": "newcommitsha456",
-				},
-			}
-			json.NewEncoder(w).Encode(resp)
-		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/1/comments":
-			resp := map[string]any{"id": 1, "body": "comment"}
-			json.NewEncoder(w).Encode(resp)
 		default:
 			http.NotFound(w, r)
 		}
@@ -138,11 +120,14 @@ func TestRunAndPost_ForkMismatchRegression(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected RunAndPost to refuse changelog update on fork PR, got nil error")
 	}
-	if diffCalled {
-		t.Errorf("expected GetRawDiff NOT to be called for fork PR, but it was called")
+	if compareCalled {
+		t.Errorf("expected GetDiffAtCommits NOT to be called for fork PR, but it was called")
 	}
 	if contentCalled {
 		t.Errorf("expected GetFileContent NOT to be called for fork PR, but it was called")
+	}
+	if graphQLCalled {
+		t.Errorf("expected GraphQL mutation NOT to be called for fork PR, but it was called")
 	}
 	if updateCalled {
 		t.Errorf("expected UpdateFile NOT to be called for fork PR, but base branch was updated")
@@ -150,25 +135,31 @@ func TestRunAndPost_ForkMismatchRegression(t *testing.T) {
 }
 
 func TestRunAndPost_SameRepoHeadSHA(t *testing.T) {
-	var requestedRef string
-	var updatedBranch string
+	baseSHA := "1111111111111111111111111111111111111111"
+	headSHA := "2222222222222222222222222222222222222222"
+	newCommitSHA := "3333333333333333333333333333333333333333"
+
+	var compareCalled bool
+	var contentRequestedRef string
+	var graphQLCalled bool
+	var receivedExpectedHeadOID string
+	var receivedBranch string
+	var receivedPath string
+	var updateFileCalled bool
+	var commentBody string
+	var llmCallCount int
 
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/1":
-			if strings.Contains(r.Header.Get("Accept"), "diff") {
-				w.Header().Set("Content-Type", "text/plain")
-				fmt.Fprint(w, "diff --git a/foo.go b/foo.go\nindex 0000000..1111111 100644\n--- a/foo.go\n+++ b/foo.go\n@@ -0,0 +1 @@\n+// new code\n")
-				return
-			}
-			// Same-repo PR: head.repo.owner matches base repo owner
 			prJSON := map[string]any{
 				"number": 1,
 				"title":  "Same repo PR",
 				"body":   "PR description",
 				"base": map[string]any{
 					"ref": "main",
+					"sha": baseSHA,
 					"repo": map[string]any{
 						"owner": map[string]any{"login": "owner"},
 						"name":  "repo",
@@ -176,7 +167,7 @@ func TestRunAndPost_SameRepoHeadSHA(t *testing.T) {
 				},
 				"head": map[string]any{
 					"ref": "feature-branch",
-					"sha": "immutablesha999",
+					"sha": headSHA,
 					"repo": map[string]any{
 						"owner": map[string]any{"login": "owner"},
 						"name":  "repo",
@@ -184,31 +175,72 @@ func TestRunAndPost_SameRepoHeadSHA(t *testing.T) {
 				},
 			}
 			json.NewEncoder(w).Encode(prJSON)
+		case r.Method == http.MethodGet && r.URL.Path == fmt.Sprintf("/repos/owner/repo/compare/%s...%s", baseSHA, headSHA):
+			compareCalled = true
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "diff --git a/foo.go b/foo.go\nindex 0000000..1111111 100644\n--- a/foo.go\n+++ b/foo.go\n@@ -0,0 +1 @@\n+// new code\n")
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
-			requestedRef = r.URL.Query().Get("ref")
+			contentRequestedRef = r.URL.Query().Get("ref")
 			content := base64.StdEncoding.EncodeToString([]byte("# Changelog\n\n## [Unreleased]\n"))
 			resp := map[string]any{
 				"name":     "CHANGELOG.md",
 				"path":     "CHANGELOG.md",
-				"sha":      "oldsha123",
+				"sha":      "csha123",
 				"content":  content,
 				"encoding": "base64",
 			}
 			json.NewEncoder(w).Encode(resp)
-		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
-			var payload struct {
-				Branch string `json:"branch"`
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			graphQLCalled = true
+			var req map[string]any
+			json.NewDecoder(r.Body).Decode(&req)
+			if vars, ok := req["variables"].(map[string]any); ok {
+				if in, ok := vars["input"].(map[string]any); ok {
+					if exp, ok := in["expectedHeadOid"].(string); ok {
+						receivedExpectedHeadOID = exp
+					}
+					if br, ok := in["branch"].(map[string]any); ok {
+						if name, ok := br["branchName"].(string); ok {
+							receivedBranch = name
+						}
+					}
+					if fc, ok := in["fileChanges"].(map[string]any); ok {
+						if adds, ok := fc["additions"].([]any); ok && len(adds) > 0 {
+							if firstAdd, ok := adds[0].(map[string]any); ok {
+								if p, ok := firstAdd["path"].(string); ok {
+									receivedPath = p
+								}
+							}
+						}
+					}
+				}
 			}
-			json.NewDecoder(r.Body).Decode(&payload)
-			updatedBranch = payload.Branch
 			resp := map[string]any{
-				"commit": map[string]any{
-					"sha": "newcommitsha777",
+				"data": map[string]any{
+					"createCommitOnBranch": map[string]any{
+						"commit": map[string]any{
+							"oid": newCommitSHA,
+							"url": "https://github.com/owner/repo/commit/" + newCommitSHA,
+						},
+						"ref": map[string]any{
+							"name": "refs/heads/feature-branch",
+							"target": map[string]any{
+								"oid": newCommitSHA,
+							},
+						},
+					},
 				},
 			}
 			json.NewEncoder(w).Encode(resp)
+		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
+			updateFileCalled = true
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/1/comments":
-			resp := map[string]any{"id": 1, "body": "comment"}
+			var payload struct {
+				Body string `json:"body"`
+			}
+			json.NewDecoder(r.Body).Decode(&payload)
+			commentBody = payload.Body
+			resp := map[string]any{"id": 1, "body": commentBody}
 			json.NewEncoder(w).Encode(resp)
 		default:
 			http.NotFound(w, r)
@@ -217,7 +249,7 @@ func TestRunAndPost_SameRepoHeadSHA(t *testing.T) {
 	defer ghServer.Close()
 
 	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+		llmCallCount++
 		resp := map[string]any{
 			"choices": []map[string]any{
 				{
@@ -244,29 +276,45 @@ func TestRunAndPost_SameRepoHeadSHA(t *testing.T) {
 		t.Fatalf("expected RunAndPost to succeed for same-repo PR, got error: %v", err)
 	}
 
-	if requestedRef != "immutablesha999" {
-		t.Errorf("expected GetFileContent to use immutable HeadSHA 'immutablesha999', got %q", requestedRef)
+	if !compareCalled {
+		t.Errorf("expected GetDiffAtCommits to be called for immutable compare")
 	}
-	if updatedBranch != "feature-branch" {
-		t.Errorf("expected UpdateFile to keep branch 'feature-branch', got %q", updatedBranch)
+	if contentRequestedRef != headSHA {
+		t.Errorf("expected GetFileContent to use immutable HeadSHA %q, got %q", headSHA, contentRequestedRef)
+	}
+	if !graphQLCalled {
+		t.Errorf("expected GraphQL createCommitOnBranch to be called")
+	}
+	if receivedExpectedHeadOID != headSHA {
+		t.Errorf("expected GraphQL mutation to supply expectedHeadOid %q, got %q", headSHA, receivedExpectedHeadOID)
+	}
+	if receivedBranch != "feature-branch" {
+		t.Errorf("expected GraphQL mutation branch to be 'feature-branch', got %q", receivedBranch)
+	}
+	if receivedPath != "CHANGELOG.md" {
+		t.Errorf("expected GraphQL mutation file change path to be 'CHANGELOG.md', got %q", receivedPath)
+	}
+	if updateFileCalled {
+		t.Errorf("expected REST UpdateFile NOT to be called, but it was called")
+	}
+	if llmCallCount != 1 {
+		t.Errorf("expected exactly 1 LLM generation call, got %d", llmCallCount)
+	}
+	if !strings.Contains(commentBody, newCommitSHA) {
+		t.Errorf("expected comment to mention commit SHA %s, got: %q", newCommitSHA, commentBody)
 	}
 }
 
 func TestRunAndPost_NullHeadRepo(t *testing.T) {
-	var diffCalled bool
+	var compareCalled bool
 	var contentCalled bool
 	var updateCalled bool
+	var graphQLCalled bool
 
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/1":
-			if strings.Contains(r.Header.Get("Accept"), "diff") {
-				diffCalled = true
-				w.Header().Set("Content-Type", "text/plain")
-				fmt.Fprint(w, "diff --git a/foo.go b/foo.go\n")
-				return
-			}
 			// Head repo is null (e.g., fork repo was deleted)
 			prJSON := map[string]any{
 				"number": 1,
@@ -274,6 +322,7 @@ func TestRunAndPost_NullHeadRepo(t *testing.T) {
 				"body":   "PR description",
 				"base": map[string]any{
 					"ref": "main",
+					"sha": "1111111111111111111111111111111111111111",
 					"repo": map[string]any{
 						"owner": map[string]any{"login": "owner"},
 						"name":  "repo",
@@ -281,13 +330,17 @@ func TestRunAndPost_NullHeadRepo(t *testing.T) {
 				},
 				"head": map[string]any{
 					"ref":  "main",
-					"sha":  "deletedrepo123",
+					"sha":  "2222222222222222222222222222222222222222",
 					"repo": nil,
 				},
 			}
 			json.NewEncoder(w).Encode(prJSON)
+		case strings.HasPrefix(r.URL.Path, "/repos/owner/repo/compare/"):
+			compareCalled = true
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
 			contentCalled = true
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			graphQLCalled = true
 		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
 			updateCalled = true
 		default:
@@ -306,11 +359,14 @@ func TestRunAndPost_NullHeadRepo(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected RunAndPost to fail safely for null head repo, got nil error")
 	}
-	if diffCalled {
-		t.Errorf("expected GetRawDiff NOT to be called when head repo is null")
+	if compareCalled {
+		t.Errorf("expected GetDiffAtCommits NOT to be called when head repo is null")
 	}
 	if contentCalled {
 		t.Errorf("expected GetFileContent NOT to be called when head repo is null")
+	}
+	if graphQLCalled {
+		t.Errorf("expected GraphQL mutation NOT to be called when head repo is null")
 	}
 	if updateCalled {
 		t.Errorf("expected UpdateFile NOT to be called when head repo is null")
@@ -318,20 +374,15 @@ func TestRunAndPost_NullHeadRepo(t *testing.T) {
 }
 
 func TestRunAndPost_SameOwnerDifferentRepo(t *testing.T) {
-	var diffCalled bool
+	var compareCalled bool
 	var contentCalled bool
 	var updateCalled bool
+	var graphQLCalled bool
 
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/1":
-			if strings.Contains(r.Header.Get("Accept"), "diff") {
-				diffCalled = true
-				w.Header().Set("Content-Type", "text/plain")
-				fmt.Fprint(w, "diff --git a/foo.go b/foo.go\n")
-				return
-			}
 			// Same owner, different repo name
 			prJSON := map[string]any{
 				"number": 1,
@@ -339,6 +390,7 @@ func TestRunAndPost_SameOwnerDifferentRepo(t *testing.T) {
 				"body":   "PR description",
 				"base": map[string]any{
 					"ref": "main",
+					"sha": "1111111111111111111111111111111111111111",
 					"repo": map[string]any{
 						"owner": map[string]any{"login": "owner"},
 						"name":  "repo",
@@ -346,7 +398,7 @@ func TestRunAndPost_SameOwnerDifferentRepo(t *testing.T) {
 				},
 				"head": map[string]any{
 					"ref": "main",
-					"sha": "distinctsha123",
+					"sha": "2222222222222222222222222222222222222222",
 					"repo": map[string]any{
 						"owner": map[string]any{"login": "owner"},
 						"name":  "other-repo",
@@ -354,8 +406,12 @@ func TestRunAndPost_SameOwnerDifferentRepo(t *testing.T) {
 				},
 			}
 			json.NewEncoder(w).Encode(prJSON)
+		case strings.HasPrefix(r.URL.Path, "/repos/owner/repo/compare/"):
+			compareCalled = true
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
 			contentCalled = true
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			graphQLCalled = true
 		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/contents/CHANGELOG.md":
 			updateCalled = true
 		default:
@@ -374,11 +430,14 @@ func TestRunAndPost_SameOwnerDifferentRepo(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected RunAndPost to refuse changelog update when repo name differs, got nil error")
 	}
-	if diffCalled {
-		t.Errorf("expected GetRawDiff NOT to be called when repo name differs")
+	if compareCalled {
+		t.Errorf("expected GetDiffAtCommits NOT to be called when repo name differs")
 	}
 	if contentCalled {
 		t.Errorf("expected GetFileContent NOT to be called when repo name differs")
+	}
+	if graphQLCalled {
+		t.Errorf("expected GraphQL mutation NOT to be called when repo name differs")
 	}
 	if updateCalled {
 		t.Errorf("expected UpdateFile NOT to be called when repo name differs")

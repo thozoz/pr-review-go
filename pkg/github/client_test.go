@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -470,4 +472,281 @@ func TestClient_FailedSourceAccessPermitsPATReview(t *testing.T) {
 	if len(comments) != 1 || len(threads) != 0 {
 		t.Errorf("expected 1 comment and 0 threads, got %d comments and %d threads", len(comments), len(threads))
 	}
+}
+
+func TestValidateCommitOID(t *testing.T) {
+	valid40 := "0123456789abcdef0123456789abcdef01234567"
+	valid64 := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	if err := ValidateCommitOID(valid40); err != nil {
+		t.Fatalf("expected valid 40-char OID, got error: %v", err)
+	}
+	if err := ValidateCommitOID(valid64); err != nil {
+		t.Fatalf("expected valid 64-char OID, got error: %v", err)
+	}
+
+	invalidCases := []struct {
+		name string
+		oid  string
+	}{
+		{"empty", ""},
+		{"short 7-char prefix", "0123456"},
+		{"39 chars", "0123456789abcdef0123456789abcdef0123456"},
+		{"41 chars", "0123456789abcdef0123456789abcdef012345678"},
+		{"non-hex char", "0123456789abcdef0123456789abcdef0123456g"},
+		{"uppercase hex", "0123456789ABCDEF0123456789ABCDEF01234567"},
+		{"spaces", " 0123456789abcdef0123456789abcdef0123456"},
+	}
+
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateCommitOID(tc.oid); err == nil {
+				t.Fatalf("expected error for %s (%q), got nil", tc.name, tc.oid)
+			}
+		})
+	}
+}
+
+func TestGetDiffAtCommits(t *testing.T) {
+	baseOID := "1111111111111111111111111111111111111111"
+	headOID := "2222222222222222222222222222222222222222"
+
+	var acceptHeader string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		acceptHeader = r.Header.Get("Accept")
+		expectedPath := fmt.Sprintf("/repos/owner/repo/compare/%s...%s", baseOID, headOID)
+		if r.Method == http.MethodGet && r.URL.Path == expectedPath {
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, "diff --git a/file.go b/file.go\n+new line\n")
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	client, err := NewTestClient(ts.URL)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Success
+	diff, err := client.GetDiffAtCommits(ctx, "owner", "repo", baseOID, headOID)
+	if err != nil {
+		t.Fatalf("expected GetDiffAtCommits to succeed, got: %v", err)
+	}
+	if !strings.Contains(diff, "+new line") {
+		t.Errorf("expected diff to contain '+new line', got: %s", diff)
+	}
+	if !strings.Contains(acceptHeader, "diff") {
+		t.Errorf("expected Accept header to contain diff media type, got: %s", acceptHeader)
+	}
+
+	// 2. Reject invalid base OID
+	if _, err := client.GetDiffAtCommits(ctx, "owner", "repo", "short123", headOID); err == nil {
+		t.Errorf("expected error for short base OID, got nil")
+	}
+
+	// 3. Reject invalid head OID
+	if _, err := client.GetDiffAtCommits(ctx, "owner", "repo", baseOID, "short456"); err == nil {
+		t.Errorf("expected error for short head OID, got nil")
+	}
+
+	// 4. Reject empty owner/repo
+	if _, err := client.GetDiffAtCommits(ctx, "", "repo", baseOID, headOID); err == nil {
+		t.Errorf("expected error for empty owner, got nil")
+	}
+}
+
+func TestCommitFileAtExpectedHead(t *testing.T) {
+	expectedOID := "2222222222222222222222222222222222222222"
+	newCommitOID := "3333333333333333333333333333333333333333"
+
+	t.Run("success", func(t *testing.T) {
+		var receivedReq map[string]any
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Path == "/graphql" {
+				json.NewDecoder(r.Body).Decode(&receivedReq)
+				resp := map[string]any{
+					"data": map[string]any{
+						"createCommitOnBranch": map[string]any{
+							"commit": map[string]any{
+								"oid": newCommitOID,
+								"url": "https://github.com/owner/repo/commit/" + newCommitOID,
+							},
+							"ref": map[string]any{
+								"name": "refs/heads/feature-branch",
+								"target": map[string]any{
+									"oid": newCommitOID,
+								},
+							},
+						},
+					},
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(resp)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer ts.Close()
+
+		client, err := NewTestClient(ts.URL)
+		if err != nil {
+			t.Fatalf("failed to create client: %v", err)
+		}
+
+		ctx := context.Background()
+		sha, err := client.CommitFileAtExpectedHead(ctx, "owner", "repo", "refs/heads/feature-branch", expectedOID, "CHANGELOG.md", "# Changelog\n", "docs: update changelog")
+		if err != nil {
+			t.Fatalf("expected success, got error: %v", err)
+		}
+		if sha != newCommitOID {
+			t.Errorf("expected commit SHA %s, got %s", newCommitOID, sha)
+		}
+
+		// Verify GraphQL mutation variables
+		variables, ok := receivedReq["variables"].(map[string]any)
+		if !ok {
+			t.Fatalf("variables missing in request: %+v", receivedReq)
+		}
+		input, ok := variables["input"].(map[string]any)
+		if !ok {
+			t.Fatalf("input missing in variables: %+v", variables)
+		}
+		if input["expectedHeadOid"] != expectedOID {
+			t.Errorf("expected expectedHeadOid %s, got %v", expectedOID, input["expectedHeadOid"])
+		}
+		branch := input["branch"].(map[string]any)
+		if branch["branchName"] != "feature-branch" {
+			t.Errorf("expected branchName 'feature-branch', got %v", branch["branchName"])
+		}
+	})
+
+	t.Run("head moved GraphQL error mapped to HeadMovedError", func(t *testing.T) {
+		actualOID := "4444444444444444444444444444444444444444"
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Path == "/graphql" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				resp := map[string]any{
+					"errors": []map[string]any{
+						{
+							"message": fmt.Sprintf("Expected branch to point to %q but it points to %q", expectedOID, actualOID),
+							"type":    "UNPROCESSABLE",
+						},
+					},
+				}
+				json.NewEncoder(w).Encode(resp)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer ts.Close()
+
+		client, err := NewTestClient(ts.URL)
+		if err != nil {
+			t.Fatalf("failed to create client: %v", err)
+		}
+
+		ctx := context.Background()
+		_, err = client.CommitFileAtExpectedHead(ctx, "owner", "repo", "feature-branch", expectedOID, "CHANGELOG.md", "# Changelog", "msg")
+		if err == nil {
+			t.Fatalf("expected HeadMovedError, got nil")
+		}
+
+		var headMovedErr *HeadMovedError
+		if !errors.As(err, &headMovedErr) {
+			t.Fatalf("expected error to be *HeadMovedError, got: %T (%v)", err, err)
+		}
+		if headMovedErr.ExpectedHeadOID != expectedOID {
+			t.Errorf("expected ExpectedHeadOID %s, got %s", expectedOID, headMovedErr.ExpectedHeadOID)
+		}
+		if headMovedErr.ActualHeadOID != actualOID {
+			t.Errorf("expected ActualHeadOID %s, got %s", actualOID, headMovedErr.ActualHeadOID)
+		}
+		if !errors.Is(err, ErrHeadMoved) {
+			t.Errorf("expected errors.Is(err, ErrHeadMoved) to be true")
+		}
+	})
+
+	t.Run("HTTP 200 with other GraphQL error never reports success", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			resp := map[string]any{
+				"errors": []map[string]any{
+					{"message": "Resource not accessible by integration"},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		_, err := client.CommitFileAtExpectedHead(context.Background(), "owner", "repo", "main", expectedOID, "CHANGELOG.md", "c", "m")
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "Resource not accessible") {
+			t.Errorf("unexpected error text: %v", err)
+		}
+		if errors.Is(err, ErrHeadMoved) {
+			t.Errorf("should not be HeadMovedError for generic GraphQL error")
+		}
+	})
+
+	t.Run("HTTP status error", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Unauthorized access", http.StatusUnauthorized)
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		_, err := client.CommitFileAtExpectedHead(context.Background(), "owner", "repo", "main", expectedOID, "CHANGELOG.md", "c", "m")
+		if err == nil {
+			t.Fatalf("expected error for 401, got nil")
+		}
+		if !strings.Contains(err.Error(), "auth error (status 401)") {
+			t.Errorf("unexpected error text: %v", err)
+		}
+	})
+
+	t.Run("malformed response", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, "not-json{}}")
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		_, err := client.CommitFileAtExpectedHead(context.Background(), "owner", "repo", "main", expectedOID, "CHANGELOG.md", "c", "m")
+		if err == nil {
+			t.Fatalf("expected error for malformed JSON, got nil")
+		}
+	})
+
+	t.Run("missing commit OID in response", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			resp := map[string]any{
+				"data": map[string]any{
+					"createCommitOnBranch": map[string]any{
+						"commit": map[string]any{"oid": ""},
+						"ref":    map[string]any{"name": "refs/heads/main"},
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		_, err := client.CommitFileAtExpectedHead(context.Background(), "owner", "repo", "main", expectedOID, "CHANGELOG.md", "c", "m")
+		if err == nil {
+			t.Fatalf("expected error for empty commit OID, got nil")
+		}
+	})
 }

@@ -14,6 +14,7 @@ type PRDetails struct {
 	Body          string
 	Author        string
 	BaseRef       string
+	BaseSHA       string // Captured immutable base commit OID (D-16, SAFE-03)
 	HeadRef       string
 	HeadSHA       string
 	HeadRepoOwner string
