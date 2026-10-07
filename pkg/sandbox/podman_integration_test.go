@@ -540,3 +540,516 @@ func TestPodmanSourceTracer(t *testing.T) {
 	})
 }
 
+// TestPodmanDependencies proves restricted dependency preparation through the narrow
+// Unix gateway and offline build/test execution on Podman (D-05, D-06, D-07, D-12, D-15).
+// It is opt-in via PR_REVIEW_SANDBOX_INTEGRATION=1.
+func TestPodmanDependencies(t *testing.T) {
+	if os.Getenv("PR_REVIEW_SANDBOX_INTEGRATION") != "1" {
+		t.Skip("skipping live dependency tracer: set PR_REVIEW_SANDBOX_INTEGRATION=1 to enable")
+	}
+
+	// 1. Prerequisite and validation enforcement (fail-closed behavior)
+	t.Run("PrerequisiteAndValidationEnforcement", func(t *testing.T) {
+		// Enforce podman presence when integration test is enabled
+		if _, err := exec.LookPath("podman"); err != nil {
+			t.Fatalf("podman binary is required when PR_REVIEW_SANDBOX_INTEGRATION=1: %v", err)
+		}
+
+		// Enforce git presence when integration test is enabled
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Fatalf("git binary is required when PR_REVIEW_SANDBOX_INTEGRATION=1: %v", err)
+		}
+
+		// Verify escaping replacements are rejected
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.22\n\nreplace foo => ../outside\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateGoMod(dir); !errors.Is(err, ErrEscapingReplacement) {
+			t.Fatalf("expected ErrEscapingReplacement for parent traversal replacement, got: %v", err)
+		}
+
+		// Verify deep escaping replacement rejected
+		if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.22\n\nreplace foo => sub/../../outside\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateGoMod(dir); !errors.Is(err, ErrEscapingReplacement) {
+			t.Fatalf("expected ErrEscapingReplacement for deep traversal replacement, got: %v", err)
+		}
+
+		// Verify block escaping replacement rejected
+		if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.22\n\nreplace (\n\tfoo => ../outside\n)\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateGoMod(dir); !errors.Is(err, ErrEscapingReplacement) {
+			t.Fatalf("expected ErrEscapingReplacement for block replacement, got: %v", err)
+		}
+
+		// Verify in-root replacement accepted
+		subDir := filepath.Join(dir, "subpkg")
+		_ = os.MkdirAll(subDir, 0755)
+		if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module test\n\ngo 1.22\n\nreplace foo => ./subpkg\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateGoMod(dir); err != nil {
+			t.Fatalf("expected in-root replacement to pass, got: %v", err)
+		}
+
+		// Verify unvendored dependencies without preparer return StatusIncomplete
+		unvendoredDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(unvendoredDir, "go.mod"), []byte("module test\n\ngo 1.22\n\nrequire golang.org/x/sync v0.7.0\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		runner := NewRunner(0)
+		report, err := runner.VerifyProject(context.Background(), unvendoredDir)
+		if err != nil {
+			t.Fatalf("VerifyProject failed: %v", err)
+		}
+		if report.Status != StatusIncomplete {
+			t.Fatalf("expected StatusIncomplete when unvendored dependencies have no preparer, got: %q", report.Status)
+		}
+	})
+
+	// 2. Gateway route restrictions, redirect handling, and security denials
+	t.Run("GatewayRouteProbingAndDenials", func(t *testing.T) {
+		var receivedAuthHeader string
+		redirectTargetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedAuthHeader = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write([]byte("PK\x03\x04test-zip-content"))
+		}))
+		defer redirectTargetServer.Close()
+
+		mockProxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			receivedAuthHeader = r.Header.Get("Authorization")
+			switch {
+			case r.URL.Path == "/golang.org/x/sync/@v/v0.7.0.info":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"Version":"v0.7.0","Time":"2024-04-18T14:41:43Z"}`))
+			case r.URL.Path == "/golang.org/x/sync/@v/v0.7.0.mod":
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("module golang.org/x/sync\n\ngo 1.18\n"))
+			case r.URL.Path == "/golang.org/x/sync/@v/v0.7.0.zip":
+				// Redirect to allowed redirect origin
+				http.Redirect(w, r, redirectTargetServer.URL+"/golang.org/x/sync/v0.7.0.zip", http.StatusFound)
+			case r.URL.Path == "/golang.org/x/sync/@v/v0.7.0-evil.zip":
+				// Redirect to untrusted / unlisted origin
+				http.Redirect(w, r, "https://evil.untrusted.host.com/evil.zip", http.StatusFound)
+			case r.URL.Path == "/sumdb/sum.golang.org/supported" || r.URL.Path == "/supported":
+				w.WriteHeader(http.StatusOK)
+			case strings.HasPrefix(r.URL.Path, "/sumdb/sum.golang.org/lookup/") || strings.HasPrefix(r.URL.Path, "/lookup/"):
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("golang.org/x/sync v0.7.0 h1:3wmp05U811omFsSGS488P1/7h4s/6csm18+5s5QZ2V0=\n"))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer mockProxyServer.Close()
+
+		redirHost := strings.TrimPrefix(redirectTargetServer.URL, "http://")
+		if h, _, err := net.SplitHostPort(redirHost); err == nil {
+			redirHost = h
+		}
+
+		sockDir := t.TempDir()
+		sockPath := filepath.Join(sockDir, "dep-gw.sock")
+		gw, err := StartDependencyGateway(DependencyGatewayConfig{
+			SocketPath:        sockPath,
+			ProxyBaseURL:      mockProxyServer.URL,
+			SumDBBaseURL:      mockProxyServer.URL,
+			AllowedHosts:      []string{redirHost, "storage.googleapis.com"},
+			AllowTestLoopback: true,
+		})
+		if err != nil {
+			t.Fatalf("failed to start dependency gateway: %v", err)
+		}
+		defer gw.Close()
+
+		client := &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", sockPath)
+				},
+			},
+			Timeout: 5 * time.Second,
+		}
+
+		// Probe 1: Allowed module info route
+		reqInfo, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/v0.7.0.info", nil)
+		reqInfo.Header.Set("Authorization", "Bearer injected-credential")
+		respInfo, err := client.Do(reqInfo)
+		if err != nil {
+			t.Fatalf("allowed info route failed: %v", err)
+		}
+		respInfo.Body.Close()
+		if respInfo.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for .info, got: %d", respInfo.StatusCode)
+		}
+		if receivedAuthHeader != "" {
+			t.Fatalf("expected Authorization header to be stripped, got: %q", receivedAuthHeader)
+		}
+
+		// Probe 2: Allowed module mod route
+		reqMod, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/v0.7.0.mod", nil)
+		respMod, err := client.Do(reqMod)
+		if err != nil {
+			t.Fatalf("allowed mod route failed: %v", err)
+		}
+		respMod.Body.Close()
+		if respMod.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for .mod, got: %d", respMod.StatusCode)
+		}
+
+		// Probe 3: Allowed module zip route with followed redirect
+		reqZip, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/v0.7.0.zip", nil)
+		respZip, err := client.Do(reqZip)
+		if err != nil {
+			t.Fatalf("allowed zip route with redirect failed: %v", err)
+		}
+		respZip.Body.Close()
+		if respZip.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for .zip, got: %d", respZip.StatusCode)
+		}
+
+		// Probe 4: Allowed SumDB routes
+		reqSum, _ := http.NewRequest(http.MethodGet, "http://unix/sumdb/sum.golang.org/supported", nil)
+		respSum, err := client.Do(reqSum)
+		if err != nil {
+			t.Fatalf("allowed sumdb supported route failed: %v", err)
+		}
+		respSum.Body.Close()
+		if respSum.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for sumdb supported, got: %d", respSum.StatusCode)
+		}
+
+		reqLookup, _ := http.NewRequest(http.MethodGet, "http://unix/sumdb/sum.golang.org/lookup/golang.org/x/sync@v0.7.0", nil)
+		respLookup, err := client.Do(reqLookup)
+		if err != nil {
+			t.Fatalf("allowed sumdb lookup route failed: %v", err)
+		}
+		respLookup.Body.Close()
+		if respLookup.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK for sumdb lookup, got: %d", respLookup.StatusCode)
+		}
+
+		// Probe 5: Deny direct VCS route
+		reqVCS, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync.git/info/refs", nil)
+		respVCS, err := client.Do(reqVCS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respVCS.Body.Close()
+		if respVCS.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for VCS path, got: %d", respVCS.StatusCode)
+		}
+
+		// Probe 6: Deny CONNECT method
+		reqConnect, _ := http.NewRequest(http.MethodConnect, "http://unix/proxy.golang.org:443", nil)
+		respConnect, err := client.Do(reqConnect)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respConnect.Body.Close()
+		if respConnect.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405 Method Not Allowed for CONNECT, got: %d", respConnect.StatusCode)
+		}
+
+		// Probe 7: Deny POST method
+		reqPost, _ := http.NewRequest(http.MethodPost, "http://unix/golang.org/x/sync/@v/v0.7.0.mod", strings.NewReader("bad"))
+		respPost, err := client.Do(reqPost)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respPost.Body.Close()
+		if respPost.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405 Method Not Allowed for POST, got: %d", respPost.StatusCode)
+		}
+
+		// Probe 8: Deny traversal / double-escaped path
+		reqTrav, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/../../../../etc/passwd", nil)
+		respTrav, err := client.Do(reqTrav)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respTrav.Body.Close()
+		if respTrav.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for traversal path, got: %d", respTrav.StatusCode)
+		}
+
+		// Probe 9: Deny redirect to untrusted / unlisted origin (403 Forbidden)
+		reqPriv, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/v0.7.0-evil.zip", nil)
+		respPriv, err := client.Do(reqPriv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respPriv.Body.Close()
+		if respPriv.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 Forbidden for untrusted redirect host, got: %d", respPriv.StatusCode)
+		}
+
+		// Probe 10: Deny SSRF / loopback target when AllowTestLoopback is false
+		sockPathSSRF := filepath.Join(sockDir, "dep-ssrf.sock")
+		gwSSRF, err := StartDependencyGateway(DependencyGatewayConfig{
+			SocketPath:        sockPathSSRF,
+			ProxyBaseURL:      "http://127.0.0.1:8080",
+			AllowTestLoopback: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer gwSSRF.Close()
+
+		clientSSRF := &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", sockPathSSRF)
+				},
+			},
+			Timeout: 3 * time.Second,
+		}
+		reqSSRF, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/v0.7.0.info", nil)
+		respSSRF, err := clientSSRF.Do(reqSSRF)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respSSRF.Body.Close()
+		if respSSRF.StatusCode != http.StatusBadGateway {
+			t.Fatalf("expected 502 Bad Gateway for loopback SSRF target, got: %d", respSSRF.StatusCode)
+		}
+
+		// Probe 11: Deny redirect loop (> 3 hops)
+		var loopServer *httptest.Server
+		loopServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, loopServer.URL+"/loop", http.StatusFound)
+		}))
+		defer loopServer.Close()
+
+		loopHost := strings.TrimPrefix(loopServer.URL, "http://")
+		if h, _, err := net.SplitHostPort(loopHost); err == nil {
+			loopHost = h
+		}
+
+		sockPathLoop := filepath.Join(sockDir, "dep-loop.sock")
+		gwLoop, err := StartDependencyGateway(DependencyGatewayConfig{
+			SocketPath:        sockPathLoop,
+			ProxyBaseURL:      loopServer.URL,
+			AllowedHosts:      []string{loopHost},
+			AllowTestLoopback: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer gwLoop.Close()
+
+		clientLoop := &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", sockPathLoop)
+				},
+			},
+			Timeout: 3 * time.Second,
+		}
+		reqLoop, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/v0.7.0.zip", nil)
+		respLoop, err := clientLoop.Do(reqLoop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		respLoop.Body.Close()
+		if respLoop.StatusCode != http.StatusBadGateway {
+			t.Fatalf("expected 502 Bad Gateway for redirect loop, got: %d", respLoop.StatusCode)
+		}
+	})
+
+	// 3. Offline stage isolation and no gateway socket
+	t.Run("OfflineStageIsolationAndNoGatewaySocket", func(t *testing.T) {
+		mockSlot := newMockSlotManager(t)
+		mockPodman := newMockPodmanBackend(t)
+
+		r := &Runner{
+			Timeout:     5 * time.Minute,
+			SlotManager: mockSlot,
+			Backend:     mockPodman,
+			DepPreparer: &mockDependencyPreparer{
+				result: &StageResult{
+					StageName: "prep",
+					Passed:    true,
+				},
+			},
+		}
+
+		// Build a benign snapshot
+		srcDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(srcDir, "go.mod"), []byte("module offline.test\n\ngo 1.22\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "main.go"), []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		validSHA := "0123456789abcdef0123456789abcdef01234567"
+		snap := &Snapshot{
+			CommitSHA: validSHA,
+			SourceDir: srcDir,
+		}
+
+		report, err := r.RunSnapshot(context.Background(), snap)
+		if err != nil {
+			t.Fatalf("RunSnapshot failed: %v", err)
+		}
+		if report.Status != StatusPassed {
+			t.Fatalf("expected StatusPassed with mock podman, got: %q", report.Status)
+		}
+	})
+
+	// 4. Live execution against operator-provisioned environment (if configured)
+	t.Run("LiveExecution", func(t *testing.T) {
+		podmanPath, err := exec.LookPath("podman")
+		if err != nil {
+			t.Fatalf("podman binary not found in PATH: %v", err)
+		}
+
+		imageDigest := os.Getenv("PR_REVIEW_SANDBOX_IMAGE")
+		slotDir := os.Getenv("PR_REVIEW_SLOT_DIR")
+		if imageDigest == "" || slotDir == "" {
+			t.Logf("Operator setup required: set PR_REVIEW_SANDBOX_IMAGE and PR_REVIEW_SLOT_DIR to run live container dependency probes")
+			t.Logf("See 01-USER-SETUP.md for administrator and operator provisioning instructions")
+			return
+		}
+
+		controlDir := os.Getenv("PR_REVIEW_CONTROL_DIR")
+		if controlDir == "" {
+			controlDir = t.TempDir()
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		slotMgr, err := NewLinuxSlotManager(slotDir, controlDir)
+		if err != nil {
+			t.Fatalf("failed to initialize slot manager: %v", err)
+		}
+
+		mountID, err := slotMgr.ValidateSlotMount(slotDir)
+		if err != nil {
+			t.Fatalf("operator slot %q failed validation: %v", slotDir, err)
+		}
+		t.Logf("Operator slot verified: %q (mount ID %d)", slotDir, mountID)
+
+		podmanCfg := PodmanConfig{
+			BinaryPath:   podmanPath,
+			ImageDigest:  imageDigest,
+			CPUs:         2.0,
+			MemoryBytes:  2147483648,
+			PidsLimit:    256,
+			TimeoutStage: 5 * time.Minute,
+			TimeoutClean: 15 * time.Second,
+		}
+		backend := NewPodmanBackend(podmanCfg)
+
+		if err := backend.Attest(ctx); err != nil {
+			t.Fatalf("podman capability attestation failed: %v", err)
+		}
+		t.Logf("Live dependency tracer attestation PASSED")
+
+		// Create pinned public module fixture
+		fixtureDir := t.TempDir()
+		goModContent := `module tracer.test/depfixture
+
+go 1.22
+
+require golang.org/x/sync v0.7.0
+`
+		if err := os.WriteFile(filepath.Join(fixtureDir, "go.mod"), []byte(goModContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+		goSumContent := `golang.org/x/sync v0.7.0 h1:3wmp05U811omFsSGS488P1/7h4s/6csm18+5s5QZ2V0=
+golang.org/x/sync v0.7.0/go.mod h1:C:Sem/wgKAdf3E1YbNVo56rypy6yDYV64EB44mWDwuQ=
+`
+		if err := os.WriteFile(filepath.Join(fixtureDir, "go.sum"), []byte(goSumContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+		code := `package depfixture
+
+import (
+	"context"
+	"golang.org/x/sync/errgroup"
+)
+
+func RunParallel(tasks []func() error) error {
+	g, _ := errgroup.WithContext(context.Background())
+	for _, t := range tasks {
+		fn := t
+		g.Go(fn)
+	}
+	return g.Wait()
+}
+`
+		if err := os.WriteFile(filepath.Join(fixtureDir, "fixture.go"), []byte(code), 0644); err != nil {
+			t.Fatal(err)
+		}
+		testCode := `package depfixture
+
+import (
+	"errors"
+	"sync/atomic"
+	"testing"
+)
+
+func TestRunParallel(t *testing.T) {
+	var count int64
+	tasks := []func() error{
+		func() error { atomic.AddInt64(&count, 1); return nil },
+		func() error { atomic.AddInt64(&count, 1); return nil },
+	}
+	if err := RunParallel(tasks); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if atomic.LoadInt64(&count) != 2 {
+		t.Fatalf("expected 2 tasks run, got: %d", count)
+	}
+}
+
+func TestRunParallel_Error(t *testing.T) {
+	tasks := []func() error{
+		func() error { return errors.New("boom") },
+	}
+	if err := RunParallel(tasks); err == nil {
+		t.Fatalf("expected error from boom task")
+	}
+}
+`
+		if err := os.WriteFile(filepath.Join(fixtureDir, "fixture_test.go"), []byte(testCode), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		runnerCfg := &config.Config{
+			SandboxCPUs:             2.0,
+			SandboxMemoryBytes:      2147483648,
+			SandboxPidsLimit:        256,
+			SandboxDiskBytes:        MaxSlotCapacityBytes,
+			SandboxTimeoutExecution: 5 * time.Minute,
+			SandboxTimeoutPrep:      3 * time.Minute,
+			SandboxTimeoutCleanup:   15 * time.Second,
+		}
+		runner := NewRunnerWithConfig(runnerCfg, backend, slotMgr)
+
+		sha := computeDirSHA(fixtureDir)
+		snapshot := &Snapshot{
+			CommitSHA: sha,
+			SourceDir: fixtureDir,
+		}
+
+		report, err := runner.RunSnapshot(ctx, snapshot)
+		if err != nil {
+			t.Fatalf("RunSnapshot failed unexpectedly: %v", err)
+		}
+		if report.Status != StatusPassed {
+			t.Fatalf("expected StatusPassed for pinned public module fixture, got status=%q, reason=%q", report.Status, report.Reason)
+		}
+		t.Logf("Live dependency preparation and offline build/race-test PASSED")
+	})
+}
+
+
