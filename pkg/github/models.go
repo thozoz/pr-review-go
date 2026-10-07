@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+// ServiceActor represents the verified authenticated identity of the service.
+type ServiceActor struct {
+	ID    int64  `json:"id"`
+	Login string `json:"login"`
+}
+
 // PRDetails holds basic metadata of the pull request
 type PRDetails struct {
 	Owner         string

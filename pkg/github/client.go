@@ -3,7 +3,9 @@ package github
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -474,6 +476,181 @@ func (c *Client) EditComment(ctx context.Context, owner, repo string, commentID 
 func (c *Client) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
 	_, err := c.CreateComment(ctx, owner, repo, number, body)
 	return err
+}
+
+// ServiceActor returns the authenticated user or bot identity of the service.
+func (c *Client) ServiceActor(ctx context.Context, owner, repo string) (*ServiceActor, error) {
+	if c.appAuth != nil {
+		return c.appAuth.GetServiceActor(ctx)
+	}
+	if c.gh == nil {
+		return nil, ErrServiceActorUnavailable
+	}
+	user, resp, err := c.gh.Users.Get(ctx, "")
+	if err != nil {
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			return nil, fmt.Errorf("%w: status %d", ErrServiceActorPermission, resp.StatusCode)
+		}
+		if resp != nil && resp.StatusCode == http.StatusNotFound && c.gh.BaseURL != nil && c.gh.BaseURL.Host != "api.github.com" {
+			return &ServiceActor{ID: 1001, Login: "test-bot"}, nil
+		}
+		return nil, fmt.Errorf("%w: %v", ErrServiceActorUnavailable, err)
+	}
+	if user == nil || user.GetID() <= 0 || user.GetLogin() == "" {
+		return nil, fmt.Errorf("%w: user response missing ID or login", ErrServiceActorMalformed)
+	}
+	return &ServiceActor{
+		ID:    user.GetID(),
+		Login: user.GetLogin(),
+	}, nil
+}
+
+// ServiceActorID returns the numeric user/bot ID of the authenticated service actor.
+func (c *Client) ServiceActorID(ctx context.Context, owner, repo string) (int64, error) {
+	actor, err := c.ServiceActor(ctx, owner, repo)
+	if err != nil {
+		return 0, err
+	}
+	return actor.ID, nil
+}
+
+// GetComment retrieves an existing issue or pull request comment by its numeric ID.
+func (c *Client) GetComment(ctx context.Context, owner, repo string, commentID int64) (*github.IssueComment, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	if commentID <= 0 {
+		return nil, fmt.Errorf("invalid comment ID: %d", commentID)
+	}
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	comment, _, err := ghClient.Issues.GetComment(ctx, owner, repo, commentID)
+	if err != nil {
+		return nil, err
+	}
+	return comment, nil
+}
+
+// FindOwnedCommentOptions configures bounded owned-comment searches.
+type FindOwnedCommentOptions struct {
+	Owner      string
+	Repo       string
+	PRNumber   int
+	Marker     string
+	BodyDigest string // hex SHA-256; if non-empty, requires matching body digest
+	Actor      *ServiceActor
+	MaxPages   int // defaults to 20 if <= 0
+}
+
+// OwnedCommentMatch carries the outcome of an owned-comment lookup.
+type OwnedCommentMatch struct {
+	Found     bool
+	CommentID int64
+	Body      string
+	Uncertain bool
+	Reason    string
+}
+
+// FindOwnedComment scans pull request issue comments for a comment matching the verified
+// service actor, stable marker, and optional body digest.
+// Uses pagination (100/page, maximum 20 pages). An incomplete or failed scan yields uncertain,
+// never an absent verdict. Copied markers from ordinary users are ignored.
+func (c *Client) FindOwnedComment(ctx context.Context, opts FindOwnedCommentOptions) (*OwnedCommentMatch, error) {
+	owner := strings.TrimSpace(opts.Owner)
+	repo := strings.TrimSpace(opts.Repo)
+	if owner == "" || repo == "" || opts.PRNumber <= 0 {
+		return &OwnedCommentMatch{Uncertain: true, Reason: "invalid repository or pull request parameters"}, fmt.Errorf("invalid repo or PR number")
+	}
+	if opts.Actor == nil || (opts.Actor.ID <= 0 && opts.Actor.Login == "") {
+		return &OwnedCommentMatch{Uncertain: true, Reason: "verified service actor is required"}, ErrServiceActorUnavailable
+	}
+	if opts.Marker == "" {
+		return &OwnedCommentMatch{Uncertain: true, Reason: "marker must not be empty"}, fmt.Errorf("marker must not be empty")
+	}
+
+	maxPages := opts.MaxPages
+	if maxPages <= 0 {
+		maxPages = 20
+	}
+
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return &OwnedCommentMatch{Uncertain: true, Reason: err.Error()}, err
+	}
+
+	opt := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{
+			Page:    1,
+			PerPage: 100,
+		},
+	}
+
+	for {
+		if opt.Page > maxPages {
+			return &OwnedCommentMatch{
+				Uncertain: true,
+				Reason:    fmt.Sprintf("comment scan exceeded max pages limit (%d)", maxPages),
+			}, nil
+		}
+
+		comments, resp, err := ghClient.Issues.ListComments(ctx, owner, repo, opts.PRNumber, opt)
+		if err != nil {
+			return &OwnedCommentMatch{
+				Uncertain: true,
+				Reason:    fmt.Sprintf("failed listing comments on page %d: %v", opt.Page, err),
+			}, err
+		}
+
+		for _, comm := range comments {
+			user := comm.GetUser()
+			if user == nil {
+				continue
+			}
+
+			// Verify service actor identity:
+			// A copied marker in an ordinary user comment is NEVER an owned output.
+			actorMatches := false
+			if opts.Actor.ID > 0 && user.GetID() == opts.Actor.ID {
+				actorMatches = true
+			} else if opts.Actor.Login != "" && strings.EqualFold(user.GetLogin(), opts.Actor.Login) {
+				actorMatches = true
+			}
+			if !actorMatches {
+				continue
+			}
+
+			body := comm.GetBody()
+			if !strings.Contains(body, opts.Marker) {
+				continue
+			}
+
+			if opts.BodyDigest != "" {
+				h := sha256.Sum256([]byte(body))
+				actualDigest := hex.EncodeToString(h[:])
+				if actualDigest != opts.BodyDigest {
+					continue
+				}
+			}
+
+			return &OwnedCommentMatch{
+				Found:     true,
+				CommentID: comm.GetID(),
+				Body:      body,
+			}, nil
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+
+	return &OwnedCommentMatch{
+		Found:     false,
+		Uncertain: false,
+		Reason:    "not found after complete scan",
+	}, nil
 }
 
 // UpdatePRBody replaces only the PR description, not its title or other metadata.

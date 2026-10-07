@@ -94,6 +94,24 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) error {
 	gh := e.server.gh
 	engine := e.server.engine
+	pub := NewPublication(e.store, gh)
+
+	// Check if this job already has a saved review output intent.
+	// If output was already generated before a crash, reconcile durable saved output
+	// before scheduling regeneration — known stored output never reruns generation.
+	reviewMarker := fmt.Sprintf("<!-- pr-review-output:%s -->", job.ID)
+	existingIntent, _ := e.store.GetOutputIntent(ctx, reviewMarker)
+	if existingIntent != nil && existingIntent.Body != "" {
+		log.Printf("[jobs] Reconciling existing stored review output for %s without regeneration", job.ID)
+		res, err := pub.ReconcileOutput(ctx, existingIntent)
+		if err != nil {
+			return err
+		}
+		if res != nil && res.Status == "completed" && job.StatusCommentID > 0 {
+			_, _ = pub.PublishStatus(ctx, job, "✅ Review completed.")
+		}
+		return nil
+	}
 
 	// 1. Initial head check before expensive generation
 	livePR, prErr := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
@@ -159,39 +177,10 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		initialStatusBody = "⏳ Review queued; waiting for capacity"
 	}
 
-	statusMarker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
-	statusIntent := &OutputIntent{
-		Marker:    statusMarker,
-		JobID:     job.ID,
-		Action:    "status",
-		PRKey:     job.PRKey,
-		Owner:     job.Owner,
-		Repo:      job.Repo,
-		PRNumber:  job.PRNumber,
-		ExactHead: job.HeadSHA,
-		Body:      initialStatusBody,
-		Status:    "pending",
-	}
-
-	if err := e.store.SaveOutputIntent(ctx, statusIntent); err != nil {
-		log.Printf("[jobs] Failed saving initial status intent for %s: %v", job.ID, err)
-	}
-
-	statusCommentID, err := gh.CreateComment(ctx, job.Owner, job.Repo, job.PRNumber, initialStatusBody)
-	if err == nil {
-		statusIntent.CommentID = statusCommentID
-		statusIntent.Status = "in_progress"
-		_ = e.store.UpdateOutputIntent(ctx, statusIntent)
-
-		job.StatusCommentID = statusCommentID
-		_ = e.store.UpdateJob(ctx, job)
-
-		if !isRerun {
-			// Transition status comment to running
-			_ = gh.EditComment(ctx, job.Owner, job.Repo, statusCommentID, "🔄 Review running...")
-		}
-	} else {
-		log.Printf("[jobs] Warning: Failed creating status comment for %s: %v", job.ID, err)
+	_, _ = pub.PublishStatus(ctx, job, initialStatusBody)
+	if !isRerun {
+		// Transition status comment to running
+		_, _ = pub.PublishStatus(ctx, job, "🔄 Review running...")
 	}
 
 	// 3. Head-bound review execution
@@ -199,7 +188,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	if err != nil {
 		log.Printf("[jobs] Review failed for %s: %v", job.ID, err)
 		if job.StatusCommentID > 0 {
-			_ = gh.EditComment(ctx, job.Owner, job.Repo, job.StatusCommentID, fmt.Sprintf("❌ Review failed: %v", err))
+			_, _ = pub.PublishStatus(ctx, job, fmt.Sprintf("❌ Review failed: %v", err))
 		}
 		job.Status = "failed"
 		job.Error = err.Error()
@@ -256,7 +245,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	}
 
 	// 5. Save review output intent before posting
-	reviewMarker := fmt.Sprintf("<!-- pr-review-output:%s -->", job.ID)
+	reviewMarker = fmt.Sprintf("<!-- pr-review-output:%s -->", job.ID)
 	boundedMarkdown := report.RawMarkdown
 	if len(boundedMarkdown) > MaxReviewBodyBytes {
 		boundedMarkdown = boundedMarkdown[:MaxReviewBodyBytes]
@@ -278,38 +267,24 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		log.Printf("[jobs] Failed saving review output intent for %s: %v", job.ID, err)
 	}
 
-	// 6. Post review output
-	outputCommentID, err := gh.CreateComment(ctx, job.Owner, job.Repo, job.PRNumber, boundedMarkdown)
-	if err != nil {
-		log.Printf("[jobs] Failed posting review comment for %s: %v", job.ID, err)
-		reviewIntent.Status = "uncertain"
-		_ = e.store.UpdateOutputIntent(ctx, reviewIntent)
-		job.Status = "uncertain"
-		job.Error = err.Error()
-		_ = e.store.UpdateJob(ctx, job)
-		return err
+	// 6. Reconcile review output publication across crash windows & in-flight head movement
+	res, recErr := pub.ReconcileOutput(ctx, reviewIntent)
+	if recErr != nil || (res != nil && res.Status == "uncertain") {
+		return recErr
 	}
 
-	reviewIntent.CommentID = outputCommentID
-	reviewIntent.Status = "completed"
-	_ = e.store.UpdateOutputIntent(ctx, reviewIntent)
+	if res != nil && res.Status == "superseded" {
+		if job.StatusCommentID > 0 {
+			_, _ = pub.PublishStatus(ctx, job, "⏭️ Review superseded by newer commit.")
+		}
+		return nil
+	}
 
 	// 7. Update status comment to completed
 	if job.StatusCommentID > 0 && !isRerun {
-		_ = gh.EditComment(ctx, job.Owner, job.Repo, job.StatusCommentID, "✅ Review completed.")
+		_, _ = pub.PublishStatus(ctx, job, "✅ Review completed.")
 	}
 
-	// 8. Update PR state last reviewed head and mark job completed
-	prState, _ = e.store.GetPRState(ctx, job.PRKey)
-	if prState != nil {
-		prState.LastReviewedHead = job.HeadSHA
-		_ = e.store.UpdatePRState(ctx, prState)
-	}
-
-	job.Status = "completed"
-	now := time.Now().UTC()
-	job.FinishedAt = &now
-	_ = e.store.UpdateJob(ctx, job)
 	return nil
 }
 

@@ -32,6 +32,9 @@ var (
 	ErrRetrievalAuthUnavailable = errors.New("retrieval credentials unavailable: GitHub App authentication is required for scoped private source retrieval, PAT substitution is forbidden (D-10)")
 	ErrInvalidRepoID            = errors.New("invalid or empty repository ID")
 	ErrScopeTooBroad            = errors.New("retrieval credential scope too broad or unverified")
+	ErrServiceActorUnavailable  = errors.New("service actor unavailable")
+	ErrServiceActorPermission   = errors.New("service actor permission error")
+	ErrServiceActorMalformed    = errors.New("service actor response malformed")
 )
 
 // RetrievalCredential holds a short-lived, least-privilege App token scoped to exactly one
@@ -77,6 +80,9 @@ type AppAuth struct {
 	jwtMu     sync.Mutex
 	cachedJWT string
 	jwtExpiry time.Time
+
+	actorMu     sync.Mutex
+	cachedActor *ServiceActor
 
 	mu    sync.Mutex
 	repos map[string]*repoEntry
@@ -257,6 +263,100 @@ func (a *AppAuth) getRepoInstallationID(ctx context.Context, owner, repo string)
 		return 0, fmt.Errorf("no installation ID in response for %s/%s", owner, repo)
 	}
 	return inst.ID, nil
+}
+
+func (a *AppAuth) GetServiceActor(ctx context.Context) (*ServiceActor, error) {
+	a.actorMu.Lock()
+	defer a.actorMu.Unlock()
+	if a.cachedActor != nil {
+		return a.cachedActor, nil
+	}
+
+	jwt, err := a.getJWT()
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to generate jwt: %v", ErrServiceActorUnavailable, err)
+	}
+
+	appURL := fmt.Sprintf("%s/app", a.apiURL())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, appURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: create app request: %v", ErrServiceActorUnavailable, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: request app info: %v", ErrServiceActorUnavailable, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: get app returned status %d", ErrServiceActorPermission, resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: get app returned status %d", ErrServiceActorUnavailable, resp.StatusCode)
+	}
+
+	var appInfo struct {
+		ID   int64  `json:"id"`
+		Slug string `json:"slug"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&appInfo); err != nil {
+		return nil, fmt.Errorf("%w: decode app info: %v", ErrServiceActorMalformed, err)
+	}
+
+	slug := appInfo.Slug
+	if slug == "" {
+		slug = strings.ToLower(strings.ReplaceAll(appInfo.Name, " ", "-"))
+	}
+	if slug == "" {
+		return nil, fmt.Errorf("%w: empty app slug and name", ErrServiceActorMalformed)
+	}
+
+	botLogin := slug + "[bot]"
+	userURL := fmt.Sprintf("%s/users/%s", a.apiURL(), url.PathEscape(botLogin))
+	userReq, err := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: create bot user request: %v", ErrServiceActorUnavailable, err)
+	}
+	userReq.Header.Set("Authorization", "Bearer "+jwt)
+	userReq.Header.Set("Accept", "application/vnd.github+json")
+	userReq.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	userResp, err := a.httpClient.Do(userReq)
+	if err != nil {
+		return nil, fmt.Errorf("%w: request bot user: %v", ErrServiceActorUnavailable, err)
+	}
+	defer userResp.Body.Close()
+
+	if userResp.StatusCode == http.StatusUnauthorized || userResp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: get bot user returned status %d", ErrServiceActorPermission, userResp.StatusCode)
+	}
+	if userResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: get bot user returned status %d", ErrServiceActorUnavailable, userResp.StatusCode)
+	}
+
+	var botUser struct {
+		ID    int64  `json:"id"`
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	}
+	if err := json.NewDecoder(userResp.Body).Decode(&botUser); err != nil {
+		return nil, fmt.Errorf("%w: decode bot user: %v", ErrServiceActorMalformed, err)
+	}
+
+	if botUser.ID <= 0 || botUser.Login == "" {
+		return nil, fmt.Errorf("%w: bot user missing id or login", ErrServiceActorMalformed)
+	}
+
+	a.cachedActor = &ServiceActor{
+		ID:    botUser.ID,
+		Login: botUser.Login,
+	}
+	return a.cachedActor, nil
 }
 
 func (a *AppAuth) createInstallationToken(ctx context.Context, installationID int64) (*oauth2.Token, error) {
