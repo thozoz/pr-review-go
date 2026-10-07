@@ -43,6 +43,7 @@ type Server struct {
 	store        JobStore
 	scheduler    *Scheduler
 	runtimeReady bool
+	shuttingDown bool
 	runtimeErr   error
 	mu           sync.RWMutex
 }
@@ -152,17 +153,38 @@ func (s *Server) ensureStore() error {
 	return s.scheduler.Start(context.Background())
 }
 
+// Shutdown stops admission of new webhook events, drains workers within the provided
+// context deadline, and closes the persistent database only after workers have stopped.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	s.shuttingDown = true
+	s.runtimeReady = false
+	s.mu.Unlock()
+
+	if s.cfg.IsGitHubAppSetupMode() {
+		return nil
+	}
+
+	var shutdownErr error
+	if s.scheduler != nil {
+		if err := s.scheduler.Shutdown(ctx); err != nil {
+			shutdownErr = err
+		}
+	}
+
+	// Close database ONLY after workers have stopped
+	if s.store != nil {
+		if err := s.store.Close(); err != nil && shutdownErr == nil {
+			shutdownErr = err
+		}
+	}
+
+	return shutdownErr
+}
+
 // Stop stops workers and closes the durable job store.
 func (s *Server) Stop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.scheduler != nil {
-		s.scheduler.Stop()
-	}
-	if s.store != nil {
-		_ = s.store.Close()
-	}
-	s.runtimeReady = false
+	_ = s.Shutdown(context.Background())
 }
 
 func (s *Server) SetStore(store JobStore) {
@@ -224,6 +246,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	runtimeErr := s.runtimeErr
 	ready := s.runtimeReady
+	shuttingDown := s.shuttingDown
 	s.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -231,6 +254,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	runtimeStatus := "ready"
 	if s.cfg.IsGitHubAppSetupMode() {
 		runtimeStatus = "setup_mode"
+	} else if shuttingDown {
+		status = "degraded"
+		runtimeStatus = "shutting_down"
 	} else if runtimeErr != nil {
 		status = "degraded"
 		runtimeStatus = "unavailable"
@@ -238,15 +264,48 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		runtimeStatus = "uninitialized"
 	}
 
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	resp := map[string]any{
 		"status":  status,
 		"runtime": runtimeStatus,
 		"service": "pr-review-go",
 		"version": version.Version,
-	})
+	}
+
+	if s.store != nil && !s.cfg.IsGitHubAppSetupMode() {
+		warningTTL := s.cfg.WebhookOldQueueWarning
+		if warningTTL <= 0 {
+			warningTTL = 24 * time.Hour
+		}
+		counts, err := s.store.GetHealthCounts(r.Context(), warningTTL)
+		if err == nil {
+			resp["counts"] = map[string]int{
+				"queued":          counts.Queued,
+				"running":         counts.Running,
+				"uncertain":       counts.Uncertain,
+				"needs_attention": counts.NeedsAttention,
+			}
+			resp["old_wait_warning"] = counts.OldWaitWarning
+			if counts.Uncertain > 0 || counts.NeedsAttention > 0 || counts.OldWaitWarning {
+				if status == "ok" {
+					resp["status"] = "degraded"
+				}
+			}
+		}
+	}
+
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	shuttingDown := s.shuttingDown
+	s.mu.RUnlock()
+	if shuttingDown {
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	if s.cfg.WebhookSecret == "" {
 		log.Printf("[webhook] Webhook secret not configured")
 		http.Error(w, "webhook secret not configured", http.StatusUnauthorized)

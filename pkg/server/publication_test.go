@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
 
 	"github.com/thozoz/pr-review-go/pkg/config"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
@@ -460,4 +462,311 @@ func TestPublicationRecovery(t *testing.T) {
 			t.Errorf("job status = %q, want completed", updatedJob.Status)
 		}
 	})
+}
+
+func TestJobRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "jobs.db")
+	store, err := OpenJobStore(dbPath, StoreOptions{BacklogLimit: 20})
+	if err != nil {
+		t.Fatalf("OpenJobStore error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	prKey1, _ := MakePRKey("github.com", 100, 1)
+	prKey2, _ := MakePRKey("github.com", 200, 2)
+	baseSHA := "1111111111111111111111111111111111111111"
+	headSHA := "2222222222222222222222222222222222222222"
+
+	// Admit jobs for PR 1
+	deliv1 := Delivery{
+		Host:        prKey1.Host,
+		RepoID:      prKey1.RepoID,
+		DeliveryID:  "deliv-1",
+		EventKind:   "pull_request",
+		PayloadHash: "hash1",
+		ReceivedAt:  time.Now().UTC(),
+	}
+	_, err = store.Admit(ctx, deliv1, []Job{
+		{Kind: "review", Trigger: "automatic", PRKey: prKey1, Owner: "org", Repo: "repo1", PRNumber: 1, BaseSHA: baseSHA, HeadSHA: headSHA},
+		{Kind: "review", Trigger: "automatic", PRKey: prKey1, Owner: "org", Repo: "repo1", PRNumber: 1, BaseSHA: baseSHA, HeadSHA: headSHA},
+		{Kind: "labels", Trigger: "automatic", PRKey: prKey1, Owner: "org", Repo: "repo1", PRNumber: 1, BaseSHA: baseSHA, HeadSHA: headSHA},
+		{Kind: "improve", Trigger: "explicit", PRKey: prKey1, Owner: "org", Repo: "repo1", PRNumber: 1, BaseSHA: baseSHA, HeadSHA: headSHA},
+		{Kind: "summary", Trigger: "explicit", PRKey: prKey1, Owner: "org", Repo: "repo1", PRNumber: 1, BaseSHA: baseSHA, HeadSHA: headSHA},
+		{Kind: "assistant", Trigger: "explicit", PRKey: prKey1, Owner: "org", Repo: "repo1", PRNumber: 1, BaseSHA: baseSHA, HeadSHA: headSHA},
+	})
+	if err != nil {
+		t.Fatalf("Admit deliv1 error: %v", err)
+	}
+
+	// Admit queued job for PR 2
+	deliv2 := Delivery{
+		Host:        prKey2.Host,
+		RepoID:      prKey2.RepoID,
+		DeliveryID:  "deliv-2",
+		EventKind:   "pull_request",
+		PayloadHash: "hash2",
+		ReceivedAt:  time.Now().UTC(),
+	}
+	_, err = store.Admit(ctx, deliv2, []Job{
+		{Kind: "review", Trigger: "automatic", PRKey: prKey2, Owner: "org", Repo: "repo2", PRNumber: 2, BaseSHA: baseSHA, HeadSHA: headSHA},
+	})
+	if err != nil {
+		t.Fatalf("Admit deliv2 error: %v", err)
+	}
+
+	jobs, _ := store.ListQueuedJobs(ctx)
+	if len(jobs) < 7 {
+		t.Fatalf("expected at least 7 queued jobs, got %d", len(jobs))
+	}
+
+	// Mark jobs 0-5 as running (simulating crash while running)
+	j0 := jobs[0] // review with saved output
+	j0.Status = "running"
+	_ = store.UpdateJob(ctx, j0)
+	// Save output intent for j0
+	marker0 := fmt.Sprintf("<!-- pr-review-output:%s -->", j0.ID)
+	_ = store.SaveOutputIntent(ctx, &OutputIntent{
+		Marker: marker0, JobID: j0.ID, Action: "review_output", PRKey: prKey1,
+		ExactHead: headSHA, Body: "Saved output report", Status: "pending",
+	})
+
+	j1 := jobs[1] // review without saved output
+	j1.Status = "running"
+	_ = store.UpdateJob(ctx, j1)
+
+	j2 := jobs[2] // labels (idempotent)
+	j2.Status = "running"
+	_ = store.UpdateJob(ctx, j2)
+
+	j3 := jobs[3] // improve (static)
+	j3.Status = "running"
+	_ = store.UpdateJob(ctx, j3)
+
+	j4 := jobs[4] // summary (non-idempotent)
+	j4.Status = "running"
+	_ = store.UpdateJob(ctx, j4)
+
+	j5 := jobs[5] // assistant (non-idempotent)
+	j5.Status = "running"
+	_ = store.UpdateJob(ctx, j5)
+
+	// Set active job for PR 1
+	st1, _ := store.GetPRState(ctx, prKey1)
+	st1.ActiveJobID = j0.ID
+	_ = store.UpdatePRState(ctx, st1)
+
+	// Perform RecoverJobs
+	recovered, err := store.RecoverJobs(ctx)
+	if err != nil {
+		t.Fatalf("RecoverJobs error: %v", err)
+	}
+	if len(recovered) != 6 {
+		t.Fatalf("expected 6 recovered jobs, got %d", len(recovered))
+	}
+
+	// Verify recovery phases and statuses:
+	rj0, _ := store.GetJob(ctx, j0.ID)
+	if rj0.Status != "queued" || rj0.RecoveryPhase != "reconcile_output" {
+		t.Errorf("job 0 with saved output: status = %q, phase = %q, want queued / reconcile_output", rj0.Status, rj0.RecoveryPhase)
+	}
+
+	rj1, _ := store.GetJob(ctx, j1.ID)
+	if rj1.Status != "queued" || rj1.RecoveryPhase != "requeued_after_interrupt" {
+		t.Errorf("job 1 without output: status = %q, phase = %q, want queued / requeued_after_interrupt", rj1.Status, rj1.RecoveryPhase)
+	}
+
+	rj2, _ := store.GetJob(ctx, j2.ID)
+	if rj2.Status != "queued" || rj2.RecoveryPhase != "requeued_idempotent" {
+		t.Errorf("job 2 labels: status = %q, phase = %q, want queued / requeued_idempotent", rj2.Status, rj2.RecoveryPhase)
+	}
+
+	rj3, _ := store.GetJob(ctx, j3.ID)
+	if rj3.Status != "queued" || rj3.RecoveryPhase != "requeued_static" {
+		t.Errorf("job 3 improve: status = %q, phase = %q, want queued / requeued_static", rj3.Status, rj3.RecoveryPhase)
+	}
+
+	rj4, _ := store.GetJob(ctx, j4.ID)
+	if rj4.Status != "needs_attention" || rj4.RecoveryPhase != "interrupted_unproven" {
+		t.Errorf("job 4 summary: status = %q, phase = %q, want needs_attention / interrupted_unproven", rj4.Status, rj4.RecoveryPhase)
+	}
+
+	rj5, _ := store.GetJob(ctx, j5.ID)
+	if rj5.Status != "needs_attention" || rj5.RecoveryPhase != "interrupted_unproven" {
+		t.Errorf("job 5 assistant: status = %q, phase = %q, want needs_attention / interrupted_unproven", rj5.Status, rj5.RecoveryPhase)
+	}
+
+	// Verify PR states: PR 1 should be blocked because of needs_attention jobs, active slot cleared
+	st1After, _ := store.GetPRState(ctx, prKey1)
+	if st1After.ActiveJobID != "" {
+		t.Errorf("expected PR 1 ActiveJobID to be cleared, got %q", st1After.ActiveJobID)
+	}
+	if !st1After.HasBlockedAction {
+		t.Errorf("expected PR 1 to have HasBlockedAction = true")
+	}
+
+	// Verify ClaimNextJob: PR 1 jobs are blocked, but PR 2 job can be claimed!
+	claimedJob, err := store.ClaimNextJob(ctx, map[string]bool{})
+	if err != nil {
+		t.Fatalf("ClaimNextJob error: %v", err)
+	}
+	if claimedJob == nil {
+		t.Fatalf("expected PR 2 job to be claimed, got nil")
+	}
+	if claimedJob.PRKey != prKey2 {
+		t.Errorf("claimed job PRKey = %v, want PR 2 (%v)", claimedJob.PRKey, prKey2)
+	}
+}
+
+func TestQueueOperatorResolution(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "jobs.db")
+	store, err := OpenJobStore(dbPath, StoreOptions{BacklogLimit: 10})
+	if err != nil {
+		t.Fatalf("OpenJobStore error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	prKey, _ := MakePRKey("github.com", 300, 3)
+	job := seedTestJob(t, store, prKey, "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222")
+
+	// 1. InspectJobs
+	allJobs, err := store.InspectJobs(ctx)
+	if err != nil {
+		t.Fatalf("InspectJobs error: %v", err)
+	}
+	if len(allJobs) == 0 {
+		t.Fatalf("InspectJobs returned empty list")
+	}
+
+	// 2. Unknown job resolution returns ErrJobNotFound
+	err = store.ResolveJob(ctx, "nonexistent-job-id", "confirmed", false)
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("expected ErrJobNotFound, got: %v", err)
+	}
+
+	// 3. Invalid resolution returns error
+	err = store.ResolveJob(ctx, job.ID, "bogus-disposition", false)
+	if err == nil {
+		t.Errorf("expected error for invalid resolution disposition")
+	}
+
+	// 4. Rerun without acknowledge-duplicate-risk returns error
+	job.Status = "needs_attention"
+	_ = store.UpdateJob(ctx, job)
+	err = store.ResolveJob(ctx, job.ID, "rerun", false)
+	if err == nil || !strings.Contains(err.Error(), "--acknowledge-duplicate-risk") {
+		t.Errorf("expected acknowledge duplicate risk error, got: %v", err)
+	}
+
+	// 5. Rerun with acknowledge-duplicate-risk succeeds and requeues job
+	err = store.ResolveJob(ctx, job.ID, "rerun", true)
+	if err != nil {
+		t.Fatalf("ResolveJob rerun error: %v", err)
+	}
+	rerunJob, _ := store.GetJob(ctx, job.ID)
+	if rerunJob.Status != "queued" || rerunJob.RecoveryPhase != "operator_rerun" {
+		t.Errorf("rerun job status = %q, phase = %q", rerunJob.Status, rerunJob.RecoveryPhase)
+	}
+
+	// 6. Confirmed disposition marks job completed
+	err = store.ResolveJob(ctx, job.ID, "confirmed", false)
+	if err != nil {
+		t.Fatalf("ResolveJob confirmed error: %v", err)
+	}
+	confirmedJob, _ := store.GetJob(ctx, job.ID)
+	if confirmedJob.Status != "completed" || confirmedJob.RecoveryPhase != "operator_confirmed" {
+		t.Errorf("confirmed job status = %q, phase = %q", confirmedJob.Status, confirmedJob.RecoveryPhase)
+	}
+
+	// 7. Cancel disposition marks job cancelled
+	job.Status = "needs_attention"
+	_ = store.UpdateJob(ctx, job)
+	err = store.ResolveJob(ctx, job.ID, "cancel", false)
+	if err != nil {
+		t.Fatalf("ResolveJob cancel error: %v", err)
+	}
+	cancelledJob, _ := store.GetJob(ctx, job.ID)
+	if cancelledJob.Status != "cancelled" || cancelledJob.RecoveryPhase != "operator_cancelled" {
+		t.Errorf("cancelled job status = %q, phase = %q", cancelledJob.Status, cancelledJob.RecoveryPhase)
+	}
+
+	// 8. Second-writer access: opening store while already open returns ErrDatabaseLocked
+	_, errSecond := OpenJobStore(dbPath, StoreOptions{OpenTimeout: 50 * time.Millisecond})
+	if !errors.Is(errSecond, ErrDatabaseLocked) {
+		t.Errorf("expected ErrDatabaseLocked for second writer, got: %v", errSecond)
+	}
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		WebhookStateDir:        tempDir,
+		WebhookSecret:          "test-secret",
+		WebhookWorkers:         1,
+		WebhookShutdownTimeout: 5 * time.Second,
+		Port:                   8080,
+		GitHubToken:            "test-token",
+		LLMAPIKey:              "test-key",
+		LLMModel:               "gpt-4o",
+		LLMBaseURL:             "https://api.openai.com/v1",
+	}
+
+	srv := NewServer(cfg)
+	ctx := context.Background()
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("Server.Start error: %v", err)
+	}
+
+	// 1. Health check returns non-sensitive counts
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health check returned code %d", rec.Code)
+	}
+	var healthResp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &healthResp); err != nil {
+		t.Fatalf("decode health response error: %v", err)
+	}
+	if healthResp["status"] != "ok" || healthResp["runtime"] != "ready" {
+		t.Errorf("health status = %v, runtime = %v", healthResp["status"], healthResp["runtime"])
+	}
+	if _, ok := healthResp["counts"]; !ok {
+		t.Errorf("health response missing non-sensitive counts: %v", healthResp)
+	}
+
+	// 2. Initiate Shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Server.Shutdown error: %v", err)
+	}
+
+	// 3. Webhook admission after shutdown receives 503
+	webhookRec := httptest.NewRecorder()
+	webhookReq := httptest.NewRequest(http.MethodPost, "/api/v1/github_webhooks", strings.NewReader(`{}`))
+	srv.Routes().ServeHTTP(webhookRec, webhookReq)
+
+	if webhookRec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 Service Unavailable during/after shutdown, got %d", webhookRec.Code)
+	}
+
+	// 4. Setup mode has no queue lifecycle
+	setupCfg := &config.Config{
+		GitHubAppSetupToken: "setup-token-123",
+		PublicURL:           "https://example.com",
+	}
+	setupSrv := NewServer(setupCfg)
+	if err := setupSrv.Start(context.Background()); err != nil {
+		t.Fatalf("setup mode Start error: %v", err)
+	}
+	if err := setupSrv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("setup mode Shutdown error: %v", err)
+	}
 }

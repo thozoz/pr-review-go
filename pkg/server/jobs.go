@@ -408,6 +408,7 @@ type Scheduler struct {
 	mu        sync.Mutex
 	wakeCh    chan struct{}
 	stopCh    chan struct{}
+	stopped   bool
 	wg        sync.WaitGroup
 }
 
@@ -427,7 +428,7 @@ func NewScheduler(store JobStore, executor JobExecutor, workers int) *Scheduler 
 
 func (s *Scheduler) Start(ctx context.Context) error {
 	// Recover interrupted jobs on startup
-	if _, err := s.store.RecoverInterruptedJobs(ctx); err != nil {
+	if _, err := s.store.RecoverJobs(ctx); err != nil {
 		log.Printf("[scheduler] Warning during job recovery: %v", err)
 	}
 
@@ -441,9 +442,32 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	return nil
 }
 
-func (s *Scheduler) Stop() {
+func (s *Scheduler) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return nil
+	}
+	s.stopped = true
 	close(s.stopCh)
-	s.wg.Wait()
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("scheduler shutdown timed out: %w", ctx.Err())
+	}
+}
+
+func (s *Scheduler) Stop() {
+	_ = s.Shutdown(context.Background())
 }
 
 func (s *Scheduler) Wake() {

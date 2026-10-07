@@ -151,6 +151,16 @@ type PRState struct {
 	HasReservedSuccessor bool   `json:"has_reserved_successor,omitempty"`
 	PendingAutoJobID     string `json:"pending_auto_job_id,omitempty"`
 	LatestHeadSHA        string `json:"latest_head_sha,omitempty"`
+	HasBlockedAction     bool   `json:"has_blocked_action,omitempty"`
+	BlockedReason        string `json:"blocked_reason,omitempty"`
+}
+
+type HealthCounts struct {
+	Queued         int  `json:"queued"`
+	Running        int  `json:"running"`
+	Uncertain      int  `json:"uncertain"`
+	NeedsAttention int  `json:"needs_attention"`
+	OldWaitWarning bool `json:"old_wait_warning"`
 }
 
 type AdmitStatus int
@@ -189,6 +199,10 @@ type JobStore interface {
 	GetOutputIntent(ctx context.Context, marker string) (*OutputIntent, error)
 	UpdateOutputIntent(ctx context.Context, intent *OutputIntent) error
 	RecoverInterruptedJobs(ctx context.Context) ([]*Job, error)
+	RecoverJobs(ctx context.Context) ([]*Job, error)
+	InspectJobs(ctx context.Context) ([]*Job, error)
+	ResolveJob(ctx context.Context, jobID string, resolution string, ackDuplicateRisk bool) error
+	GetHealthCounts(ctx context.Context, oldWaitWarning time.Duration) (HealthCounts, error)
 	ClaimNextJob(ctx context.Context, activePRs map[string]bool) (*Job, error)
 	ReleasePR(ctx context.Context, prKey PRKey) error
 	ScheduleSuccessorReview(ctx context.Context, prKey PRKey, owner, repo string, prNum int, baseSHA, headSHA string) (*Job, error)
@@ -802,9 +816,14 @@ func (s *BoltJobStore) UpdateOutputIntent(ctx context.Context, intent *OutputInt
 	return s.SaveOutputIntent(ctx, intent)
 }
 
-// RecoverInterruptedJobs inspects uncompleted jobs on startup and sets their recovery phase.
-// Running jobs that were interrupted are held as uncertain.
-func (s *BoltJobStore) RecoverInterruptedJobs(ctx context.Context) ([]*Job, error) {
+// RecoverJobs inspects uncompleted jobs on startup and sets their recovery phase:
+// - Review with saved output intent: queued for ReconcileOutput without regeneration.
+// - Interrupted review generation: requeued for generation.
+// - Idempotent actions (labels): requeued for idempotent set-add.
+// - Static actions (improve): requeued with owned intent.
+// - Non-idempotent actions (describe, summary, docs, changelog, assistant): marked needs_attention if unproven.
+// - Uncertain and needs_attention jobs release worker slots while blocking subsequent PR actions.
+func (s *BoltJobStore) RecoverJobs(ctx context.Context) ([]*Job, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.db == nil {
@@ -813,30 +832,269 @@ func (s *BoltJobStore) RecoverInterruptedJobs(ctx context.Context) ([]*Job, erro
 
 	var recovered []*Job
 	err := s.db.Update(func(tx *bbolt.Tx) error {
+		jobsBucket := tx.Bucket(bucketJobs)
+		prsBucket := tx.Bucket(bucketPRs)
+		intentsBucket := tx.Bucket(bucketIntents)
+
+		c := jobsBucket.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err != nil {
+				continue
+			}
+
+			if j.Status == "running" {
+				switch j.Kind {
+				case "review":
+					marker := fmt.Sprintf("<!-- pr-review-output:%s -->", j.ID)
+					hasSavedOutput := false
+					if itBytes := intentsBucket.Get([]byte(marker)); itBytes != nil {
+						var it OutputIntent
+						if err := json.Unmarshal(itBytes, &it); err == nil && it.Body != "" {
+							hasSavedOutput = true
+						}
+					}
+
+					if hasSavedOutput {
+						j.Status = "queued"
+						j.RecoveryPhase = "reconcile_output"
+					} else {
+						j.Status = "queued"
+						j.RecoveryPhase = "requeued_after_interrupt"
+					}
+
+				case "labels":
+					j.Status = "queued"
+					j.RecoveryPhase = "requeued_idempotent"
+
+				case "improve":
+					j.Status = "queued"
+					j.RecoveryPhase = "requeued_static"
+
+				default:
+					// Non-idempotent action
+					outputProven := false
+					marker := fmt.Sprintf("<!-- pr-%s-output:%s -->", j.Kind, j.ID)
+					if itBytes := intentsBucket.Get([]byte(marker)); itBytes != nil {
+						var it OutputIntent
+						if err := json.Unmarshal(itBytes, &it); err == nil && it.Status == "completed" {
+							outputProven = true
+						}
+					}
+
+					if outputProven {
+						j.Status = "completed"
+					} else {
+						j.Status = "needs_attention"
+						j.RecoveryPhase = "interrupted_unproven"
+						j.Error = "interrupted action cannot prove external outcome; requires operator resolution"
+					}
+				}
+
+				jBytes, err := json.Marshal(j)
+				if err != nil {
+					return err
+				}
+				if err := jobsBucket.Put(k, jBytes); err != nil {
+					return err
+				}
+				copyJob := j
+				recovered = append(recovered, &copyJob)
+			}
+		}
+
+		// Update PR states: release active slots for running/uncertain jobs, and block PRs with uncertain/needs_attention jobs
+		blockedPRs := make(map[string]string)
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err == nil {
+				if j.Status == "uncertain" || j.Status == "needs_attention" {
+					blockedPRs[j.PRKey.String()] = fmt.Sprintf("job %s is %s", j.ID, j.Status)
+				}
+			}
+		}
+
+		prCursor := prsBucket.Cursor()
+		for k, v := prCursor.First(); k != nil; k, v = prCursor.Next() {
+			var st PRState
+			if err := json.Unmarshal(v, &st); err == nil {
+				st.ActiveJobID = ""
+				if reason, blocked := blockedPRs[st.PRKey.String()]; blocked {
+					st.HasBlockedAction = true
+					st.BlockedReason = reason
+				} else {
+					st.HasBlockedAction = false
+					st.BlockedReason = ""
+				}
+				if stBytes, err := json.Marshal(st); err == nil {
+					_ = prsBucket.Put(k, stBytes)
+				}
+			}
+		}
+
+		return nil
+	})
+	return recovered, err
+}
+
+// RecoverInterruptedJobs delegates to RecoverJobs for backward compatibility.
+func (s *BoltJobStore) RecoverInterruptedJobs(ctx context.Context) ([]*Job, error) {
+	return s.RecoverJobs(ctx)
+}
+
+func (s *BoltJobStore) InspectJobs(ctx context.Context) ([]*Job, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return nil, ErrStoreClosed
+	}
+
+	var list []*Job
+	err := s.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(bucketJobs)
 		c := b.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var j Job
 			if err := json.Unmarshal(v, &j); err == nil {
-				if j.Status == "running" {
-					// Crashed while running: hold as uncertain
-					j.Status = "uncertain"
-					j.RecoveryPhase = "recovered_after_crash"
-					jBytes, err := json.Marshal(j)
-					if err != nil {
-						return err
+				copyJob := j
+				list = append(list, &copyJob)
+			}
+		}
+		return nil
+	})
+	return list, err
+}
+
+func (s *BoltJobStore) ResolveJob(ctx context.Context, jobID string, resolution string, ackDuplicateRisk bool) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return ErrStoreClosed
+	}
+
+	resolution = strings.ToLower(strings.TrimSpace(resolution))
+	if resolution != "confirmed" && resolution != "rerun" && resolution != "cancel" {
+		return fmt.Errorf("invalid resolution %q: must be confirmed, rerun, or cancel", resolution)
+	}
+	if resolution == "rerun" && !ackDuplicateRisk {
+		return errors.New("rerun requires --acknowledge-duplicate-risk")
+	}
+
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		jobsBucket := tx.Bucket(bucketJobs)
+		prsBucket := tx.Bucket(bucketPRs)
+
+		var targetKey []byte
+		var targetJob Job
+		found := false
+
+		c := jobsBucket.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err == nil && j.ID == jobID {
+				targetKey = make([]byte, len(k))
+				copy(targetKey, k)
+				targetJob = j
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return ErrJobNotFound
+		}
+
+		now := time.Now().UTC()
+		switch resolution {
+		case "confirmed":
+			targetJob.Status = "completed"
+			targetJob.Error = ""
+			targetJob.FinishedAt = &now
+			targetJob.RecoveryPhase = "operator_confirmed"
+		case "rerun":
+			targetJob.Status = "queued"
+			targetJob.Error = ""
+			targetJob.StartedAt = nil
+			targetJob.FinishedAt = nil
+			targetJob.RecoveryPhase = "operator_rerun"
+		case "cancel":
+			targetJob.Status = "cancelled"
+			targetJob.Error = "cancelled by operator"
+			targetJob.FinishedAt = &now
+			targetJob.RecoveryPhase = "operator_cancelled"
+		}
+
+		jBytes, err := json.Marshal(targetJob)
+		if err != nil {
+			return err
+		}
+		if err := jobsBucket.Put(targetKey, jBytes); err != nil {
+			return err
+		}
+
+		// Re-evaluate PR state for HasBlockedAction
+		prKeyStr := targetJob.PRKey.String()
+		hasOtherBlocked := false
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err == nil && j.PRKey.String() == prKeyStr && j.ID != jobID {
+				if j.Status == "uncertain" || j.Status == "needs_attention" {
+					hasOtherBlocked = true
+					break
+				}
+			}
+		}
+
+		if stBytes := prsBucket.Get([]byte(prKeyStr)); stBytes != nil {
+			var st PRState
+			if err := json.Unmarshal(stBytes, &st); err == nil {
+				st.HasBlockedAction = hasOtherBlocked
+				if !hasOtherBlocked {
+					st.BlockedReason = ""
+				}
+				if updatedBytes, err := json.Marshal(st); err == nil {
+					_ = prsBucket.Put([]byte(prKeyStr), updatedBytes)
+				}
+			}
+		}
+
+		return nil
+	})
+}
+
+func (s *BoltJobStore) GetHealthCounts(ctx context.Context, oldWaitWarning time.Duration) (HealthCounts, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return HealthCounts{}, ErrStoreClosed
+	}
+
+	var counts HealthCounts
+	now := time.Now().UTC()
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketJobs)
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err == nil {
+				switch j.Status {
+				case "queued":
+					counts.Queued++
+					if oldWaitWarning > 0 && now.Sub(j.CreatedAt) > oldWaitWarning {
+						counts.OldWaitWarning = true
 					}
-					if err := b.Put(k, jBytes); err != nil {
-						return err
-					}
-					copyJob := j
-					recovered = append(recovered, &copyJob)
+				case "running":
+					counts.Running++
+				case "uncertain":
+					counts.Uncertain++
+				case "needs_attention":
+					counts.NeedsAttention++
 				}
 			}
 		}
 		return nil
 	})
-	return recovered, err
+	return counts, err
 }
 
 // ClaimNextJob claims the oldest eligible queued job while respecting per-PR exclusion
@@ -904,7 +1162,7 @@ func (s *BoltJobStore) ClaimNextJob(ctx context.Context, activePRs map[string]bo
 				}
 			}
 
-			if state.ActiveJobID != "" {
+			if state.ActiveJobID != "" || state.HasBlockedAction {
 				continue
 			}
 
