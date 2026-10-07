@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -303,5 +304,125 @@ func TestCanWriteRepository(t *testing.T) {
 	allowed, err = client.CanWriteRepository(context.Background(), "org", "repo", "")
 	if err != nil || allowed {
 		t.Fatalf("expected empty username denied without API call, got allowed=%v err=%v", allowed, err)
+	}
+}
+
+func TestClient_GetRepoID(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/repos/my-org/my-repo" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":   654321,
+				"name": "my-repo",
+			})
+			return
+		}
+		if r.URL.Path == "/repos/my-org/zero-id" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":   0,
+				"name": "zero-id",
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	client, err := NewTestClient(ts.URL)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Success case
+	repoID, err := client.GetRepoID(ctx, "my-org", "my-repo")
+	if err != nil {
+		t.Fatalf("unexpected error from GetRepoID: %v", err)
+	}
+	if repoID != 654321 {
+		t.Errorf("expected repoID 654321, got: %d", repoID)
+	}
+
+	// 2. 404 Not Found
+	_, err = client.GetRepoID(ctx, "my-org", "missing-repo")
+	if err == nil {
+		t.Fatalf("expected error for missing repo, got nil")
+	}
+
+	// 3. Zero ID
+	_, err = client.GetRepoID(ctx, "my-org", "zero-id")
+	if err == nil || !errors.Is(err, ErrInvalidRepoID) {
+		t.Errorf("expected ErrInvalidRepoID for zero ID repo, got: %v", err)
+	}
+}
+
+// TestClient_FailedSourceAccessPermitsPATReview tests that when narrow source retrieval fails
+// (or is unavailable because only a PAT is configured), ordinary PAT review operations
+// (such as GetPR and GetComments) continue to succeed, and no execution credential fallback occurs.
+func TestClient_FailedSourceAccessPermitsPATReview(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/owner/repo/pulls/10":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 10,
+				"title":  "Ordinary PAT review PR",
+				"base": map[string]any{
+					"ref":  "main",
+					"repo": map[string]any{"id": 111, "name": "repo", "owner": map[string]any{"login": "owner"}},
+				},
+				"head": map[string]any{
+					"ref":  "feat",
+					"sha":  "abcdef1234567890abcdef1234567890abcdef12",
+					"repo": map[string]any{"id": 222, "name": "repo", "owner": map[string]any{"login": "owner"}},
+				},
+			})
+			return
+		case "/repos/owner/repo/issues/10/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1, "body": "first comment"},
+			})
+			return
+		case "/repos/owner/repo/pulls/10/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	client, err := NewTestClientWithToken(ts.URL, "ghp_ordinary_pat_for_review_only")
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Source retrieval credential request fails because PAT cannot be used for retrieval
+	cred, err := client.CreateRetrievalCredential(ctx, "owner", "repo", 222)
+	if err == nil || !errors.Is(err, ErrRetrievalAuthUnavailable) {
+		t.Fatalf("expected ErrRetrievalAuthUnavailable, got: %v (cred: %+v)", err, cred)
+	}
+
+	// 2. But ordinary review API calls with the PAT continue to succeed without hindrance
+	pr, err := client.GetPR(ctx, "owner", "repo", 10)
+	if err != nil {
+		t.Fatalf("GetPR failed unexpectedly: %v", err)
+	}
+	if pr.Title != "Ordinary PAT review PR" {
+		t.Errorf("unexpected PR title: %q", pr.Title)
+	}
+	if pr.HeadRepoID != 222 {
+		t.Errorf("expected HeadRepoID to be 222, got %d", pr.HeadRepoID)
+	}
+
+	comments, threads, err := client.GetComments(ctx, "owner", "repo", 10)
+	if err != nil {
+		t.Fatalf("GetComments failed unexpectedly: %v", err)
+	}
+	if len(comments) != 1 || len(threads) != 0 {
+		t.Errorf("expected 1 comment and 0 threads, got %d comments and %d threads", len(comments), len(threads))
 	}
 }

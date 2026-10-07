@@ -640,3 +640,117 @@ exit 0
 		t.Fatalf("expected credential to report IsRevoked() == true")
 	}
 }
+
+// TestPrivateGitSource_RedactionAndFailureRevocation asserts that on failure or revocation error,
+// the token is zeroized in memory and any error messages do not leak the secret token (D-10, SAFE-01).
+func TestPrivateGitSource_RedactionAndFailureRevocation(t *testing.T) {
+	sentinelSecret := "super-confidential-token-do-not-leak-8877"
+	validSHA := "0123456789abcdef0123456789abcdef01234567"
+
+	testDir := t.TempDir()
+	mockPodmanScript := filepath.Join(testDir, "mock-failing-podman.sh")
+	scriptContent := `#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "info" ]; then
+        echo '{"host":{"rootless":true,"cgroupVersion":"v2","security":{"rootless":true}}}'
+        exit 0
+    fi
+    if [ "$arg" = "/sys/fs/cgroup/memory.max" ]; then
+        echo '2147483648'
+        exit 0
+    fi
+    if [ "$arg" = "rm" ] || [ "$arg" = "kill" ]; then
+        exit 0
+    fi
+done
+# Simulate retrieval failure
+echo "remote: HTTP 403 Forbidden - bad token" >&2
+exit 1
+`
+	if err := os.WriteFile(mockPodmanScript, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("failed to write mock podman: %v", err)
+	}
+
+	mockCreds := &mockCredentialProvider{
+		token:     sentinelSecret,
+		revokeErr: errors.New("upstream revoke endpoint returned 500 internal server error"),
+	}
+	sm := newMockSlotManager(t)
+
+	backendCfg := PodmanConfig{
+		BinaryPath:  mockPodmanScript,
+		ImageDigest: "test-image:latest",
+		CPUs:        2.0,
+		MemoryBytes: 2 * 1024 * 1024 * 1024,
+		PidsLimit:   256,
+	}
+	backend := NewPodmanBackend(backendCfg)
+
+	src := NewPrivateGitSource(backend, sm, nil, mockCreds, 12345)
+	src.GatewayBaseURL = "http://127.0.0.1:1"
+
+	_, _, err := src.PrepareSource(context.Background(), "https://github.com/priv/repo", "main", validSHA)
+	if err == nil {
+		t.Fatalf("expected PrepareSource to fail when container fails, got nil error")
+	}
+
+	// 1. Verify error message does NOT leak the secret token (redaction check)
+	errStr := err.Error()
+	if strings.Contains(errStr, sentinelSecret) {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: error message leaked sentinel token: %s", errStr)
+	}
+
+	// 2. Verify token revocation was attempted even though container failed
+	if mockCreds.revokeCalls < 1 {
+		t.Errorf("expected token revocation to be called on container failure, got %d calls", mockCreds.revokeCalls)
+	}
+
+	// 3. Verify credential token is zeroized in memory even though revokeErr was returned
+	if mockCreds.createdCred == nil || mockCreds.createdCred.Token != "" {
+		t.Errorf("expected credential token to be zeroized, got: %q", mockCreds.createdCred.Token)
+	}
+}
+
+// TestPrivateSourceIntegration is an opt-in integration test targeting an operator-controlled
+// disposable private GitHub repository (D-10, 01-USER-SETUP.md).
+// Routine tests run against mocks; this test requires explicit opt-in via PR_REVIEW_PRIVATE_INTEGRATION=1
+// and never mutates host state or repository contents.
+func TestPrivateSourceIntegration(t *testing.T) {
+	if os.Getenv("PR_REVIEW_PRIVATE_INTEGRATION") != "1" {
+		t.Skip("skipping opt-in disposable private source integration test (set PR_REVIEW_PRIVATE_INTEGRATION=1 to run)")
+	}
+
+	repoURL := os.Getenv("PR_REVIEW_PRIVATE_REPO_URL")
+	commitSHA := os.Getenv("PR_REVIEW_PRIVATE_COMMIT_SHA")
+	if repoURL == "" || commitSHA == "" {
+		t.Fatalf("PR_REVIEW_PRIVATE_INTEGRATION=1 requires PR_REVIEW_PRIVATE_REPO_URL and PR_REVIEW_PRIVATE_COMMIT_SHA")
+	}
+
+	appIDStr := os.Getenv("GITHUB_APP_ID")
+	keyPath := os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
+	if appIDStr == "" || keyPath == "" {
+		t.Fatalf("PR_REVIEW_PRIVATE_INTEGRATION=1 requires GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH")
+	}
+
+	var appID int64
+	if _, err := fmt.Sscanf(appIDStr, "%d", &appID); err != nil || appID <= 0 {
+		t.Fatalf("invalid GITHUB_APP_ID %q: %v", appIDStr, err)
+	}
+
+	client, err := github.NewAppClient(appID, keyPath)
+	if err != nil {
+		t.Fatalf("failed to create App client: %v", err)
+	}
+
+	owner, repo, err := ValidateCloneURL(repoURL)
+	if err != nil {
+		t.Fatalf("invalid repo URL %q: %v", repoURL, err)
+	}
+
+	repoID, err := client.GetRepoID(context.Background(), owner, repo)
+	if err != nil {
+		t.Fatalf("failed to get repository ID for %s/%s: %v", owner, repo, err)
+	}
+
+	t.Logf("Successfully verified narrow App credential access for private repo %s/%s (ID: %d)", owner, repo, repoID)
+}
