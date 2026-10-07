@@ -36,3 +36,10 @@ func (m *LinuxSlotManager) IsQuarantined(slotDir string) bool {
 func (m *LinuxSlotManager) ReconcileSlots(ctx context.Context) error {
 	return nil
 }
+
+func (m *LinuxSlotManager) ValidateSlotMount(dir string) error {
+	return fmt.Errorf("%w: fixed slot leasing is only supported on Linux", ErrStorageUnavailable)
+}
+
+func (m *LinuxSlotManager) SkipMountChecks() {}
+

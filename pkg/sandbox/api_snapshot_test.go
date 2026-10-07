@@ -550,3 +550,46 @@ func TestAPISnapshotSource_PrivateRepo_DeniedWithoutAuth(t *testing.T) {
 		t.Errorf("expected ErrRetrievalAuthUnavailable for private repo without auth, got: %v", err)
 	}
 }
+
+func TestAPISnapshotSource_ContextCancellation(t *testing.T) {
+	commitSHA := "0123456789abcdef0123456789abcdef01234567"
+	mock := newMockAPIServer(commitSHA)
+	defer mock.Close()
+
+	ghClient, _ := github.NewTestClient(mock.server.URL)
+	source := NewAPISnapshotSource(ghClient, nil, 0, false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	_, _, err := source.PrepareSource(ctx, "https://github.com/testowner/testrepo.git", "main", commitSHA)
+	if err == nil {
+		t.Fatalf("expected error on cancelled context, got nil")
+	}
+}
+
+func TestAPISnapshotSource_EscapingSymlinkTarget_Rejected(t *testing.T) {
+	commitSHA := "0123456789abcdef0123456789abcdef01234567"
+	mock := newMockAPIServer(commitSHA)
+	defer mock.Close()
+
+	symlinkBlobSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	mock.blobs[symlinkBlobSHA] = []byte("../../outside/secret")
+
+	mock.treeEntries = []*gh.TreeEntry{
+		{
+			Path: gh.Ptr("link_out"),
+			Mode: gh.Ptr("120000"),
+			Type: gh.Ptr("blob"),
+			SHA:  gh.Ptr(symlinkBlobSHA),
+		},
+	}
+
+	ghClient, _ := github.NewTestClient(mock.server.URL)
+	source := NewAPISnapshotSource(ghClient, nil, 0, false)
+
+	_, _, err := source.PrepareSource(context.Background(), "https://github.com/testowner/testrepo.git", "main", commitSHA)
+	if err == nil || !errors.Is(err, ErrUnsafePathEntry) {
+		t.Fatalf("expected ErrUnsafePathEntry for escaping symlink target, got: %v", err)
+	}
+}

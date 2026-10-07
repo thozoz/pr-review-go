@@ -347,3 +347,44 @@ func TestPlatform_NewPlatformRunner_ConfiguresSourceProvider(t *testing.T) {
 	}
 }
 
+func TestCustomRules_SwapAfterOpenDoesNotLeakSecret(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	outsideDir := filepath.Join(baseDir, "outside")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	outsideSecret := filepath.Join(outsideDir, "secret-rules.md")
+	secretContent := "super-secret-rules-token"
+	if err := os.WriteFile(outsideSecret, []byte(secretContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	victimFile := filepath.Join(workDir, "AGENTS.md")
+	benignContent := "# Benign Guidelines\nFollow rules."
+	if err := os.WriteFile(victimFile, []byte(benignContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(0)
+	report := &VerificationReport{}
+	runner.extractCustomRules(workDir, report)
+	if report.CustomRules != benignContent {
+		t.Fatalf("expected initial benign rules, got %q", report.CustomRules)
+	}
+
+	// Swap victim file with symlink to outside secret
+	_ = os.Remove(victimFile)
+	if err := os.Symlink(outsideSecret, victimFile); err == nil {
+		swappedReport := &VerificationReport{}
+		runner.extractCustomRules(workDir, swappedReport)
+		if strings.Contains(swappedReport.CustomRules, secretContent) {
+			t.Fatalf("VULNERABILITY: read outside secret after swap: %s", swappedReport.CustomRules)
+		}
+	}
+}
+
