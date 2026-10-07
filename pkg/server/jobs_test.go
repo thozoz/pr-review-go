@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
+	"go.etcd.io/bbolt"
 )
 
 func TestWebhookDurableTracer(t *testing.T) {
@@ -296,4 +298,397 @@ func TestWebhookDurableTracer(t *testing.T) {
 	scheduler.Stop()
 	_ = reopenedStore.Close()
 }
+
+func TestWebhookAdmissionBounds(t *testing.T) {
+	const (
+		testSecret = "bounds-test-secret"
+		repoID     = int64(98765)
+		prNum      = 42
+		baseSHA    = "1111111111111111111111111111111111111111"
+		headSHA    = "2222222222222222222222222222222222222222"
+	)
+
+	newTestServer := func(t *testing.T, backlogLimit int, bodyLimit int64) (*Server, *BoltJobStore, string) {
+		stateDir := t.TempDir()
+		cfg := &config.Config{
+			WebhookSecret:        testSecret,
+			WebhookStateDir:      stateDir,
+			WebhookWorkers:       1,
+			WebhookBacklog:       backlogLimit,
+			WebhookDeliveryTTL:   24 * time.Hour,
+			WebhookDeliveryLimit: 100,
+			WebhookStateMaxBytes: 16777216,
+			WebhookBodyMaxBytes:  bodyLimit,
+			EffortLevel:          "lite",
+			EnableSandbox:        false,
+			LLMBaseURL:           "http://example.invalid",
+			LLMAPIKey:            "key",
+			LLMModel:             "model",
+			GitHubToken:          "token",
+			AutoActions:          []string{"review"},
+		}
+		dbPath := filepath.Join(stateDir, "jobs.db")
+		store, err := OpenJobStore(dbPath, StoreOptions{
+			BacklogLimit:  backlogLimit,
+			DeliveryLimit: 100,
+			StateMaxBytes: 16777216,
+			DeliveryTTL:   24 * time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("failed to open job store: %v", err)
+		}
+		srv := NewServer(cfg)
+		srv.SetStore(store)
+		return srv, store, stateDir
+	}
+
+	validPayload := func(rID int64, pNum int) []byte {
+		return []byte(fmt.Sprintf(`{
+			"action": "opened",
+			"pull_request": {
+				"number": %d,
+				"head": {"sha": %q, "ref": "feat-x"},
+				"base": {"sha": %q, "ref": "main"}
+			},
+			"repository": {
+				"id": %d,
+				"name": "repo",
+				"owner": {"login": "org"}
+			}
+		}`, pNum, headSHA, baseSHA, rID))
+	}
+
+	t.Run("invalid delivery identifiers return 400 with no receipt", func(t *testing.T) {
+		srv, store, _ := newTestServer(t, 10, 1048576)
+		defer store.Close()
+
+		testDeliveries := []string{
+			"",                             // empty
+			"invalid delivery with spaces", // spaces
+			strings.Repeat("a", 129),       // > 128 chars
+			"delivery\nwith\nnewlines",     // non-printable ASCII
+		}
+
+		payload := validPayload(repoID, prNum)
+		for _, delivID := range testDeliveries {
+			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Delivery", delivID)
+			req.Header.Set("X-GitHub-Event", "pull_request")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+			rr := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("delivery %q: expected 400, got %d", delivID, rr.Code)
+			}
+		}
+
+		// Verify zero receipts created
+		jobs, _ := store.ListQueuedJobs(context.Background())
+		if len(jobs) != 0 {
+			t.Fatalf("expected 0 jobs admitted for invalid delivery IDs, got %d", len(jobs))
+		}
+	})
+
+	t.Run("repository or PR zero returns 400 with no receipt", func(t *testing.T) {
+		srv, store, _ := newTestServer(t, 10, 1048576)
+		defer store.Close()
+
+		cases := []struct {
+			rID  int64
+			pNum int
+		}{
+			{0, 10},
+			{-1, 10},
+			{repoID, 0},
+			{repoID, -5},
+		}
+
+		for _, tc := range cases {
+			payload := validPayload(tc.rID, tc.pNum)
+			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("deliv-zero-%d-%d", tc.rID, tc.pNum))
+			req.Header.Set("X-GitHub-Event", "pull_request")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+			rr := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("rID=%d, pNum=%d: expected 400, got %d", tc.rID, tc.pNum, rr.Code)
+			}
+		}
+	})
+
+	t.Run("changed digest on same delivery ID returns 409 collision", func(t *testing.T) {
+		srv, store, _ := newTestServer(t, 10, 1048576)
+		defer store.Close()
+
+		delivID := "deliv-collision-test"
+		payloadA := validPayload(repoID, 1)
+		payloadB := validPayload(repoID, 2)
+
+		// First delivery succeeds
+		reqA := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payloadA))
+		reqA.Header.Set("X-GitHub-Delivery", delivID)
+		reqA.Header.Set("X-GitHub-Event", "pull_request")
+		reqA.Header.Set("Content-Type", "application/json")
+		reqA.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payloadA))
+
+		rrA := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rrA, reqA)
+		if rrA.Code != http.StatusOK {
+			t.Fatalf("first delivery expected 200, got %d", rrA.Code)
+		}
+
+		// Second delivery with same ID but different payload returns 409
+		reqB := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payloadB))
+		reqB.Header.Set("X-GitHub-Delivery", delivID)
+		reqB.Header.Set("X-GitHub-Event", "pull_request")
+		reqB.Header.Set("Content-Type", "application/json")
+		reqB.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payloadB))
+
+		rrB := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rrB, reqB)
+		if rrB.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict, got %d: %s", rrB.Code, rrB.Body.String())
+		}
+	})
+
+	t.Run("invalid signature returns 401", func(t *testing.T) {
+		srv, store, _ := newTestServer(t, 10, 1048576)
+		defer store.Close()
+
+		payload := validPayload(repoID, prNum)
+		req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		req.Header.Set("X-GitHub-Delivery", "deliv-sig-bad")
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", "sha256=invalidbadhash")
+
+		rr := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rr.Code)
+		}
+	})
+
+	t.Run("body overflow returns 413", func(t *testing.T) {
+		const smallLimit = 65536 // 64 KiB
+		srv, store, _ := newTestServer(t, 10, smallLimit)
+		defer store.Close()
+
+		oversizedPayload := bytes.Repeat([]byte("A"), smallLimit+100)
+		req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(oversizedPayload))
+		req.Header.Set("X-GitHub-Delivery", "deliv-oversized")
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, oversizedPayload))
+
+		rr := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("expected 413 Request Entity Too Large, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("full queue rejects atomically with 503 and Retry-After 30", func(t *testing.T) {
+		const smallBacklog = 2
+		srv, store, _ := newTestServer(t, smallBacklog, 1048576)
+		defer store.Close()
+
+		// Fill backlog
+		for i := 1; i <= smallBacklog; i++ {
+			p := validPayload(repoID, i)
+			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(p))
+			req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("deliv-fill-%d", i))
+			req.Header.Set("X-GitHub-Event", "pull_request")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, p))
+
+			rr := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("fill request %d expected 200, got %d", i, rr.Code)
+			}
+		}
+
+		// Verify 2 queued jobs
+		jobs, _ := store.ListQueuedJobs(context.Background())
+		if len(jobs) != smallBacklog {
+			t.Fatalf("expected %d jobs, got %d", smallBacklog, len(jobs))
+		}
+
+		// Next request exceeds backlog
+		pOverflow := validPayload(repoID, smallBacklog+1)
+		reqOverflow := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(pOverflow))
+		reqOverflow.Header.Set("X-GitHub-Delivery", "deliv-overflow")
+		reqOverflow.Header.Set("X-GitHub-Event", "pull_request")
+		reqOverflow.Header.Set("Content-Type", "application/json")
+		reqOverflow.Header.Set("X-Hub-Signature-256", signPayload(testSecret, pOverflow))
+
+		rrOverflow := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rrOverflow, reqOverflow)
+
+		if rrOverflow.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got %d: %s", rrOverflow.Code, rrOverflow.Body.String())
+		}
+		if rrOverflow.Header().Get("Retry-After") != "30" {
+			t.Errorf("expected Retry-After header '30', got %q", rrOverflow.Header().Get("Retry-After"))
+		}
+
+		// Ensure no receipt created for rejected delivery
+		_, err := store.GetDelivery(context.Background(), fmt.Sprintf("github.com/%d/deliv-overflow", repoID))
+		if err == nil {
+			t.Fatalf("receipt must not be created for rejected delivery")
+		}
+		// Existing jobs unchanged
+		jobsAfter, _ := store.ListQueuedJobs(context.Background())
+		if len(jobsAfter) != smallBacklog {
+			t.Fatalf("existing queued jobs count altered, got %d, want %d", len(jobsAfter), smallBacklog)
+		}
+	})
+
+	t.Run("concurrent identical deliveries commit exactly one job", func(t *testing.T) {
+		srv, store, _ := newTestServer(t, 20, 1048576)
+		defer store.Close()
+
+		payload := validPayload(repoID, 100)
+		delivID := "deliv-concurrent-001"
+		sig := signPayload(testSecret, payload)
+
+		const concurrency = 10
+		var wg sync.WaitGroup
+		statusCodes := make([]int, concurrency)
+
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+				req.Header.Set("X-GitHub-Delivery", delivID)
+				req.Header.Set("X-GitHub-Event", "pull_request")
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Hub-Signature-256", sig)
+
+				rr := httptest.NewRecorder()
+				srv.Routes().ServeHTTP(rr, req)
+				statusCodes[idx] = rr.Code
+			}(i)
+		}
+		wg.Wait()
+
+		for i, code := range statusCodes {
+			if code != http.StatusOK {
+				t.Fatalf("request %d returned %d, want 200", i, code)
+			}
+		}
+
+		// Exactly 1 job must be enqueued
+		jobs, _ := store.ListQueuedJobs(context.Background())
+		if len(jobs) != 1 {
+			t.Fatalf("expected exactly 1 job admitted across %d concurrent deliveries, got %d", concurrency, len(jobs))
+		}
+	})
+
+	t.Run("exclusive open failure and runtime unavailable truth in health", func(t *testing.T) {
+		stateDir := t.TempDir()
+		dbPath := filepath.Join(stateDir, "jobs.db")
+
+		// Open first DB handle to hold exclusive lock
+		db1, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+		if err != nil {
+			t.Fatalf("failed to open primary bbolt DB: %v", err)
+		}
+		defer db1.Close()
+
+		// Attempting second open should fail with ErrDatabaseLocked
+		_, err = OpenJobStore(dbPath, StoreOptions{OpenTimeout: 50 * time.Millisecond})
+		if err == nil || !strings.Contains(err.Error(), "locked") {
+			t.Fatalf("expected database locked error, got: %v", err)
+		}
+
+		// Server with runtime error rejects actionable work with 503 and exposes degraded health
+		srv := NewServer(&config.Config{
+			WebhookSecret:   testSecret,
+			WebhookStateDir: stateDir,
+			EffortLevel:     "lite",
+			EnableSandbox:   false,
+			LLMBaseURL:      "http://example.invalid",
+			LLMAPIKey:       "key",
+			LLMModel:        "model",
+			GitHubToken:     "token",
+		})
+		srv.SetRuntimeError(ErrDatabaseLocked)
+
+		// Health reflects unavailable truthfully without secrets
+		reqHealth := httptest.NewRequest("GET", "/healthz", nil)
+		rrHealth := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rrHealth, reqHealth)
+
+		if rrHealth.Code != http.StatusOK {
+			t.Fatalf("health endpoint returned %d", rrHealth.Code)
+		}
+		var healthResp map[string]string
+		_ = json.Unmarshal(rrHealth.Body.Bytes(), &healthResp)
+		if healthResp["status"] != "degraded" || healthResp["runtime"] != "unavailable" {
+			t.Fatalf("expected degraded/unavailable health, got: %v", healthResp)
+		}
+		if strings.Contains(rrHealth.Body.String(), testSecret) || strings.Contains(rrHealth.Body.String(), dbPath) {
+			t.Fatalf("health response leaked secrets or internal paths")
+		}
+
+		// Actionable webhook returns 503 with Retry-After 30
+		payload := validPayload(repoID, prNum)
+		reqAction := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+		reqAction.Header.Set("X-GitHub-Delivery", "deliv-locked")
+		reqAction.Header.Set("X-GitHub-Event", "pull_request")
+		reqAction.Header.Set("Content-Type", "application/json")
+		reqAction.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+		rrAction := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rrAction, reqAction)
+		if rrAction.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got %d", rrAction.Code)
+		}
+		if rrAction.Header().Get("Retry-After") != "30" {
+			t.Errorf("expected Retry-After 30, got %q", rrAction.Header().Get("Retry-After"))
+		}
+	})
+
+	t.Run("unknown schema version fails closed", func(t *testing.T) {
+		stateDir := t.TempDir()
+		dbPath := filepath.Join(stateDir, "corrupt.db")
+
+		// Create a bolt db with unknown schema version 99
+		db, err := bbolt.Open(dbPath, 0600, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = db.Update(func(tx *bbolt.Tx) error {
+			b, err := tx.CreateBucket([]byte("meta"))
+			if err != nil {
+				return err
+			}
+			verBytes := make([]byte, 4)
+			binary.BigEndian.PutUint32(verBytes, 99)
+			return b.Put([]byte("schema_version"), verBytes)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = db.Close()
+
+		_, err = OpenJobStore(dbPath, StoreOptions{})
+		if err == nil || !strings.Contains(err.Error(), "unknown store schema version") {
+			t.Fatalf("expected unknown schema version error, got: %v", err)
+		}
+	})
+}
+
 
