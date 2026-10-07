@@ -405,3 +405,92 @@ func TestReviewPR_SourceProviderAndIncompleteStatusGating(t *testing.T) {
 		t.Errorf("expected 0 inline suggestions for incomplete verification, got: %d", len(report.Suggestions))
 	}
 }
+
+func TestPromptAndReportFormattingForAllVerificationStatuses(t *testing.T) {
+	pr := &github.PRDetails{
+		Title:   "Feature PR",
+		Author:  "author",
+		BaseRef: "main",
+		HeadRef: "feature",
+	}
+
+	testCases := []struct {
+		status         sandbox.VerificationStatus
+		expectedSys    string
+		expectedHeader string
+	}{
+		{
+			status:         sandbox.StatusPassed,
+			expectedSys:    "Live Sandbox Verification (did the code compile, did tests pass in a real runner)",
+			expectedHeader: "### Real Sandbox Environment Verification:\n",
+		},
+		{
+			status:         sandbox.StatusBuildFailed,
+			expectedSys:    "Live Sandbox Verification (the code was executed in a real isolated runner and FAILED)",
+			expectedHeader: "### Real Sandbox Environment Verification (Failed):\n",
+		},
+		{
+			status:         sandbox.StatusTestFailed,
+			expectedSys:    "Live Sandbox Verification (the code was executed in a real isolated runner and FAILED)",
+			expectedHeader: "### Real Sandbox Environment Verification (Failed):\n",
+		},
+		{
+			status:         sandbox.StatusTimeout,
+			expectedSys:    "Live Sandbox Verification (execution exceeded time limits and timed out)",
+			expectedHeader: "### Real Sandbox Environment Verification (Timeout):\n",
+		},
+		{
+			status:         sandbox.StatusResourceExhausted,
+			expectedSys:    "Live Sandbox Verification (execution exceeded memory or storage quota)",
+			expectedHeader: "### Real Sandbox Environment Verification (Resource Exhausted):\n",
+		},
+		{
+			status:         sandbox.StatusDiskExhausted,
+			expectedSys:    "Live Sandbox Verification (execution exceeded memory or storage quota)",
+			expectedHeader: "### Real Sandbox Environment Verification (Resource Exhausted):\n",
+		},
+		{
+			status:         sandbox.StatusIncomplete,
+			expectedSys:    "Live sandbox verification was incomplete (unsupported dependencies, missing toolchain, or missing credentials)",
+			expectedHeader: "### Sandbox Verification (Incomplete):\n",
+		},
+		{
+			status:         sandbox.StatusUnsupportedLanguage,
+			expectedSys:    "Live sandbox verification was skipped or unavailable",
+			expectedHeader: "### Sandbox Verification (Unsupported Language):\n",
+		},
+		{
+			status:         sandbox.StatusUnavailable,
+			expectedSys:    "Live sandbox verification was skipped or unavailable",
+			expectedHeader: "### Sandbox Verification (Skipped / Unavailable):\n",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run("Status_"+string(tc.status), func(t *testing.T) {
+			sysPrompt := buildSystemPrompt(tc.status)
+			if !strings.Contains(sysPrompt, tc.expectedSys) {
+				t.Errorf("system prompt for status %q missing expected substring %q", tc.status, tc.expectedSys)
+			}
+
+			userPrompt := buildUserPrompt(pr, "", nil, nil, "STATUS: "+string(tc.status), tc.status)
+			if !strings.Contains(userPrompt, tc.expectedHeader) {
+				t.Errorf("user prompt for status %q missing expected header %q", tc.status, tc.expectedHeader)
+			}
+
+			// Format report markdown
+			report := &ReviewReport{
+				PRTitle:             pr.Title,
+				Score:               80,
+				VerificationStatus:  tc.status,
+				VerificationSummary: "Summary for " + string(tc.status),
+				Summary:             "Review summary text",
+			}
+			md := FormatReportMarkdown(report)
+			if !strings.Contains(md, report.VerificationSummary) {
+				t.Errorf("markdown report missing verification summary: %s", report.VerificationSummary)
+			}
+		})
+	}
+}
+

@@ -439,14 +439,20 @@ func newMockSlotManager(t *testing.T) *mockSlotManager {
 func (m *mockSlotManager) AcquireSlot(ctx context.Context, jobID string) (*SlotLease, error) {
 	snapDir := filepath.Join(m.slotDir, "snapshot")
 	tmpDir := filepath.Join(m.slotDir, "tmp")
+	workDir := filepath.Join(m.slotDir, "work")
+	cacheDir := filepath.Join(m.slotDir, "cache")
 	_ = os.MkdirAll(snapDir, 0755)
 	_ = os.MkdirAll(tmpDir, 0755)
+	_ = os.MkdirAll(workDir, 0755)
+	_ = os.MkdirAll(cacheDir, 0755)
 	return &SlotLease{
 		JobID:       jobID,
 		SlotDir:     m.slotDir,
 		ControlDir:  m.controlDir,
 		SnapshotDir: snapDir,
 		TmpDir:      tmpDir,
+		WorkDir:     workDir,
+		CacheDir:    cacheDir,
 	}, nil
 }
 
@@ -454,6 +460,38 @@ func (m *mockSlotManager) ReleaseSlot(lease *SlotLease) error          { return 
 func (m *mockSlotManager) QuarantineSlot(slotDir, reason string) error { return nil }
 func (m *mockSlotManager) IsQuarantined(slotDir string) bool           { return false }
 func (m *mockSlotManager) ReconcileSlots(ctx context.Context) error    { return nil }
+
+func newMockPodmanBackend(t *testing.T) *PodmanBackend {
+	mockScript := filepath.Join(t.TempDir(), "mock-podman.sh")
+	scriptContent := `#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "info" ]; then
+        echo '{"host":{"rootless":true,"cgroupVersion":"v2","security":{"rootless":true}}}'
+        exit 0
+    fi
+    if [ "$arg" = "/sys/fs/cgroup/memory.max" ]; then
+        echo '2147483648'
+        exit 0
+    fi
+    if [ "$arg" = "rm" ] || [ "$arg" = "kill" ]; then
+        exit 0
+    fi
+done
+exit 0
+`
+	if err := os.WriteFile(mockScript, []byte(scriptContent), 0755); err != nil {
+		t.Fatalf("failed to write mock podman script: %v", err)
+	}
+
+	return NewPodmanBackend(PodmanConfig{
+		BinaryPath:  mockScript,
+		ImageDigest: "test-image:latest",
+		CPUs:        2.0,
+		MemoryBytes: 2 * 1024 * 1024 * 1024,
+		PidsLimit:   256,
+	})
+}
+
 
 func TestPrivateGitSource_ValidationAndMissingBackend(t *testing.T) {
 	validSHA := "0123456789abcdef0123456789abcdef01234567"

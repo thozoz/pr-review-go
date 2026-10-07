@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
@@ -18,7 +19,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: pr-review-sandbox-helper <command> [options]\nCommands: relay, export, retrieve\n")
+		fmt.Fprintf(os.Stderr, "Usage: pr-review-sandbox-helper <command> [options]\nCommands: relay, export, retrieve, prepare\n")
 		os.Exit(1)
 	}
 
@@ -32,6 +33,8 @@ func main() {
 		runExport(ctx, os.Args[2:])
 	case "retrieve":
 		runRetrieve(ctx, os.Args[2:])
+	case "prepare":
+		runPrepare(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -199,3 +202,102 @@ func runRetrieve(ctx context.Context, args []string) {
 		}
 	}
 }
+
+func runPrepare(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("prepare", flag.ExitOnError)
+	socketPath := fs.String("socket", "", "Unix domain socket path for dependency gateway")
+	workDir := fs.String("work", "", "Working directory containing go.mod")
+	_ = fs.Parse(args)
+
+	if *socketPath == "" || *workDir == "" {
+		fmt.Fprintf(os.Stderr, "Error: -socket and -work are required\n")
+		os.Exit(1)
+	}
+
+	// 1. Validate go.mod in workDir
+	if err := sandbox.ValidateGoMod(*workDir); err != nil {
+		fmt.Fprintf(os.Stderr, "INCOMPLETE: %v\n", err)
+		os.Exit(2)
+	}
+
+	// 2. Bind ephemeral loopback port for relay
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to bind ephemeral loopback port: %v\n", err)
+		os.Exit(1)
+	}
+	relayAddr := l.Addr().String()
+	_ = l.Close()
+
+	relayCtx, cancelRelay := context.WithCancel(ctx)
+	defer cancelRelay()
+
+	relayListener, err := sandbox.StartLoopbackRelay(relayCtx, relayAddr, *socketPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start loopback relay on %s: %v\n", relayAddr, err)
+		os.Exit(1)
+	}
+	defer relayListener.Close()
+
+	// 3. Execute trusted go mod download with strictly sanitized environment (D-05, SAFE-01)
+	downloadCmd := exec.CommandContext(ctx, "go", "mod", "download")
+	downloadCmd.Dir = *workDir
+	downloadCmd.Env = []string{
+		"GOPROXY=" + fmt.Sprintf("http://%s", relayAddr),
+		"GOSUMDB=" + fmt.Sprintf("sum.golang.org http://%s/sumdb/sum.golang.org", relayAddr),
+		"GOVCS=off",
+		"GOTOOLCHAIN=local",
+		"GOWORK=off",
+		"GOENV=off",
+		"GOCACHE=/cache/go-build",
+		"GOMODCACHE=/cache/go/pkg/mod",
+		"GOPATH=/cache/go",
+		"HOME=/tmp",
+		"TMPDIR=/tmp",
+		"PATH=/usr/local/go/bin:/usr/bin:/bin",
+	}
+
+	out, err := downloadCmd.CombinedOutput()
+	outStr := string(out)
+
+	if err != nil {
+		lowerOut := strings.ToLower(outStr)
+
+		// Check for disk full
+		if strings.Contains(lowerOut, "no space left on device") || strings.Contains(lowerOut, "enospc") {
+			fmt.Fprintf(os.Stderr, "DISK_EXHAUSTED: %s\n", outStr)
+			os.Exit(3)
+		}
+
+		// Check for newer toolchain requirement
+		if strings.Contains(lowerOut, "cannot switch to that toolchain") ||
+			strings.Contains(lowerOut, "requires go >=") ||
+			strings.Contains(lowerOut, "toolchain not available") ||
+			strings.Contains(lowerOut, "cannot find toolchain") {
+			fmt.Fprintf(os.Stderr, "INCOMPLETE: toolchain mismatch: %s\n", outStr)
+			os.Exit(2)
+		}
+
+		// Check for checksum error or missing checksum
+		if strings.Contains(lowerOut, "checksum mismatch") ||
+			strings.Contains(lowerOut, "security error") ||
+			strings.Contains(lowerOut, "missing go.sum entry") ||
+			strings.Contains(lowerOut, "not in go.sum") {
+			fmt.Fprintf(os.Stderr, "INCOMPLETE: checksum verification failed: %s\n", outStr)
+			os.Exit(2)
+		}
+
+		// Check for private module or repository access denied
+		if strings.Contains(lowerOut, "404 not found") ||
+			strings.Contains(lowerOut, "403 forbidden") ||
+			strings.Contains(lowerOut, "reading https://proxy.golang.org") ||
+			strings.Contains(lowerOut, "access denied") {
+			fmt.Fprintf(os.Stderr, "INCOMPLETE: private module or not found on proxy: %s\n", outStr)
+			os.Exit(2)
+		}
+
+		fmt.Fprintf(os.Stderr, "go mod download failed: %v (output: %s)\n", err, outStr)
+		os.Exit(1)
+	}
+}
+

@@ -155,6 +155,7 @@ type Runner struct {
 	Backend        *PodmanBackend
 	SlotManager    SlotManager
 	SourceProvider SourceProvider
+	DepPreparer    DependencyPreparer
 }
 
 func NewRunner(timeout time.Duration) *Runner {
@@ -179,8 +180,16 @@ func NewRunnerWithConfig(cfg *config.Config, backend *PodmanBackend, sm SlotMana
 	}
 	if backend != nil && sm != nil {
 		r.SourceProvider = NewPublicGitSource(backend, sm, cfg)
+		r.DepPreparer = NewDependencyPreparer(backend, cfg)
 	}
 	return r
+}
+
+func (r *Runner) prepTimeout() time.Duration {
+	if r.Config != nil && r.Config.SandboxTimeoutPrep > 0 {
+		return r.Config.SandboxTimeoutPrep
+	}
+	return 3 * time.Minute
 }
 
 func (r *Runner) executionTimeout() time.Duration {
@@ -231,9 +240,8 @@ func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationRe
 	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
 		report.DetectedType = "go"
 
-		// Check for unvendored external dependencies:
-		// Real tracer accepts dependency-free or verified vendored Go (D-03)
-		if hasUnvendoredDependencies(dir) {
+		// When dependency preparer is unconfigured, unvendored external dependencies yield incomplete
+		if hasUnvendoredDependencies(dir) && r.DepPreparer == nil {
 			report.Status = StatusIncomplete
 			report.Reason = "external dependencies require network gateway (Plan 04)"
 			report.Summary = "INCOMPLETE: External dependencies require network gateway."
@@ -366,7 +374,60 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 		return report, nil
 	}
 
-	// 4. Combined 5-minute deadline for build and race-test stages (D-06)
+	// 4. Validate go.mod replacements remain in-root (SAFE-01 encoding, D-05)
+	if err := ValidateGoMod(lease.WorkDir); err != nil {
+		report.Status = StatusIncomplete
+		report.Reason = err.Error()
+		report.Summary = fmt.Sprintf("INCOMPLETE: %v", err)
+		return report, nil
+	}
+
+	// 5. Dependency preparation stage (D-05, D-06, D-07, D-12)
+	if r.DepPreparer != nil {
+		prepCtx, cancelPrep := context.WithTimeout(ctx, r.prepTimeout())
+		defer cancelPrep()
+
+		prepRes, err := r.DepPreparer.PrepareDependencies(prepCtx, jobID, lease)
+		if err != nil {
+			report.Status = StatusUnavailable
+			report.Reason = fmt.Sprintf("dependency preparation error: %v", err)
+			report.Summary = fmt.Sprintf("UNAVAILABLE: %v", err)
+			return report, nil
+		}
+		if prepRes != nil && !prepRes.Passed {
+			report.FailedStage = "prep"
+			if prepRes.IsTimeout {
+				report.Status = StatusTimeout
+				report.Reason = "dependency preparation exceeded execution timeout"
+				report.Summary = "TIMEOUT: dependency preparation timed out."
+			} else if prepRes.IsDiskFull {
+				report.Status = StatusDiskExhausted
+				report.Reason = "filesystem disk quota exceeded during dependency preparation"
+				report.Summary = "DISK_EXHAUSTED: dependency preparation failed with ENOSPC."
+			} else if prepRes.IsOOM {
+				report.Status = StatusResourceExhausted
+				report.Reason = "memory or cgroup limit exceeded during dependency preparation"
+				report.Summary = "RESOURCE_EXHAUSTED: dependency preparation exceeded memory limits."
+			} else if prepRes.IsIncomplete || prepRes.Command == "INCOMPLETE" {
+				report.Status = StatusIncomplete
+				report.Reason = strings.TrimSpace(prepRes.Stderr)
+				if report.Reason == "" {
+					report.Reason = "dependency requirement incomplete"
+				}
+				report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
+			} else {
+				report.Status = StatusBuildFailed
+				report.Reason = strings.TrimSpace(prepRes.Stderr)
+				if report.Reason == "" {
+					report.Reason = "dependency preparation failed"
+				}
+				report.Summary = fmt.Sprintf("FAILED: dependency preparation failed: %s", report.Reason)
+			}
+			return report, nil
+		}
+	}
+
+	// 6. Combined 5-minute deadline for build and race-test stages (D-06)
 	execCtx, cancelExec := context.WithTimeout(ctx, r.executionTimeout())
 	defer cancelExec()
 

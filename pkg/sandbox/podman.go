@@ -44,6 +44,7 @@ type StageResult struct {
 	IsTimeout    bool          `json:"is_timeout"`
 	IsOOM        bool          `json:"is_oom"`
 	IsDiskFull   bool          `json:"is_disk_full"`
+	IsIncomplete bool          `json:"is_incomplete"`
 }
 
 func NewPodmanBackend(cfg PodmanConfig) *PodmanBackend {
