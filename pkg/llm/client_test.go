@@ -3,8 +3,10 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -336,3 +338,418 @@ func TestLLMResponseLimit(t *testing.T) {
 		t.Fatalf("expected oversize error on error response body, got: %v", err)
 	}
 }
+
+type fixtureTransport struct {
+	allowedHost string
+	rt          http.RoundTripper
+}
+
+func (f *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host != f.allowedHost {
+		return nil, fmt.Errorf("fixture transport rejected non-fixture URL host: %s", req.URL.Host)
+	}
+	base := f.rt
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(req)
+}
+
+func newFixtureClient(serverURL string) *http.Client {
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		panic(err)
+	}
+	return &http.Client{
+		Transport: &fixtureTransport{
+			allowedHost: u.Host,
+		},
+		Timeout: 5 * time.Second,
+	}
+}
+
+func TestChatCompletion_ProtocolAndSuccess(t *testing.T) {
+	var (
+		receivedMethod      string
+		receivedPath        string
+		receivedContentType string
+		receivedAuth        string
+		receivedBody        ChatRequest
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod = r.Method
+		receivedPath = r.URL.Path
+		receivedContentType = r.Header.Get("Content-Type")
+		receivedAuth = r.Header.Get("Authorization")
+
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+
+		resp := ChatResponse{
+			Choices: []ChatChoice{
+				{
+					Message: ChatMessage{
+						Role:    "assistant",
+						Content: "  Verified output response  ",
+					},
+					FinishReason: "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "secret-key-42", "custom-model")
+	client.SetHTTPClient(newFixtureClient(ts.URL))
+
+	res, err := client.ChatCompletion(context.Background(), "System prompt here", "User prompt here")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if receivedMethod != http.MethodPost {
+		t.Errorf("expected POST, got %s", receivedMethod)
+	}
+	if receivedPath != "/chat/completions" {
+		t.Errorf("expected /chat/completions, got %s", receivedPath)
+	}
+	if receivedContentType != "application/json" {
+		t.Errorf("expected application/json, got %s", receivedContentType)
+	}
+	if receivedAuth != "Bearer secret-key-42" {
+		t.Errorf("expected Bearer secret-key-42, got %s", receivedAuth)
+	}
+	if receivedBody.Model != "custom-model" {
+		t.Errorf("expected custom-model, got %s", receivedBody.Model)
+	}
+	if len(receivedBody.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(receivedBody.Messages))
+	}
+	if receivedBody.Messages[0].Role != "system" || receivedBody.Messages[0].Content != "System prompt here" {
+		t.Errorf("unexpected system message: %+v", receivedBody.Messages[0])
+	}
+	if receivedBody.Messages[1].Role != "user" || receivedBody.Messages[1].Content != "User prompt here" {
+		t.Errorf("unexpected user message: %+v", receivedBody.Messages[1])
+	}
+	if res != "  Verified output response  " {
+		t.Errorf("unexpected result: %q", res)
+	}
+}
+
+func TestChatCompletion_InputValidation(t *testing.T) {
+	cases := []struct {
+		name         string
+		baseURL      string
+		apiKey       string
+		model        string
+		systemPrompt string
+		userPrompt   string
+		errSubstring string
+	}{
+		{
+			name:         "missing base URL",
+			baseURL:      "",
+			apiKey:       "key",
+			model:        "model",
+			systemPrompt: "sys",
+			userPrompt:   "usr",
+			errSubstring: "base URL is not configured",
+		},
+		{
+			name:         "missing api key",
+			baseURL:      "http://localhost",
+			apiKey:       "",
+			model:        "model",
+			systemPrompt: "sys",
+			userPrompt:   "usr",
+			errSubstring: "API key is not configured",
+		},
+		{
+			name:         "missing model",
+			baseURL:      "http://localhost",
+			apiKey:       "key",
+			model:        "",
+			systemPrompt: "sys",
+			userPrompt:   "usr",
+			errSubstring: "model is not configured",
+		},
+		{
+			name:         "empty system prompt",
+			baseURL:      "http://localhost",
+			apiKey:       "key",
+			model:        "model",
+			systemPrompt: "",
+			userPrompt:   "usr",
+			errSubstring: "system prompt cannot be empty",
+		},
+		{
+			name:         "whitespace-only system prompt",
+			baseURL:      "http://localhost",
+			apiKey:       "key",
+			model:        "model",
+			systemPrompt: "  \t \n ",
+			userPrompt:   "usr",
+			errSubstring: "system prompt cannot be empty",
+		},
+		{
+			name:         "empty user prompt",
+			baseURL:      "http://localhost",
+			apiKey:       "key",
+			model:        "model",
+			systemPrompt: "sys",
+			userPrompt:   "",
+			errSubstring: "user prompt cannot be empty",
+		},
+		{
+			name:         "whitespace-only user prompt",
+			baseURL:      "http://localhost",
+			apiKey:       "key",
+			model:        "model",
+			systemPrompt: "sys",
+			userPrompt:   " \r\n  ",
+			errSubstring: "user prompt cannot be empty",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := NewClient(tc.baseURL, tc.apiKey, tc.model)
+			_, err := client.ChatCompletion(context.Background(), tc.systemPrompt, tc.userPrompt)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.errSubstring)
+			}
+			if !strings.Contains(err.Error(), tc.errSubstring) {
+				t.Fatalf("expected error containing %q, got %v", tc.errSubstring, err)
+			}
+		})
+	}
+}
+
+func TestChatCompletion_MalformedURL(t *testing.T) {
+	client := NewClient("http://[::1]:namedport", "key", "model")
+	_, err := client.ChatCompletion(context.Background(), "sys", "usr")
+	if err == nil {
+		t.Fatal("expected error on malformed URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to create http request") {
+		t.Fatalf("expected 'failed to create http request', got: %v", err)
+	}
+}
+
+func TestChatCompletion_TransportFailure(t *testing.T) {
+	// Point to a closed port / unrouted local address
+	client := NewClient("http://127.0.0.1:59998", "key", "model")
+	_, err := client.ChatCompletion(context.Background(), "sys", "usr")
+	if err == nil {
+		t.Fatal("expected transport failure error, got nil")
+	}
+	if !strings.Contains(err.Error(), "http request failed") {
+		t.Fatalf("expected 'http request failed', got: %v", err)
+	}
+}
+
+func TestChatCompletion_CancelledContext(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "key", "model")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before request
+
+	_, err := client.ChatCompletion(ctx, "sys", "usr")
+	if err == nil {
+		t.Fatal("expected context error, got nil")
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected 'context canceled', got: %v", err)
+	}
+}
+
+func TestChatCompletion_ReadFailure(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hijack connection to abruptly close it mid-body
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\nPartial"))
+		_ = conn.Close()
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "key", "model")
+	_, err := client.ChatCompletion(context.Background(), "sys", "usr")
+	if err == nil {
+		t.Fatal("expected read failure error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to read response") {
+		t.Fatalf("expected 'failed to read response', got: %v", err)
+	}
+}
+
+func TestChatCompletion_HTTPStatusesAndNoRetries(t *testing.T) {
+	statusCodes := []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusInternalServerError}
+
+	for _, code := range statusCodes {
+		t.Run(fmt.Sprintf("status_%d", code), func(t *testing.T) {
+			var requestCount int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&requestCount, 1)
+				w.WriteHeader(code)
+				_, _ = w.Write([]byte(fmt.Sprintf("simulated error %d", code)))
+			}))
+			defer ts.Close()
+
+			client := NewClient(ts.URL, "key", "model")
+			client.SetHTTPClient(newFixtureClient(ts.URL))
+
+			_, err := client.ChatCompletion(context.Background(), "sys", "usr")
+			if err == nil {
+				t.Fatalf("expected error for status %d, got nil", code)
+			}
+			expectedSubstr := fmt.Sprintf("api error (status %d)", code)
+			if !strings.Contains(err.Error(), expectedSubstr) {
+				t.Fatalf("expected error to contain %q, got: %v", expectedSubstr, err)
+			}
+
+			// Exactly one attempt — no retries in Phase 2
+			finalCount := atomic.LoadInt32(&requestCount)
+			if finalCount != 1 {
+				t.Fatalf("expected exactly 1 request for status %d, got %d", code, finalCount)
+			}
+		})
+	}
+}
+
+func TestChatCompletion_ErrorEnvelope(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := ChatResponse{
+			Error: &struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+			}{
+				Message: "rate limit quota exhausted",
+				Type:    "insufficient_quota",
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "key", "model")
+	_, err := client.ChatCompletion(context.Background(), "sys", "usr")
+	if err == nil {
+		t.Fatal("expected error envelope error, got nil")
+	}
+	if !strings.Contains(err.Error(), "llm returned error: rate limit quota exhausted") {
+		t.Fatalf("expected error envelope message, got: %v", err)
+	}
+}
+
+func TestChatCompletion_MalformedJSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices": [ { "message": { "content": `)) // malformed JSON
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "key", "model")
+	_, err := client.ChatCompletion(context.Background(), "sys", "usr")
+	if err == nil {
+		t.Fatal("expected malformed JSON error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to unmarshal chat response") {
+		t.Fatalf("expected unmarshal error, got: %v", err)
+	}
+}
+
+func TestChatCompletion_EmptyChoices(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := ChatResponse{
+			Choices: []ChatChoice{},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "key", "model")
+	_, err := client.ChatCompletion(context.Background(), "sys", "usr")
+	if err == nil {
+		t.Fatal("expected empty choices error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no response choices returned from model") {
+		t.Fatalf("expected 'no response choices returned from model', got: %v", err)
+	}
+}
+
+func TestChatCompletion_BlankAssistantContent(t *testing.T) {
+	blankContents := []string{
+		"",
+		" ",
+		"\t\n  \r\n",
+	}
+
+	for i, blank := range blankContents {
+		t.Run(fmt.Sprintf("blank_content_%d", i), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				resp := ChatResponse{
+					Choices: []ChatChoice{
+						{
+							Message: ChatMessage{
+								Role:    "assistant",
+								Content: blank,
+							},
+						},
+					},
+				}
+				_ = json.NewEncoder(w).Encode(resp)
+			}))
+			defer ts.Close()
+
+			client := NewClient(ts.URL, "key", "model")
+			_, err := client.ChatCompletion(context.Background(), "sys", "usr")
+			if err == nil {
+				t.Fatalf("expected error on blank content %q, got nil", blank)
+			}
+			if !strings.Contains(err.Error(), "empty assistant response content") {
+				t.Fatalf("expected 'empty assistant response content', got: %v", err)
+			}
+		})
+	}
+}
+
+func TestChatCompletion_FixtureTransportRejectsExternal(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	fixtureClient := newFixtureClient(ts.URL)
+
+	req, err := http.NewRequestWithContext(context.Background(), "GET", "https://api.openai.com/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fixtureClient.Do(req)
+	if err == nil {
+		t.Fatal("expected fixture transport to reject non-fixture host, got nil error")
+	}
+	if !strings.Contains(err.Error(), "fixture transport rejected non-fixture URL host") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+

@@ -17,10 +17,19 @@ type Summarizer struct {
 }
 
 func NewSummarizer(cfg *config.Config) *Summarizer {
+	return NewSummarizerWithClients(
+		cfg,
+		github.NewClientFromConfig(cfg),
+		llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
+	)
+}
+
+// NewSummarizerWithClients creates a Summarizer with injected GitHub and LLM clients for isolated testing.
+func NewSummarizerWithClients(cfg *config.Config, gh *github.Client, llmClient *llm.Client) *Summarizer {
 	return &Summarizer{
 		cfg: cfg,
-		gh:  github.NewClientFromConfig(cfg),
-		llm: llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
+		gh:  gh,
+		llm: llmClient,
 	}
 }
 

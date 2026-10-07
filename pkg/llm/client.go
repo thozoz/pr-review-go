@@ -197,6 +197,13 @@ func (c *Client) SetTimeout(timeout time.Duration) {
 	c.httpClient.Timeout = timeout
 }
 
+// SetHTTPClient allows injecting a custom http.Client (e.g. for testing with custom transports).
+func (c *Client) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		c.httpClient = client
+	}
+}
+
 // SetMaxResponseBytes customizes the maximum allowed response size for this client.
 func (c *Client) SetMaxResponseBytes(limit int64) {
 	c.maxResponseBytes = limit
@@ -317,5 +324,10 @@ func (c *Client) ChatCompletion(ctx context.Context, systemPrompt, userPrompt st
 		return "", fmt.Errorf("no response choices returned from model")
 	}
 
-	return chatResp.Choices[0].Message.Content, nil
+	content := chatResp.Choices[0].Message.Content
+	if strings.TrimSpace(content) == "" {
+		return "", fmt.Errorf("empty assistant response content")
+	}
+
+	return content, nil
 }
