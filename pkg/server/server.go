@@ -58,15 +58,31 @@ func NewServer(cfg *config.Config) *Server {
 			cfg: cfg,
 		}
 	}
+	gh := ghclient.NewClientFromConfig(cfg)
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	return NewServerWithClients(cfg, gh, llmClient)
+}
+
+// NewServerWithClients creates a Server with injected GitHub and LLM clients for testing.
+func NewServerWithClients(cfg *config.Config, gh *ghclient.Client, llmClient *llm.Client) *Server {
+	if err := cfg.Validate(); err != nil {
+		panic(fmt.Sprintf("invalid config: %v", err))
+	}
+	if cfg.IsGitHubAppSetupMode() {
+		return &Server{
+			cfg: cfg,
+			gh:  gh,
+		}
+	}
 	return &Server{
 		cfg:        cfg,
-		engine:     reviewer.NewEngine(cfg),
+		engine:     reviewer.NewEngineWithClients(cfg, gh, llmClient, nil),
 		labeler:    labeler.NewLabeler(cfg),
-		summarizer: summarizer.NewSummarizer(cfg),
+		summarizer: summarizer.NewSummarizerWithClients(cfg, gh, llmClient),
 		assistant:  assistant.NewAssistant(cfg),
 		describer:  describer.NewDescriber(cfg),
 		changelog:  changelog.NewUpdater(cfg),
-		gh:         ghclient.NewClientFromConfig(cfg),
+		gh:         gh,
 	}
 }
 

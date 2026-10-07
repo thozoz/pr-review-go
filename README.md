@@ -31,7 +31,7 @@ pkg/
   assistant/           # Read-only interactive PR assistant (read_file, list_files)
   labeler/             # Auto-labeler based on PR contents
   changelog/           # Atomic changelog generation and expected-head CAS publication
-  server/              # GitHub Webhook server with HMAC validation & background runner
+  server/              # GitHub Webhook server with HMAC validation, durable bbolt queue & fixed workers
 deploy/
   sandbox/             # Trusted Containerfile and helper build recipe
   pr-review.service   # Systemd unit template for Proxmox CT / Linux server
@@ -72,6 +72,7 @@ see [release setup](docs/RELEASING.md) for the one-time publisher configuration.
 ### 1. Build
 ```bash
 go build -o bin/pr-review-go ./cmd/pr-review-go
+go build -o bin/pr-review-server ./cmd/pr-review-server
 ```
 
 ### 2. Manual CLI Mode
@@ -109,20 +110,34 @@ export AUTO_ACTIONS="review,labels,describe"
 export WEBHOOK_SECRET="your-hmac-secret"
 export PORT=3000
 
-./bin/pr-review-go -server
+# Optional durable queue and capacity controls (defaults shown):
+export WEBHOOK_STATE_DIR="$HOME/.config/pr-review-go/state"
+export WEBHOOK_WORKERS=2
+export WEBHOOK_BACKLOG=100
+export LLM_CONCURRENCY=2
+export LLM_MIN_INTERVAL=1s
+export SANDBOX_CONCURRENCY=1
+
+./bin/pr-review-server
 ```
 
-When running in server mode, incoming webhook triggers:
+When running in server mode:
+- **Durable bbolt Ledger**: Webhooks commit delivery receipts and job bundles atomically to `jobs.db` before returning HTTP 200. Saturated queues return HTTP 503 (`Retry-After: 30`).
+- **Per-PR FIFO Serialization**: Work is serialized per pull request; distinct PRs process in parallel across fixed workers.
+- **Automatic Review Coalescing**: Subsequent commits during an active review coalesce into a single follow-up review of the latest commit; outdated reports are discarded before publication.
+- **Status Comment Recycling**: The bot updates a single recycled status comment per PR instead of spamming transitions.
+- **Rerun Protection**: Repeated comment deliveries are deduplicated; fresh `/review` comments on already-reviewed commits explicitly rerun and display `"This commit was already reviewed. Reviewing again."`.
+- **Offline Disaster Recovery**: Blocked or crashed jobs can be inspected and resolved using `./bin/pr-review-server --queue-inspect` and `--queue-resolve`.
+
+For full configuration tables, capacity limits, redelivery warnings, and recovery runbooks, see [docs/WEBHOOK_OPERATIONS.md](docs/WEBHOOK_OPERATIONS.md).
+
+Incoming webhook triggers:
 - `pull_request`: `opened` -> auto-labels + code review
-- `pull_request`: `synchronize` -> incremental review
+- `pull_request`: `synchronize` -> coalesced incremental review
 - Comment `/review` -> triggers code review; project build/tests remain disabled
 - Comment `/improve` -> posts an unavailable notice; no suggestions are generated
 - Comment `/describe` -> appends a purpose and file walkthrough to PR body
 - Comment `/update_changelog` -> commits one changelog entry when author has not edited it
-
-`AUTO_ACTIONS` accepts `review`, `labels`, `describe`, and `improve`, but `improve` is currently skipped. Set it empty
-to disable automatic actions. `review` also runs on later PR updates when selected;
-other automatic actions run only when the PR opens. Comment commands require repository write permission.
 - Comment `/summarize` or `/summary` -> triggers discussion summary
 - Comment `/labels` or `/generate_labels` -> triggers label generation
 - Comment `@bot <task>`, `@pr-review <task>`, or `/ask <task>` -> launches interactive sandbox assistant
