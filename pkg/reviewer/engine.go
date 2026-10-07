@@ -68,7 +68,14 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 			verReport, err := e.sandbox.VerifyProject(ctx, workDir)
 			if err == nil {
 				verificationSummary = verReport.Summary
-				sandboxVerified = len(verReport.Results) > 0
+				if verReport.Status == sandbox.StatusPassed {
+					sandboxVerified = true
+				} else {
+					sandboxVerified = false
+					if verReport.Reason != "" {
+						verificationSummary = fmt.Sprintf("[%s] %s: %s", verReport.Status, verReport.Summary, verReport.Reason)
+					}
+				}
 				// If tests or build failed, append stderr/stdout snippet
 				for _, res := range verReport.Results {
 					if !res.Passed {
@@ -77,9 +84,11 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 							res.Command, res.ExitCode, res.Stdout, res.Stderr)
 					}
 				}
+			} else {
+				verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
 			}
 		} else {
-			verificationSummary = fmt.Sprintf("Sandbox checkout failed: %v", err)
+			verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
 		}
 	}
 
