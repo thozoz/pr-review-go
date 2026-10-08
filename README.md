@@ -110,7 +110,7 @@ export AUTO_ACTIONS="review,labels,describe"
 export WEBHOOK_SECRET="your-hmac-secret"
 export PORT=3000
 
-# Optional durable queue and capacity controls (defaults shown):
+# Optional durable queue and capacity controls (defaults shown; WEBHOOK_STATE_DIR defaults to platform os.UserConfigDir()/pr-review-go/state):
 export WEBHOOK_STATE_DIR="$HOME/.config/pr-review-go/state"
 export WEBHOOK_WORKERS=2
 export WEBHOOK_BACKLOG=100
@@ -122,12 +122,12 @@ export SANDBOX_CONCURRENCY=1
 ```
 
 When running in server mode:
-- **Durable bbolt Ledger**: Webhooks commit delivery receipts and job bundles atomically to `jobs.db` before returning HTTP 200. Saturated queues return HTTP 503 (`Retry-After: 30`).
+- **Durable bbolt Ledger & Bounded Retention**: Webhooks commit delivery receipts and job bundles atomically to `jobs.db` before returning HTTP 200. Bounded maintenance reclaims expired terminal records without evicting active work. Saturated queues return HTTP 503 (`Retry-After: 30`).
 - **Per-PR FIFO Serialization**: Work is serialized per pull request; distinct PRs process in parallel across fixed workers.
 - **Automatic Review Coalescing**: Subsequent commits during an active review coalesce into a single follow-up review of the latest commit; outdated reports are discarded before publication.
-- **Status Comment Recycling**: The bot updates a single recycled status comment per PR instead of spamming transitions.
-- **Rerun Protection**: Repeated comment deliveries are deduplicated; fresh `/review` comments on already-reviewed commits explicitly rerun and display `"This commit was already reviewed. Reviewing again."`.
-- **Offline Disaster Recovery**: Blocked or crashed jobs can be inspected and resolved using `./bin/pr-review-server --queue-inspect` and `--queue-resolve`.
+- **Status Comment Recycling & Outbox**: A dedicated background StatusOutbox publishes durable queued status comments immediately; transitions recycle the same status comment per PR.
+- **Rerun Protection**: Repeated comment deliveries are deduplicated within the retention window; fresh `/review` comments on already-reviewed commits explicitly rerun and display `"This commit was already reviewed. Reviewing again."`.
+- **Offline Disaster Recovery**: Blocked or crashed jobs can be inspected and resolved using `WEBHOOK_STATE_DIR=/path ./bin/pr-review-server --queue-inspect` and `--queue-resolve` (`confirmed`, `rerun`, `cancel`).
 
 For full configuration tables, capacity limits, redelivery warnings, and recovery runbooks, see [docs/WEBHOOK_OPERATIONS.md](docs/WEBHOOK_OPERATIONS.md).
 

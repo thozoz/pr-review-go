@@ -515,6 +515,14 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		log.Printf("[scheduler] Warning during job recovery: %v", err)
 	}
 
+	// Initial store maintenance pass
+	if _, err := s.store.MaintainTerminalRecords(ctx, time.Now().UTC(), 128); err != nil {
+		log.Printf("[scheduler] Initial store maintenance warning: %v", err)
+	}
+
+	s.wg.Add(1)
+	go s.maintenanceLoop(ctx)
+
 	for i := 0; i < s.workers; i++ {
 		s.wg.Add(1)
 		go s.workerLoop(ctx, i)
@@ -523,6 +531,23 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	// Trigger initial work check
 	s.Wake()
 	return nil
+}
+
+func (s *Scheduler) maintenanceLoop(ctx context.Context) {
+	defer s.wg.Done()
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, _ = s.store.MaintainTerminalRecords(ctx, time.Now().UTC(), 128)
+		}
+	}
 }
 
 func (s *Scheduler) Shutdown(ctx context.Context) error {

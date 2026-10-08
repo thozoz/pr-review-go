@@ -88,6 +88,7 @@ type Delivery struct {
 	EventKind   string    `json:"event_kind"`
 	PayloadHash string    `json:"payload_hash"` // SHA-256 hex
 	ReceivedAt  time.Time `json:"received_at"`
+	JobIDs      []string  `json:"job_ids,omitempty"`
 }
 
 func (d *Delivery) Key() string {
@@ -219,12 +220,15 @@ type JobStore interface {
 	ReleasePR(ctx context.Context, prKey PRKey) error
 	ScheduleSuccessorReview(ctx context.Context, prKey PRKey, owner, repo string, prNum int, baseSHA, headSHA string) (*Job, error)
 	ListPendingStatusIntents(ctx context.Context, limit int) ([]*OutputIntent, error)
+	MaintainTerminalRecords(ctx context.Context, now time.Time, limit int) (MaintenanceResult, error)
 }
 
 type BoltJobStore struct {
-	db   *bbolt.DB
-	opts StoreOptions
-	mu   sync.RWMutex
+	db           *bbolt.DB
+	opts         StoreOptions
+	mu           sync.RWMutex
+	mBucketIndex int
+	mCursorKey   []byte
 }
 
 // OpenJobStore opens or initializes a bbolt-backed JobStore at the specified path.
@@ -237,6 +241,9 @@ func OpenJobStore(path string, opts StoreOptions) (*BoltJobStore, error) {
 	}
 	if opts.StateMaxBytes <= 0 {
 		opts.StateMaxBytes = 67108864
+	}
+	if opts.DeliveryTTL <= 0 {
+		opts.DeliveryTTL = 168 * time.Hour
 	}
 	if opts.OpenTimeout <= 0 {
 		opts.OpenTimeout = 1 * time.Second
@@ -431,11 +438,26 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 			}
 		}
 
+		now := delivery.ReceivedAt
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+
 		// 2. Check Delivery limit
 		delivCount := delivBucket.Stats().KeyN
 		if delivCount+1 > s.opts.DeliveryLimit {
-			result = AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("delivery limit %d reached", s.opts.DeliveryLimit)}
-			return nil
+			var mRes MaintenanceResult
+			intentsBucket := tx.Bucket(bucketIntents)
+			_ = s.maintainTerminalRecordsInTx(tx, delivBucket, jobsBucket, intentsBucket, commentsBucket, prsBucket, now, s.opts.DeliveryTTL, 128, &mRes)
+			delivCount = 0
+			c := delivBucket.Cursor()
+			for k, _ := c.First(); k != nil; k, _ = c.Next() {
+				delivCount++
+			}
+			if delivCount+1 > s.opts.DeliveryLimit {
+				result = AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("delivery limit %d reached", s.opts.DeliveryLimit)}
+				return nil
+			}
 		}
 
 		// 3. Count currently queued jobs, reserved successors, and estimated bytes
@@ -520,20 +542,24 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 		// 4. Check State Max Bytes (logical retained values + reservations)
 		neededBytes := int64(netNewQueued) * EstimatedJobStorageReserve
 		if estimatedBytes+neededBytes > s.opts.StateMaxBytes {
-			result = AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("state max bytes limit %d reached", s.opts.StateMaxBytes)}
-			return nil
+			var mRes MaintenanceResult
+			intentsBucket := tx.Bucket(bucketIntents)
+			_ = s.maintainTerminalRecordsInTx(tx, delivBucket, jobsBucket, intentsBucket, commentsBucket, prsBucket, now, s.opts.DeliveryTTL, 128, &mRes)
+			estimatedBytes = 0
+			c := jobsBucket.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var j Job
+				if err := json.Unmarshal(v, &j); err == nil {
+					estimatedBytes += int64(len(v)) + j.Reservations
+				}
+			}
+			if estimatedBytes+neededBytes > s.opts.StateMaxBytes {
+				result = AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("state max bytes limit %d reached", s.opts.StateMaxBytes)}
+				return nil
+			}
 		}
 
-		// 5. Commit Delivery receipt
-		delivBytes, err := json.Marshal(delivery)
-		if err != nil {
-			return err
-		}
-		if err := delivBucket.Put(delivKey, delivBytes); err != nil {
-			return err
-		}
-
-		// 6. Commit Jobs and PR state
+		// 5. Defer Delivery commit until jobs are assigned IDs below
 		prGenerations := make(map[string]uint64)
 		for i := range jobs {
 			job := &jobs[i]
@@ -679,7 +705,28 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 			}
 		}
 
-		// 7. Register comment keys
+		// 7. Commit Delivery receipt with associated job IDs
+		var admittedJobIDs []string
+		for _, j := range jobs {
+			if j.ID != "" {
+				admittedJobIDs = append(admittedJobIDs, j.ID)
+			}
+		}
+		for _, target := range coalescedJobs {
+			if target.job.ID != "" {
+				admittedJobIDs = append(admittedJobIDs, target.job.ID)
+			}
+		}
+		delivery.JobIDs = admittedJobIDs
+		delivBytes, err := json.Marshal(delivery)
+		if err != nil {
+			return err
+		}
+		if err := delivBucket.Put(delivKey, delivBytes); err != nil {
+			return err
+		}
+
+		// 8. Register comment keys
 		for _, j := range jobs {
 			if j.CommentID > 0 {
 				commentKey := fmt.Sprintf("%d/%d/created", j.PRKey.RepoID, j.CommentID)

@@ -1449,3 +1449,214 @@ func TestWebhookQueuedWhileBusy(t *testing.T) {
 		t.Fatalf("expected PR 30 status comment to be edited across running transition; got %d", pr3RunningEdited.Load())
 	}
 }
+
+func TestWebhookRetentionEndToEnd(t *testing.T) {
+	const (
+		secret       = "retention-secret-32-bytes-long!"
+		repoID int64 = 88001
+		shaBase      = "1111111111111111111111111111111111111111"
+		shaA         = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+
+	var (
+		reviewComments atomic.Int32
+	)
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{Message: llm.ChatMessage{Role: "assistant", Content: `{"score": 95, "summary": "Looks great", "findings": []}`}},
+			},
+		})
+	}))
+	defer llmServer.Close()
+
+	ghServer := httptest.NewServer(makeGitHubHandler(func() string { return shaA }, func(b string) {
+		if strings.Contains(b, "pr-review-output") {
+			reviewComments.Add(1)
+		}
+	}))
+	defer ghServer.Close()
+
+	stateDir := t.TempDir()
+	dbPath := filepath.Join(stateDir, "jobs.db")
+	ttl := 1 * time.Hour
+
+	cfg := &config.Config{
+		Port:                 3000,
+		WebhookSecret:        secret,
+		WebhookStateDir:      stateDir,
+		WebhookWorkers:       1,
+		WebhookBacklog:       10,
+		WebhookDeliveryTTL:   ttl,
+		WebhookDeliveryLimit: 100,
+		WebhookStateMaxBytes: 16777216,
+		WebhookBodyMaxBytes:  1048576,
+		EffortLevel:          "lite",
+		LLMBaseURL:           llmServer.URL,
+		LLMAPIKey:            "test-key",
+		LLMModel:             "test-model",
+		GitHubToken:          "test-token",
+		AutoActions:          []string{"review"},
+	}
+
+	ghClient, _ := ghclient.NewTestClient(ghServer.URL)
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	srv := NewServerWithClients(cfg, ghClient, llmClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+
+	// 1. Send signed delivery for PR 1
+	deliv1ID := "deliv-retention-001"
+	r1 := sendSignedWebhook(srv.Routes(), secret, "pull_request", deliv1ID, makePROpenedPayload(repoID, 1, shaBase, shaA, "author1"))
+	if r1.Code != http.StatusOK {
+		t.Fatalf("delivery 1 failed: %d (%s)", r1.Code, r1.Body.String())
+	}
+
+	// Duplicate delivery within TTL: duplicate suppression intact
+	r1Dup := sendSignedWebhook(srv.Routes(), secret, "pull_request", deliv1ID, makePROpenedPayload(repoID, 1, shaBase, shaA, "author1"))
+	if r1Dup.Code != http.StatusOK {
+		t.Fatalf("duplicate delivery within TTL should return 200: %d", r1Dup.Code)
+	}
+
+	// Wait for PR 1 job to complete
+	for i := 0; i < 100; i++ {
+		if reviewComments.Load() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if reviewComments.Load() < 1 {
+		t.Fatalf("expected PR 1 review to complete and post comment")
+	}
+
+	// 2. Stop server to safely inspect and simulate maintenance on disk
+	srv.Stop()
+
+	// Open store directly to insert waiting work and run maintenance
+	store, err := OpenJobStore(dbPath, StoreOptions{
+		DeliveryLimit: 100,
+		BacklogLimit:  10,
+		DeliveryTTL:   ttl,
+	})
+	if err != nil {
+		t.Fatalf("OpenJobStore failed: %v", err)
+	}
+
+	// Insert an old accepted waiting/queued job for PR 2, and an uncertain publication intent
+	prKey2, _ := MakePRKey("github.com", repoID, 2)
+	waitingJob := Job{
+		Kind:      "review",
+		Trigger:   "automatic",
+		PRKey:     prKey2,
+		Owner:     "owner",
+		Repo:      "repo",
+		PRNumber:  2,
+		HeadSHA:   "2222222222222222222222222222222222222222",
+		BaseSHA:   shaBase,
+		Status:    "queued",
+		CreatedAt: time.Now().UTC().Add(-48 * time.Hour), // Old accepted waiting job
+	}
+	delivWaiting := Delivery{
+		Host:        prKey2.Host,
+		RepoID:      prKey2.RepoID,
+		DeliveryID:  "deliv-waiting-002",
+		EventKind:   "pull_request",
+		PayloadHash: "hash-2",
+		ReceivedAt:  time.Now().UTC().Add(-48 * time.Hour),
+	}
+	admitRes, err := store.Admit(ctx, delivWaiting, []Job{waitingJob})
+	if err != nil || admitRes.Status != AdmitAccepted {
+		t.Fatalf("failed to admit waiting job: %v, status: %v", err, admitRes.Status)
+	}
+
+	uncertainMarker := "<!-- pr-review-output:job-uncertain-999 -->"
+	uncertainIntent := &OutputIntent{
+		Marker:     uncertainMarker,
+		JobID:      "job-uncertain-999",
+		Action:     "publish",
+		PRKey:      prKey2,
+		Owner:      "owner",
+		Repo:       "repo",
+		PRNumber:   2,
+		ExactHead:  "2222222222222222222222222222222222222222",
+		Body:       "Uncertain published content body",
+		BodyDigest: "some-digest-999",
+		Status:     "uncertain",
+		CreatedAt:  time.Now().UTC().Add(-48 * time.Hour),
+		UpdatedAt:  time.Now().UTC().Add(-48 * time.Hour),
+	}
+	if err := store.SaveOutputIntent(ctx, uncertainIntent); err != nil {
+		t.Fatalf("failed to save uncertain intent: %v", err)
+	}
+
+	// 3. Fast-forward clock past TTL and run Maintenance
+	maintenanceNow := time.Now().UTC().Add(3 * time.Hour)
+	mRes, err := store.MaintainTerminalRecords(ctx, maintenanceNow, 128)
+	if err != nil {
+		t.Fatalf("MaintainTerminalRecords failed: %v", err)
+	}
+
+	if mRes.Deleted < 1 {
+		t.Errorf("expected at least 1 deleted terminal record, got %d", mRes.Deleted)
+	}
+	if mRes.Pinned < 1 {
+		t.Errorf("expected at least 1 pinned record for waiting/uncertain work, got %d", mRes.Pinned)
+	}
+
+	store.Close()
+
+	// 4. Reopen store from disk: verify pinned waiting and uncertain state persists
+	reopenedStore, err := OpenJobStore(dbPath, StoreOptions{
+		DeliveryLimit: 100,
+		BacklogLimit:  10,
+		DeliveryTTL:   ttl,
+	})
+	if err != nil {
+		t.Fatalf("OpenJobStore failed: %v", err)
+	}
+
+	// Uncertain intent must survive reopen with body intact
+	savedIntent, err := reopenedStore.GetOutputIntent(ctx, uncertainMarker)
+	if err != nil || savedIntent == nil {
+		t.Fatalf("uncertain intent should survive reopen: %v", err)
+	}
+	if savedIntent.Status != "uncertain" || savedIntent.Body != "Uncertain published content body" {
+		t.Errorf("uncertain intent content corrupted across reopen: %+v", savedIntent)
+	}
+
+	// Old accepted waiting job must survive reopen in queued status
+	qJobs, err := reopenedStore.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs failed: %v", err)
+	}
+	foundWaiting := false
+	for _, qj := range qJobs {
+		if qj.PRNumber == 2 && qj.Status == "queued" {
+			foundWaiting = true
+			break
+		}
+	}
+	if !foundWaiting {
+		t.Errorf("waiting job for PR 2 must survive reopen in queued status")
+	}
+
+	reopenedStore.Close()
+
+	// 5. Restart server with existing database: verify routes and fresh authorized same-head rerun
+	srv2 := NewServerWithClients(cfg, ghClient, llmClient)
+	if err := srv2.Start(ctx); err != nil {
+		t.Fatalf("srv2.Start failed: %v", err)
+	}
+	defer srv2.Stop()
+
+	rFresh := sendSignedWebhook(srv2.Routes(), secret, "issue_comment", "deliv-rerun-001", makeCommentPayload(repoID, 1, 9999, "/review", "author1"))
+	if rFresh.Code != http.StatusOK {
+		t.Fatalf("fresh authorized same-head rerun should be admitted: %d (%s)", rFresh.Code, rFresh.Body.String())
+	}
+}
