@@ -357,8 +357,9 @@ func TestSummarizer_FailuresZeroPostAndZeroLLM(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on LLM failure, got nil")
 	}
-	if calls := atomic.LoadInt32(&llmCalls); calls != 1 {
-		t.Fatalf("expected 1 LLM call on LLM failure, got %d", calls)
+	// Phase 3: persistent 5xx is retried under the bounded shared retry policy.
+	if calls := atomic.LoadInt32(&llmCalls); calls != int32(config.DefaultRetryMaxAttempts) {
+		t.Fatalf("expected %d LLM calls on LLM failure, got %d", config.DefaultRetryMaxAttempts, calls)
 	}
 	if posts := atomic.LoadInt32(&postCalls); posts != 0 {
 		t.Fatalf("expected 0 post calls on LLM failure, got %d", posts)

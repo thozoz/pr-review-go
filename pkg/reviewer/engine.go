@@ -9,6 +9,7 @@ import (
 
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/dedup"
+	"github.com/thozoz/pr-review-go/pkg/diff"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
@@ -80,7 +81,7 @@ func (e *Engine) ReviewPRAtHead(ctx context.Context, owner, repo string, number 
 		return nil, fmt.Errorf("failed to fetch diff at commits: %w", err)
 	}
 
-	report, err := e.executeReview(ctx, pr, diff)
+	report, err := e.executeAgentReview(ctx, pr, diff)
 	if err != nil {
 		return nil, err
 	}
@@ -96,15 +97,158 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 		return nil, fmt.Errorf("failed to fetch PR: %w", err)
 	}
 
-	if err := github.ValidateCommitOID(pr.BaseSHA); err == nil && github.ValidateCommitOID(pr.HeadSHA) == nil {
-		return e.ReviewPRAtHead(ctx, owner, repo, number, pr.HeadSHA)
-	}
-
 	diff, err := e.gh.GetRawDiff(ctx, owner, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch diff: %w", err)
 	}
 	return e.executeReview(ctx, pr, diff)
+}
+
+func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, rawDiff string) (*ReviewReport, error) {
+	owner := pr.Owner
+	repo := pr.Repo
+	number := pr.Number
+
+	// Parse diff into change inventory and coverage ledger
+	opts := diff.ParseOptionsFromConfig(e.cfg)
+	inv := diff.Parse(rawDiff, opts)
+	ledger := diff.NewCoverageLedger(inv)
+
+	generalComments, threads, err := e.gh.GetComments(ctx, owner, repo, number)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch comments: %w", err)
+	}
+
+	var verificationSummary = "Sandbox verification skipped."
+	var verificationStatus sandbox.VerificationStatus = sandbox.StatusUnavailable
+	var verificationReason string
+	sandboxVerified := false
+
+	var snap *sandbox.Snapshot
+	var cleanup func()
+	var cleaned bool
+
+	cleanOnce := func() {
+		if !cleaned && cleanup != nil {
+			cleaned = true
+			cleanup()
+		}
+	}
+	defer cleanOnce()
+
+	if e.cfg.EnableSandbox && e.sandbox != nil {
+		snapshot, snapCleanup, err := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+		if err == nil {
+			snap = snapshot
+			cleanup = snapCleanup
+
+			// Validate snapshot before exploration and verification
+			if err := snap.Validate(); err != nil {
+				cleanOnce()
+				return nil, fmt.Errorf("snapshot validation failed: %w", err)
+			}
+			if snap.CommitSHA != pr.HeadSHA {
+				cleanOnce()
+				return nil, fmt.Errorf("snapshot commit SHA %s does not match PR head SHA %s", snap.CommitSHA, pr.HeadSHA)
+			}
+
+			// Run sandbox verification
+			verReport, err := e.sandbox.RunSnapshot(ctx, snap)
+			if err == nil {
+				verificationStatus = verReport.Status
+				verificationReason = verReport.Reason
+				verificationSummary = verReport.Summary
+				if verReport.Status == sandbox.StatusPassed {
+					sandboxVerified = true
+				} else {
+					sandboxVerified = false
+					if verReport.Reason != "" {
+						verificationSummary = fmt.Sprintf("[%s] %s: %s", verReport.Status, verReport.Summary, verReport.Reason)
+					}
+				}
+				for _, res := range verReport.Results {
+					if !res.Passed {
+						sandboxVerified = false
+						verificationSummary += fmt.Sprintf("\nCommand `%s` failed (exit %d):\n```\n%s%s\n```",
+							res.Command, res.ExitCode, res.Stdout, res.Stderr)
+					}
+				}
+			} else {
+				verificationStatus = sandbox.StatusUnavailable
+				verificationReason = err.Error()
+				verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
+			}
+		} else {
+			verificationStatus = sandbox.StatusUnavailable
+			verificationReason = err.Error()
+			verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
+		}
+	}
+
+	// Run agent loop over change inventory and held snapshot
+	agent := NewReviewerAgent(e.cfg, e.llm)
+	agentRes, err := agent.Run(ctx, pr, inv, ledger, snap, verificationSummary, verificationStatus, generalComments, threads)
+	cleanOnce() // Clean up snapshot and permit immediately after loop finishes
+	if err != nil {
+		return nil, err
+	}
+
+	// Deduplicate findings against existing comments
+	var allCommentBodies []string
+	for _, c := range generalComments {
+		allCommentBodies = append(allCommentBodies, c.Body)
+	}
+	for _, th := range threads {
+		for _, tc := range th.Comments {
+			allCommentBodies = append(allCommentBodies, tc.Body)
+		}
+	}
+	existingFPs := dedup.ExtractFingerprints(allCommentBodies)
+
+	var uniqueFindings []Finding
+	skippedCount := 0
+	if agentRes.Output != nil {
+		for _, f := range agentRes.Output.Findings {
+			fp := dedup.ComputeFingerprint(f.File, f.Line, f.Title, f.Severity)
+			if existingFPs[fp] {
+				skippedCount++
+				continue
+			}
+			uniqueFindings = append(uniqueFindings, f)
+		}
+	}
+
+	var score int
+	var summary string
+	var commentFollowups []CommentTracking
+	if agentRes.Output != nil {
+		score = agentRes.Output.Score
+		summary = agentRes.Output.Summary
+		commentFollowups = agentRes.Output.CommentFollowups
+	}
+
+	report := &ReviewReport{
+		PRNumber:            number,
+		PRTitle:             pr.Title,
+		HeadSHA:             pr.HeadSHA,
+		Score:               score,
+		Summary:             summary,
+		VerificationSummary: verificationSummary,
+		VerificationStatus:  verificationStatus,
+		VerificationReason:  verificationReason,
+		RulesSource:         "",
+		DeduplicatedCount:   skippedCount,
+		CommentFollowups:    commentFollowups,
+		Findings:            uniqueFindings,
+		Ledger:              agentRes.Ledger,
+	}
+
+	if sandboxVerified {
+		report.Suggestions = BuildInlineSuggestions(rawDiff, uniqueFindings)
+	}
+
+	report.RawMarkdown = FormatReportMarkdown(report)
+	return report, nil
 }
 
 func (e *Engine) executeReview(ctx context.Context, pr *github.PRDetails, diff string) (*ReviewReport, error) {
@@ -534,6 +678,80 @@ func FormatReportMarkdown(r *ReviewReport) string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("## 🤖 PR Review Report: %s (Score: %d/100)\n\n", r.PRTitle, r.Score))
+
+	cov := r.GetCoverage()
+	isPartial := cov != nil && cov.State == CoverageStatePartial
+
+	if isPartial {
+		sb.WriteString(fmt.Sprintf("> ⚠️ **Partial Review Warning:** Review coverage is incomplete (%d of %d hunks examined, %d skipped). Unexamined changes have not been verified and are not cleared for merge.\n\n",
+			cov.ExaminedCount, cov.TotalHunks, cov.SkippedCount))
+	}
+
+	if cov != nil {
+		sb.WriteString("### 📊 Review Coverage\n")
+		if isPartial {
+			sb.WriteString(fmt.Sprintf("- **Status:** Partial (%d/%d hunks examined, %d skipped)\n",
+				cov.ExaminedCount, cov.TotalHunks, cov.SkippedCount))
+		} else {
+			sb.WriteString(fmt.Sprintf("- **Status:** Full (%d/%d hunks examined)\n",
+				cov.ExaminedCount, cov.TotalHunks))
+		}
+
+		const maxItems = 25
+
+		if len(cov.ExaminedHunks) > 0 {
+			sb.WriteString("- **Examined Hunks:**\n")
+			limit := len(cov.ExaminedHunks)
+			if limit > maxItems {
+				limit = maxItems
+			}
+			for i := 0; i < limit; i++ {
+				sb.WriteString(fmt.Sprintf("  - `%s`\n", cov.ExaminedHunks[i]))
+			}
+			if len(cov.ExaminedHunks) > maxItems {
+				sb.WriteString(fmt.Sprintf("  - *... and %d more examined hunks (%d total examined)*\n",
+					len(cov.ExaminedHunks)-maxItems, cov.ExaminedCount))
+			}
+		}
+
+		if len(cov.SkippedHunks) > 0 {
+			sb.WriteString("- **Skipped Hunks:**\n")
+			limit := len(cov.SkippedHunks)
+			if limit > maxItems {
+				limit = maxItems
+			}
+			for i := 0; i < limit; i++ {
+				item := cov.SkippedHunks[i]
+				reason := item.Reason
+				if reason == "" {
+					reason = "not examined"
+				}
+				sb.WriteString(fmt.Sprintf("  - `%s`: %s\n", item.ID, reason))
+			}
+			if len(cov.SkippedHunks) > maxItems {
+				sb.WriteString(fmt.Sprintf("  - *... and %d more skipped hunks (%d total skipped)*\n",
+					len(cov.SkippedHunks)-maxItems, len(cov.SkippedHunks)))
+			}
+		}
+
+		if len(cov.Omissions) > 0 {
+			sb.WriteString("- **Omissions & Unsupported Changes:**\n")
+			limit := len(cov.Omissions)
+			if limit > maxItems {
+				limit = maxItems
+			}
+			for i := 0; i < limit; i++ {
+				item := cov.Omissions[i]
+				sb.WriteString(fmt.Sprintf("  - `%s`: %s\n", item.ID, item.Reason))
+			}
+			if len(cov.Omissions) > maxItems {
+				sb.WriteString(fmt.Sprintf("  - *... and %d more omissions (%d total omissions)*\n",
+					len(cov.Omissions)-maxItems, len(cov.Omissions)))
+			}
+		}
+		sb.WriteString("\n")
+	}
+
 	if r.RulesSource != "" {
 		sb.WriteString(fmt.Sprintf("📋 **Custom Guidelines Enforced:** `%s`\n\n", r.RulesSource))
 	}
@@ -556,9 +774,17 @@ func FormatReportMarkdown(r *ReviewReport) string {
 
 	if len(r.Findings) == 0 {
 		if r.DeduplicatedCount > 0 {
-			sb.WriteString(fmt.Sprintf("### 🎯 Findings\nAll %d detected issues were already reported previously and have been deduplicated.\n\n", r.DeduplicatedCount))
+			if isPartial {
+				sb.WriteString(fmt.Sprintf("### 🎯 Findings\nAll %d detected issues were already reported previously and have been deduplicated.\n\n*Note: Review coverage was partial; unexamined changes have not been verified.*\n\n", r.DeduplicatedCount))
+			} else {
+				sb.WriteString(fmt.Sprintf("### 🎯 Findings\nAll %d detected issues were already reported previously and have been deduplicated.\n\n", r.DeduplicatedCount))
+			}
 		} else {
-			sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected. Looks ready to merge!\n\n")
+			if isPartial {
+				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected in examined files. (Review was partial; unexamined changes have not been verified and are not cleared for merge.)\n\n")
+			} else {
+				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected. Looks ready to merge!\n\n")
+			}
 		}
 	} else {
 		sb.WriteString("### 🎯 Findings\n")

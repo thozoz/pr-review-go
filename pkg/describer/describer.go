@@ -6,11 +6,15 @@ import (
 	"strings"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
+	diffpkg "github.com/thozoz/pr-review-go/pkg/diff"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
 )
 
 const marker = "<!-- pr-review-go:description -->"
+
+// TruncationNotice is appended to generated PR descriptions when the diff was truncated at a hunk boundary.
+const TruncationNotice = "\n\n> ⚠️ *Note: Diff exceeded size limits and was truncated at a hunk boundary; description is based on partial diff.*"
 
 type Describer struct {
 	gh  *github.Client
@@ -55,6 +59,12 @@ func (d *Describer) RunAndUpdate(ctx context.Context, owner, repo string, number
 }
 
 func (d *Describer) Generate(ctx context.Context, pr *github.PRDetails, diff string) (string, error) {
+	text, _, err := d.GenerateWithStatus(ctx, pr, diff)
+	return text, err
+}
+
+// GenerateWithStatus generates a PR description and indicates whether diff windowing truncated input.
+func (d *Describer) GenerateWithStatus(ctx context.Context, pr *github.PRDetails, diff string) (string, bool, error) {
 	const systemPrompt = `You write concise, professional GitHub Pull Request descriptions.
 
 Output Markdown only, using exactly these sections:
@@ -66,17 +76,24 @@ A table with columns File and Change. Include only meaningfully changed files an
 
 Do not include Mermaid, diagrams, generic praise, test claims, or sections not listed above.`
 
-	if len(diff) > 80000 {
-		diff = diff[:80000] + "\n...[diff truncated]..."
+	window := diffpkg.Parse(diff).Window(80000)
+	diffText := window.Content
+	if window.Truncated {
+		diffText += "\n...[diff truncated at hunk boundary]..."
 	}
 	userPrompt := fmt.Sprintf("PR title: %s\nAuthor: %s\nExisting author description:\n%s\n\nDiff:\n```diff\n%s\n```",
-		pr.Title, pr.Author, strings.TrimSpace(pr.Body), diff)
+		pr.Title, pr.Author, strings.TrimSpace(pr.Body), diffText)
 
 	output, err := d.llm.ChatCompletion(ctx, systemPrompt, userPrompt)
 	if err != nil {
-		return "", fmt.Errorf("llm description generation failed: %w", err)
+		return "", window.Truncated, fmt.Errorf("llm description generation failed: %w", err)
 	}
-	return strings.TrimSpace(output), nil
+
+	result := strings.TrimSpace(output)
+	if window.Truncated {
+		result += TruncationNotice
+	}
+	return result, window.Truncated, nil
 }
 
 func appendDescription(authorBody, generated string) string {

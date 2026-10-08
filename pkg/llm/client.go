@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/thozoz/pr-review-go/pkg/retry"
 )
 
 // Bounds for LLM request gate configuration.
@@ -177,6 +179,7 @@ type Client struct {
 	model            string
 	httpClient       *http.Client
 	maxResponseBytes int64
+	retryPolicy      retry.Policy
 }
 
 func NewClient(baseURL, apiKey, model string) *Client {
@@ -189,6 +192,7 @@ func NewClient(baseURL, apiKey, model string) *Client {
 			Timeout: 5 * time.Minute,
 		},
 		maxResponseBytes: DefaultLLMResponseMaxBytes,
+		retryPolicy:      retry.DefaultPolicy(),
 	}
 }
 
@@ -207,6 +211,16 @@ func (c *Client) SetHTTPClient(client *http.Client) {
 // SetMaxResponseBytes customizes the maximum allowed response size for this client.
 func (c *Client) SetMaxResponseBytes(limit int64) {
 	c.maxResponseBytes = limit
+}
+
+// SetRetryPolicy customizes retry policy for LLM operations.
+func (c *Client) SetRetryPolicy(p retry.Policy) {
+	c.retryPolicy = p
+}
+
+// SetClock allows injecting a fake clock for testing.
+func (c *Client) SetClock(clk retry.Clock) {
+	c.retryPolicy.Clock = clk
 }
 
 type ChatMessage struct {
@@ -282,52 +296,55 @@ func (c *Client) ChatCompletion(ctx context.Context, systemPrompt, userPrompt st
 	}
 
 	url := fmt.Sprintf("%s/chat/completions", c.baseURL)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		return "", fmt.Errorf("failed to create http request: %w", err)
-	}
 
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
-	}
+	return retry.Do(ctx, c.retryPolicy, retry.OpKindRead, func(attemptCtx context.Context) (string, error) {
+		req, err := http.NewRequestWithContext(attemptCtx, "POST", url, bytes.NewBuffer(payloadBytes))
+		if err != nil {
+			return "", fmt.Errorf("failed to create http request: %w", err)
+		}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("http request failed: %w", err)
-	}
-	defer resp.Body.Close()
+		req.Header.Set("Content-Type", "application/json")
+		if c.apiKey != "" {
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+		}
 
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("http request failed: %w", err)
+		}
+		defer resp.Body.Close()
 
-	if int64(len(bodyBytes)) > maxBytes {
-		return "", fmt.Errorf("llm response body exceeds limit of %d bytes", maxBytes)
-	}
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+		if err != nil {
+			return "", fmt.Errorf("failed to read response: %w", err)
+		}
 
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(bodyBytes))
-	}
+		if int64(len(bodyBytes)) > maxBytes {
+			return "", fmt.Errorf("llm response body exceeds limit of %d bytes", maxBytes)
+		}
 
-	var chatResp ChatResponse
-	if err := json.Unmarshal(bodyBytes, &chatResp); err != nil {
-		return "", fmt.Errorf("failed to unmarshal chat response: %w, raw: %s", err, string(bodyBytes))
-	}
+		if resp.StatusCode >= 400 {
+			return "", fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(bodyBytes))
+		}
 
-	if chatResp.Error != nil {
-		return "", fmt.Errorf("llm returned error: %s", chatResp.Error.Message)
-	}
+		var chatResp ChatResponse
+		if err := json.Unmarshal(bodyBytes, &chatResp); err != nil {
+			return "", fmt.Errorf("failed to unmarshal chat response: %w, raw: %s", err, string(bodyBytes))
+		}
 
-	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("no response choices returned from model")
-	}
+		if chatResp.Error != nil {
+			return "", fmt.Errorf("llm returned error: %s", chatResp.Error.Message)
+		}
 
-	content := chatResp.Choices[0].Message.Content
-	if strings.TrimSpace(content) == "" {
-		return "", fmt.Errorf("empty assistant response content")
-	}
+		if len(chatResp.Choices) == 0 {
+			return "", fmt.Errorf("no response choices returned from model")
+		}
 
-	return content, nil
+		content := chatResp.Choices[0].Message.Content
+		if strings.TrimSpace(content) == "" {
+			return "", fmt.Errorf("empty assistant response content")
+		}
+
+		return content, nil
+	})
 }

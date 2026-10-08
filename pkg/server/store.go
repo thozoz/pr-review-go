@@ -118,6 +118,10 @@ type Job struct {
 	Reservations    int64      `json:"reservations"`
 	StatusCommentID int64      `json:"status_comment_id,omitempty"`
 	OutputMarker    string     `json:"output_marker,omitempty"`
+	// NotBeforeAt parks a deferred attempt in the durable queue until the due
+	// time arrives. Zero value means immediately eligible; old rows unmarshal
+	// unchanged and schema version stays 1.
+	NotBeforeAt     time.Time  `json:"not_before_at,omitempty"`
 	Payload         string     `json:"payload,omitempty"`
 	Error           string     `json:"error,omitempty"`
 }
@@ -167,6 +171,7 @@ type HealthCounts struct {
 	Running        int  `json:"running"`
 	Uncertain      int  `json:"uncertain"`
 	NeedsAttention int  `json:"needs_attention"`
+	Deferred       int  `json:"deferred"`
 	OldWaitWarning bool `json:"old_wait_warning"`
 }
 
@@ -219,6 +224,13 @@ type JobStore interface {
 	ClaimNextJob(ctx context.Context, activePRs map[string]bool) (*Job, error)
 	ReleasePR(ctx context.Context, prKey PRKey) error
 	ScheduleSuccessorReview(ctx context.Context, prKey PRKey, owner, repo string, prNum int, baseSHA, headSHA string) (*Job, error)
+	// DeferJob atomically parks a job as a deferred attempt due at dueAt: the
+	// job returns to queued with NotBeforeAt set so workers are freed while
+	// the wait persists durably. Repeating the same deferral is idempotent.
+	DeferJob(ctx context.Context, jobID string, dueAt time.Time, reason string) (*Job, error)
+	// EarliestDeferredDue reports the earliest future due time among queued
+	// deferred attempts, so the scheduler can bound its idle poll.
+	EarliestDeferredDue(ctx context.Context) (time.Time, bool, error)
 	ListPendingStatusIntents(ctx context.Context, limit int) ([]*OutputIntent, error)
 	MaintainTerminalRecords(ctx context.Context, now time.Time, limit int) (MaintenanceResult, error)
 }
@@ -1191,6 +1203,9 @@ func (s *BoltJobStore) ResolveJob(ctx context.Context, jobID string, resolution 
 			targetJob.Error = ""
 			targetJob.StartedAt = nil
 			targetJob.FinishedAt = nil
+			// An operator rerun means run now: clear any parked due time so
+			// the job is immediately eligible instead of staying deferred.
+			targetJob.NotBeforeAt = time.Time{}
 			targetJob.RecoveryPhase = "operator_rerun"
 		case "cancel":
 			targetJob.Status = "cancelled"
@@ -1255,6 +1270,9 @@ func (s *BoltJobStore) GetHealthCounts(ctx context.Context, oldWaitWarning time.
 				switch j.Status {
 				case "queued":
 					counts.Queued++
+					if !j.NotBeforeAt.IsZero() && now.Before(j.NotBeforeAt) {
+						counts.Deferred++
+					}
 					if oldWaitWarning > 0 && now.Sub(j.CreatedAt) > oldWaitWarning {
 						counts.OldWaitWarning = true
 					}
@@ -1313,9 +1331,15 @@ func (s *BoltJobStore) ClaimNextJob(ctx context.Context, activePRs map[string]bo
 		}
 
 		// 2. Scan queued jobs in FIFO sequence order
+		claimNow := time.Now().UTC()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var j Job
 			if err := json.Unmarshal(v, &j); err != nil || j.Status != "queued" {
+				continue
+			}
+			// Not-due deferred attempts stay parked without blocking other
+			// PRs; they become eligible once the due time arrives.
+			if !j.NotBeforeAt.IsZero() && claimNow.Before(j.NotBeforeAt) {
 				continue
 			}
 
@@ -1446,6 +1470,106 @@ func (s *BoltJobStore) ReleasePR(ctx context.Context, prKey PRKey) error {
 		}
 		return prsBucket.Put(prKeyBytes, raw)
 	})
+}
+
+// DeferJob atomically parks a job as a deferred attempt due at dueAt. The job
+// returns to queued with NotBeforeAt set, StartedAt cleared, and the reason
+// recorded, so the worker is freed while the wait persists durably across
+// restarts. Only queued, running, or uncertain jobs may be parked; repeating
+// the same deferral is a no-op that returns the current state.
+func (s *BoltJobStore) DeferJob(ctx context.Context, jobID string, dueAt time.Time, reason string) (*Job, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return nil, ErrStoreClosed
+	}
+	if jobID == "" {
+		return nil, ErrJobNotFound
+	}
+	if dueAt.IsZero() {
+		return nil, fmt.Errorf("deferral due time must not be zero")
+	}
+	dueAt = dueAt.UTC()
+
+	var deferred *Job
+	err := s.db.Update(func(tx *bbolt.Tx) error {
+		jobsBucket := tx.Bucket(bucketJobs)
+		c := jobsBucket.Cursor()
+		var targetKey []byte
+		var target Job
+		found := false
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err == nil && j.ID == jobID {
+				targetKey = append([]byte(nil), k...)
+				target = j
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ErrJobNotFound
+		}
+		switch target.Status {
+		case "queued", "running", "uncertain":
+			// Parkable states: requeue below.
+		default:
+			return fmt.Errorf("cannot defer job %s in terminal status %q", jobID, target.Status)
+		}
+		if target.Status == "queued" && target.NotBeforeAt.Equal(dueAt) {
+			copyTarget := target
+			deferred = &copyTarget
+			return nil
+		}
+		target.Status = "queued"
+		target.NotBeforeAt = dueAt
+		target.StartedAt = nil
+		target.FinishedAt = nil
+		target.RecoveryPhase = "deferred_retry"
+		if reason != "" {
+			target.Error = reason
+		}
+		raw, err := json.Marshal(target)
+		if err != nil {
+			return err
+		}
+		if err := jobsBucket.Put(targetKey, raw); err != nil {
+			return err
+		}
+		copyTarget := target
+		deferred = &copyTarget
+		return nil
+	})
+	return deferred, err
+}
+
+// EarliestDeferredDue reports the earliest future due time among queued
+// deferred attempts. ok is false when no parked attempt is waiting.
+func (s *BoltJobStore) EarliestDeferredDue(ctx context.Context) (due time.Time, ok bool, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return time.Time{}, false, ErrStoreClosed
+	}
+	now := time.Now().UTC()
+	err = s.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketJobs)
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var j Job
+			if err := json.Unmarshal(v, &j); err != nil || j.Status != "queued" {
+				continue
+			}
+			if j.NotBeforeAt.IsZero() || !now.Before(j.NotBeforeAt) {
+				continue
+			}
+			if !ok || j.NotBeforeAt.Before(due) {
+				due, ok = j.NotBeforeAt, true
+			}
+		}
+		return nil
+	})
+	return due, ok, err
 }
 
 // ScheduleSuccessorReview creates or updates a queued automatic review intent for the latest head,

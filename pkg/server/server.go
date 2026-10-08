@@ -119,6 +119,9 @@ func (s *Server) Start(ctx context.Context) error {
 		executor := NewServerJobExecutor(s, s.store)
 		s.scheduler = NewScheduler(s.store, executor, s.cfg.WebhookWorkers)
 	}
+	if s.cfg != nil && s.cfg.DeferPollInterval > 0 {
+		s.scheduler.SetDeferPollInterval(s.cfg.DeferPollInterval)
+	}
 
 	if s.scheduler.LLMGate() == nil && s.cfg != nil {
 		llmGate, err := llm.NewRequestGate(s.cfg.LLMConcurrency, s.cfg.LLMMinInterval, s.cfg.LLMResponseMaxBytes, nil)
@@ -292,6 +295,23 @@ func (s *Server) Routes() http.Handler {
 	return mux
 }
 
+// DescribeQueueState renders the operator-visible queue state of a job for
+// inspection surfaces (--queue-inspect, health). Deferred attempts report
+// their park state so operators can distinguish waiting work from stuck work;
+// all other jobs report their ledger status unchanged.
+func DescribeQueueState(j *Job, now time.Time) string {
+	if j == nil {
+		return ""
+	}
+	if j.Status == "queued" && !j.NotBeforeAt.IsZero() {
+		if now.Before(j.NotBeforeAt) {
+			return "deferred until " + j.NotBeforeAt.Format(time.RFC3339)
+		}
+		return "due (deferred)"
+	}
+	return j.Status
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	runtimeErr := s.runtimeErr
@@ -333,6 +353,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 				"running":         counts.Running,
 				"uncertain":       counts.Uncertain,
 				"needs_attention": counts.NeedsAttention,
+				"deferred":        counts.Deferred,
 			}
 			resp["old_wait_warning"] = counts.OldWaitWarning
 			if counts.Uncertain > 0 || counts.NeedsAttention > 0 || counts.OldWaitWarning {

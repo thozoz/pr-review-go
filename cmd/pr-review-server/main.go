@@ -63,15 +63,15 @@ func main() {
 				log.Fatalf("Failed to inspect jobs: %v", err)
 			}
 			fmt.Printf("Persistent Queue Inspection (%s): %d total jobs\n", dbPath, len(jobs))
-			fmt.Printf("%-15s %-8s %-12s %-10s %-16s %-10s %s\n", "JOB ID", "SEQ", "KIND", "TRIGGER", "STATUS", "PR", "ERROR/PHASE")
-			fmt.Println(strings.Repeat("-", 90))
+			fmt.Printf("%-15s %-8s %-12s %-10s %-16s %-32s %-10s %s\n", "JOB ID", "SEQ", "KIND", "TRIGGER", "STATUS", "QUEUE STATE", "PR", "ERROR/PHASE")
+			fmt.Println(strings.Repeat("-", 120))
 			for _, j := range jobs {
 				errOrPhase := j.RecoveryPhase
 				if j.Error != "" {
 					errOrPhase = j.Error
 				}
-				fmt.Printf("%-15s %-8d %-12s %-10s %-16s %-10s %s\n",
-					j.ID, j.Sequence, j.Kind, j.Trigger, j.Status, j.PRKey.String(), errOrPhase)
+				fmt.Printf("%-15s %-8d %-12s %-10s %-16s %-32s %-10s %s\n",
+					j.ID, j.Sequence, j.Kind, j.Trigger, j.Status, server.DescribeQueueState(j, time.Now().UTC()), j.PRKey.String(), errOrPhase)
 			}
 			return
 		}
