@@ -122,3 +122,7 @@ other automatic actions run only when the PR opens. Comment commands require rep
 - Comment `/summarize` or `/summary` -> triggers discussion summary
 - Comment `/labels` or `/generate_labels` -> triggers label generation
 - Comment `@bot <task>`, `@pr-review <task>`, or `/ask <task>` -> launches interactive sandbox assistant
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
