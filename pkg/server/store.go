@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"go.etcd.io/bbolt"
 )
 
@@ -100,7 +101,7 @@ func (d *Delivery) Key() string {
 type Job struct {
 	ID              string     `json:"id"`
 	Sequence        uint64     `json:"sequence"`
-	Kind            string     `json:"kind"`    // "review", "labels", "describe", "summary", "docs", "changelog", "improve", "assistant"
+	Kind            string     `json:"kind"`    // "review", "labels", "describe", "summary", "docs", "changelog", "improve", "assistant", "edit"
 	Trigger         string     `json:"trigger"` // "automatic", "explicit"
 	Author          string     `json:"author"`
 	CommentID       int64      `json:"comment_id,omitempty"`
@@ -162,9 +163,23 @@ type PRState struct {
 	ActiveJobID          string `json:"active_job_id,omitempty"`
 	HasReservedSuccessor bool   `json:"has_reserved_successor,omitempty"`
 	PendingAutoJobID     string `json:"pending_auto_job_id,omitempty"`
-	LatestHeadSHA        string `json:"latest_head_sha,omitempty"`
-	HasBlockedAction     bool   `json:"has_blocked_action,omitempty"`
-	BlockedReason        string `json:"blocked_reason,omitempty"`
+	LatestHeadSHA        string   `json:"latest_head_sha,omitempty"`
+	HasBlockedAction     bool     `json:"has_blocked_action,omitempty"`
+	BlockedReason        string   `json:"blocked_reason,omitempty"`
+	LastBotCommitSHA     string   `json:"last_bot_commit_sha,omitempty"`
+	LastBotBaseSHA       string   `json:"last_bot_base_sha,omitempty"`
+	EditHistory          []string `json:"edit_history,omitempty"`
+}
+
+// AppendEditInstruction appends an instruction to EditHistory, keeping at most 5 entries.
+func (p *PRState) AppendEditInstruction(instruction string) {
+	if instruction == "" {
+		return
+	}
+	p.EditHistory = append(p.EditHistory, instruction)
+	if len(p.EditHistory) > 5 {
+		p.EditHistory = p.EditHistory[len(p.EditHistory)-5:]
+	}
 }
 
 type HealthCounts struct {
@@ -425,6 +440,14 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 		}
 		if len(raw) > MaxJobBytes {
 			return AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("job payload size %d exceeds 32 KiB bound", len(raw))}, nil
+		}
+		if j.Kind == "edit" {
+			if err := ghclient.ValidateCommitOID(j.HeadSHA); err != nil {
+				return AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("invalid edit job HeadSHA: %v", err)}, nil
+			}
+			if err := ghclient.ValidateCommitOID(j.BaseSHA); err != nil {
+				return AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("invalid edit job BaseSHA: %v", err)}, nil
+			}
 		}
 	}
 

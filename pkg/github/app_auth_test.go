@@ -1,4 +1,4 @@
-package github
+﻿package github
 
 import (
 	"context"
@@ -1310,4 +1310,148 @@ func TestClient_DeniesBroadPATSubstitution(t *testing.T) {
 	if cred != nil {
 		t.Errorf("expected cred to be nil, got: %+v", cred)
 	}
+}
+
+func TestPushCredential_ScopeVerificationAndRevoke(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+
+	t.Run("valid contents:write token on single repo passes and revokes", func(t *testing.T) {
+		var revokeCalls int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/repos/push-org/push-repo/installation":
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 8001})
+			case "/app/installations/8001/access_tokens":
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"token":                "ghs_valid_write_token",
+					"expires_at":           time.Now().Add(1 * time.Hour),
+					"permissions":          map[string]string{"contents": "write"},
+					"repository_selection": "selected",
+					"repositories": []map[string]any{
+						{"id": 445566, "name": "push-repo"},
+					},
+				})
+			case "/installation/token":
+				if r.Method != http.MethodDelete {
+					http.Error(w, "bad method", http.StatusMethodNotAllowed)
+					return
+				}
+				auth := r.Header.Get("Authorization")
+				if auth != "Bearer ghs_valid_write_token" {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				atomic.AddInt32(&revokeCalls, 1)
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client, err := NewTestAppClient(server.URL, 12345, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		cred, err := client.CreatePushCredential(context.Background(), "push-org", "push-repo", 445566)
+		if err != nil {
+			t.Fatalf("unexpected error creating push credential: %v", err)
+		}
+		if cred.Token != "ghs_valid_write_token" {
+			t.Errorf("unexpected token: %s", cred.Token)
+		}
+		if cred.IsRevoked() {
+			t.Error("expected credential not revoked initially")
+		}
+
+		if err := client.RevokePushCredential(context.Background(), cred); err != nil {
+			t.Fatalf("unexpected revoke error: %v", err)
+		}
+		if atomic.LoadInt32(&revokeCalls) != 1 {
+			t.Errorf("expected 1 delete call, got %d", revokeCalls)
+		}
+		if cred.Token != "" {
+			t.Errorf("expected token zeroized, got %s", cred.Token)
+		}
+		if !cred.IsRevoked() {
+			t.Error("expected credential to be marked revoked")
+		}
+	})
+
+	cases := []struct {
+		name         string
+		responseJSON map[string]any
+		wantErrSub   string
+	}{
+		{
+			name: "extra permission key fails",
+			responseJSON: map[string]any{
+				"token":       "tok-extra",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "write", "issues": "write"},
+			},
+			wantErrSub: "extra permission",
+		},
+		{
+			name: "contents read only fails",
+			responseJSON: map[string]any{
+				"token":       "tok-read",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "read"},
+			},
+			wantErrSub: "only write permitted",
+		},
+		{
+			name: "repository selection all fails",
+			responseJSON: map[string]any{
+				"token":                "tok-all",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "write"},
+				"repository_selection": "all",
+			},
+			wantErrSub: "unsupported repository_selection",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/repos/push-org/push-repo/installation":
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 8002})
+				case "/app/installations/8002/access_tokens":
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(tc.responseJSON)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client, err := NewTestAppClient(server.URL, 12345, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cred, err := client.CreatePushCredential(context.Background(), "push-org", "push-repo", 123)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got success: %+v", tc.wantErrSub, cred)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Errorf("expected error containing %q, got: %v", tc.wantErrSub, err)
+			}
+		})
+	}
+
+	t.Run("PAT client denies push credential", func(t *testing.T) {
+		client := NewClient("some-pat")
+		cred, err := client.CreatePushCredential(context.Background(), "push-org", "push-repo", 123)
+		if err == nil || !errors.Is(err, ErrPushAuthUnavailable) {
+			t.Fatalf("expected ErrPushAuthUnavailable, got %v (cred: %+v)", err, cred)
+		}
+	})
 }

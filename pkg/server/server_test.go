@@ -1,4 +1,4 @@
-package server
+﻿package server
 
 import (
 	"bytes"
@@ -333,31 +333,39 @@ func TestCommentCommands_UnauthorizedCommandsDenied(t *testing.T) {
 
 func TestParseCommentCommand(t *testing.T) {
 	cases := []struct {
-		body     string
-		wantKind string
-		wantCmd  bool
+		body        string
+		wantKind    string
+		wantPayload string
+		wantCmd     bool
 	}{
-		{"/approve", "approve", true},
-		{"/approve please merge", "approve", true},
-		{"/approve\nlooks good", "approve", true},
-		{"/request_changes", "request_changes", true},
-		{"/request_changes fix formatting", "request_changes", true},
-		{"/review", "review", true},
-		{"/review all", "review", true},
+		{"/approve", "approve", "", true},
+		{"/approve please merge", "approve", "", true},
+		{"/approve\nlooks good", "approve", "", true},
+		{"/request_changes", "request_changes", "", true},
+		{"/request_changes fix formatting", "request_changes", "", true},
+		{"/review", "review", "", true},
+		{"/review all", "review", "", true},
+		{"/improve", "improve", "", true},
+		{"/improve --commit fix typo", "edit", "fix typo", true},
+		{"/improve do not use --commit-flag", "improve", "", true},
+		{"@pr-review rate limiter ekle", "edit", "rate limiter ekle", true},
 		// Near-miss prefixes staying unrecognized
-		{"/approving", "", false},
-		{"/appr", "", false},
-		{"/requested_changes", "", false},
-		{"/request_change", "", false},
-		{"/reviewer", "review", true},
-		{"hello world", "", false},
+		{"/approving", "", "", false},
+		{"/appr", "", "", false},
+		{"/requested_changes", "", "", false},
+		{"/request_change", "", "", false},
+		{"/reviewer", "review", "", true},
+		{"hello world", "", "", false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.body, func(t *testing.T) {
-			kind, _ := parseCommentCommand(tc.body)
+			kind, payload := parseCommentCommand(tc.body)
 			if kind != tc.wantKind {
 				t.Errorf("parseCommentCommand(%q) kind = %q, want %q", tc.body, kind, tc.wantKind)
+			}
+			if tc.wantPayload != "" && payload != tc.wantPayload {
+				t.Errorf("parseCommentCommand(%q) payload = %q, want %q", tc.body, payload, tc.wantPayload)
 			}
 			isCmd := isCommentCommand(tc.body)
 			if isCmd != tc.wantCmd {
