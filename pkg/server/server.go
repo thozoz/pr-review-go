@@ -646,7 +646,7 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 		Payload:   payloadText,
 	}
 
-	if kind == "review" || kind == "approve" || kind == "request_changes" {
+	if kind == "review" || kind == "approve" || kind == "request_changes" || kind == "edit" {
 		pr, prErr := s.gh.GetPR(ctx, owner, repo, prNum)
 		if prErr == nil && pr != nil {
 			job.BaseSHA = pr.BaseSHA
@@ -728,6 +728,20 @@ func parseCommentCommand(body string) (kind string, payload string) {
 	case strings.HasPrefix(body, "/review"):
 		return "review", ""
 	case strings.HasPrefix(body, "/improve"):
+		rem := strings.TrimSpace(strings.TrimPrefix(body, "/improve"))
+		words := strings.Fields(rem)
+		hasCommit := false
+		var otherWords []string
+		for _, w := range words {
+			if w == "--commit" {
+				hasCommit = true
+			} else {
+				otherWords = append(otherWords, w)
+			}
+		}
+		if hasCommit {
+			return "edit", strings.Join(otherWords, " ")
+		}
 		return "improve", ""
 	case strings.HasPrefix(body, "/describe"):
 		return "describe", ""
@@ -739,9 +753,11 @@ func parseCommentCommand(body string) (kind string, payload string) {
 		return "summary", ""
 	case strings.HasPrefix(body, "/add_docs") || strings.HasPrefix(body, "/docs"):
 		return "docs", ""
-	case strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "@pr-review") || strings.HasPrefix(body, "/ask"):
+	case strings.HasPrefix(body, "@pr-review"):
+		instruction := strings.TrimSpace(strings.TrimPrefix(body, "@pr-review"))
+		return "edit", instruction
+	case strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "/ask"):
 		question := strings.TrimSpace(strings.TrimPrefix(body, "@bot"))
-		question = strings.TrimSpace(strings.TrimPrefix(question, "@pr-review"))
 		question = strings.TrimSpace(strings.TrimPrefix(question, "/ask"))
 		return "assistant", question
 	default:
