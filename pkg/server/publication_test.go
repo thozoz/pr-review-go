@@ -17,17 +17,18 @@ import (
 	"testing"
 	"time"
 
-
 	"github.com/thozoz/pr-review-go/pkg/config"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
 )
 
+var seedDeliverySeq int64
+
 func seedTestJob(t *testing.T, store JobStore, prKey PRKey, baseSHA, headSHA string) *Job {
 	delivery := Delivery{
 		Host:        prKey.Host,
 		RepoID:      prKey.RepoID,
-		DeliveryID:  fmt.Sprintf("deliv-%d", time.Now().UnixNano()),
+		DeliveryID:  fmt.Sprintf("deliv-%d-%d", time.Now().UnixNano(), atomic.AddInt64(&seedDeliverySeq, 1)),
 		EventKind:   "pull_request",
 		PayloadHash: "hash",
 		ReceivedAt:  time.Now().UTC(),

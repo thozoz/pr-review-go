@@ -69,12 +69,22 @@ func TestQueuedStatusOutbox(t *testing.T) {
 		}
 
 		// Verify job has StatusCommentID set
-		updatedJob, err := store.GetJob(ctx, job.ID)
-		if err != nil {
-			t.Fatal(err)
+		var updatedJob *Job
+		for i := 0; i < 100; i++ {
+			j, err := store.GetJob(ctx, job.ID)
+			if err == nil && j != nil && j.StatusCommentID == 501 {
+				updatedJob = j
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		if updatedJob.StatusCommentID != 501 {
-			t.Fatalf("expected StatusCommentID 501, got %d", updatedJob.StatusCommentID)
+		if updatedJob == nil {
+			j, _ := store.GetJob(ctx, job.ID)
+			val := int64(0)
+			if j != nil {
+				val = j.StatusCommentID
+			}
+			t.Fatalf("expected StatusCommentID 501, got %d", val)
 		}
 
 		// Verify intent is marked completed

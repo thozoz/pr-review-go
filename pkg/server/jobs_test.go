@@ -853,6 +853,7 @@ func TestAutomaticReviewCoalescing(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer store.Close()
 		srv.SetStore(store)
 
 		// Create a wrapped executor to observe concurrent PR executions
