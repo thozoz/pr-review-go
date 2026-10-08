@@ -463,6 +463,21 @@ func (c *Client) CanWriteRepository(ctx context.Context, owner, repo, username s
 	}
 }
 
+// ClassifyWriteError classifies an error from a GitHub write operation
+// (comment create/edit, label or body mutation) using the shared retry
+// classifier. It is the write-path reconcile-first guard: callers must route
+// ClassUncertainWrite outcomes to reconciliation/operator attention instead
+// of blind POST retries, because the remote effect is unprovable.
+func ClassifyWriteError(err error) retry.Classification {
+	return retry.ClassifyError(err, retry.OpKindWrite)
+}
+
+// IsUncertainWriteError reports whether a write error has an unprovable
+// remote outcome (timeout, lost response, ambiguous 5xx on POST).
+func IsUncertainWriteError(err error) bool {
+	return ClassifyWriteError(err) == retry.ClassUncertainWrite
+}
+
 // CreateComment creates a comment on an issue or pull request and returns its numeric ID.
 func (c *Client) CreateComment(ctx context.Context, owner, repo string, number int, body string) (int64, error) {
 	owner = strings.TrimSpace(owner)

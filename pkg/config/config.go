@@ -77,6 +77,10 @@ type Config struct {
 	RetryMaxDelay    time.Duration `json:"retry_max_delay"`
 	RetryMaxWait     time.Duration `json:"retry_max_wait"`
 	RetryJobBudget   time.Duration `json:"retry_job_budget"`
+
+	// Deferral controls for durable parking of long retry waits
+	DeferMaxWait      time.Duration `json:"defer_max_wait"`
+	DeferPollInterval time.Duration `json:"defer_poll_interval"`
 }
 
 const (
@@ -134,6 +138,13 @@ const (
 	DefaultRetryJobBudget   = 5 * time.Minute
 	MinRetryJobBudget       = 10 * time.Second
 	MaxRetryJobBudget       = 30 * time.Minute
+
+	DefaultDeferMaxWait     = 15 * time.Minute
+	MinDeferMaxWait         = 1 * time.Minute
+	MaxDeferMaxWait         = 2 * time.Hour
+	DefaultDeferPollInterval = 30 * time.Second
+	MinDeferPollInterval     = 1 * time.Second
+	MaxDeferPollInterval     = 5 * time.Minute
 
 	DefaultSandboxCPUs             = 2.0
 	DefaultSandboxMemoryBytes      = 2147483648 // 2 GiB
@@ -237,6 +248,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.ValidateRetry(); err != nil {
+		return err
+	}
+
+	if err := c.ValidateDefer(); err != nil {
 		return err
 	}
 
@@ -510,6 +525,28 @@ func (c *Config) ValidateRetry() error {
 	}
 	if c.RetryJobBudget < MinRetryJobBudget || c.RetryJobBudget > MaxRetryJobBudget {
 		return fmt.Errorf("invalid RetryJobBudget: %v (must be between %v and %v)", c.RetryJobBudget, MinRetryJobBudget, MaxRetryJobBudget)
+	}
+
+	return nil
+}
+
+// ValidateDefer validates and defaults durable-deferral bounds. DeferMaxWait
+// caps how far in the future a deferred attempt may be parked; required waits
+// beyond it are clamped, never dropped. DeferPollInterval bounds the scheduler
+// wake for due deferred attempts.
+func (c *Config) ValidateDefer() error {
+	if c.DeferMaxWait == 0 {
+		c.DeferMaxWait = DefaultDeferMaxWait
+	}
+	if c.DeferMaxWait < MinDeferMaxWait || c.DeferMaxWait > MaxDeferMaxWait {
+		return fmt.Errorf("invalid DeferMaxWait: %v (must be between %v and %v)", c.DeferMaxWait, MinDeferMaxWait, MaxDeferMaxWait)
+	}
+
+	if c.DeferPollInterval == 0 {
+		c.DeferPollInterval = DefaultDeferPollInterval
+	}
+	if c.DeferPollInterval < MinDeferPollInterval || c.DeferPollInterval > MaxDeferPollInterval {
+		return fmt.Errorf("invalid DeferPollInterval: %v (must be between %v and %v)", c.DeferPollInterval, MinDeferPollInterval, MaxDeferPollInterval)
 	}
 
 	return nil
@@ -886,6 +923,24 @@ func Load() *Config {
 		}
 	}
 
+	deferMaxWait := DefaultDeferMaxWait
+	if raw := os.Getenv("DEFER_MAX_WAIT"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			deferMaxWait = d
+		} else {
+			deferMaxWait = -1
+		}
+	}
+
+	deferPollInterval := DefaultDeferPollInterval
+	if raw := os.Getenv("DEFER_POLL_INTERVAL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			deferPollInterval = d
+		} else {
+			deferPollInterval = -1
+		}
+	}
+
 	return &Config{
 		GitHubToken:             token,
 		WebhookSecret:           webhookSecret,
@@ -937,5 +992,7 @@ func Load() *Config {
 		RetryMaxDelay:            retryMaxDelay,
 		RetryMaxWait:             retryMaxWait,
 		RetryJobBudget:           retryJobBudget,
+		DeferMaxWait:             deferMaxWait,
+		DeferPollInterval:        deferPollInterval,
 	}
 }
