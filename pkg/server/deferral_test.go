@@ -2,17 +2,22 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
+	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/retry"
+	"github.com/thozoz/pr-review-go/pkg/reviewer"
 )
 
 func openDeferTestStore(t *testing.T, backlog int) *BoltJobStore {
@@ -527,5 +532,199 @@ func TestDeferredSchedulerIdleWaitBounds(t *testing.T) {
 	}
 	if got := sched.idleWait(ctx); got <= 0 || got > time.Second {
 		t.Errorf("near idle = %v, want small positive wait", got)
+	}
+}
+
+// TestDeferredResumeWithMovedHeadSuppressesStale: a deferred attempt parked at
+// an old head whose PR head moved while waiting must not publish stale output
+// as current on resume. The due job re-enters the normal executor head gates:
+// the job retargets to the live head, the review runs at the live head, and
+// only the fresh-head output is committed (LastReviewedHead and OutputIntent
+// ExactHead equal the live head; nothing is completed for the stale head).
+func TestDeferredResumeWithMovedHeadSuppressesStale(t *testing.T) {
+	ctx := context.Background()
+	const (
+		oldHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		newHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		baseSHA = "cccccccccccccccccccccccccccccccccccccccc"
+	)
+	var liveHead atomic.Value
+	liveHead.Store(oldHead)
+
+	var (
+		commentMu      sync.Mutex
+		createdBodies  []string
+		commentCounter int64 = 2000
+		llmCalls       atomic.Int32
+	)
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{
+					Message:      llm.ChatMessage{Content: `{"score": 92, "summary": "Automatic review passed", "findings": []}`},
+					FinishReason: "stop",
+				},
+			},
+		})
+	}))
+	t.Cleanup(llmSrv.Close)
+
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/pulls/1"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 1,
+				"title":  "Deferred stale-head PR",
+				"body":   "Body",
+				"head":   map[string]any{"sha": liveHead.Load().(string), "ref": "feat-stale"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "defer-dev"},
+			})
+		case strings.Contains(p, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/main.go b/main.go\n+func Tracer() {}\n"))
+		case r.Method == http.MethodPost && strings.Contains(p, "/issues/1/comments"):
+			commentMu.Lock()
+			newID := atomic.AddInt64(&commentCounter, 1)
+			var bodyMap map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			createdBodies = append(createdBodies, bodyMap["body"])
+			commentMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": newID, "body": bodyMap["body"]})
+		case r.Method == http.MethodGet && strings.Contains(p, "/issues/1/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case r.Method == http.MethodGet && strings.Contains(p, "/issues/comments/"):
+			commentMu.Lock()
+			last := ""
+			if n := len(createdBodies); n > 0 {
+				last = createdBodies[n-1]
+			}
+			commentMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 2001, "body": last, "user": map[string]any{"id": 2001, "login": "test-bot"}})
+		case strings.Contains(p, "/issues/comments/"):
+			var bodyMap map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 2001, "body": bodyMap["body"]})
+		case strings.Contains(p, "/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(ghSrv.Close)
+
+	ghTestClient, err := ghclient.NewTestClient(ghSrv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := openDeferTestStore(t, 10)
+	prKey, err := MakePRKey("github.com", 9201, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := seedTestJob(t, store, prKey, baseSHA, oldHead)
+
+	// Worker picks the job up, hits an over-budget wait, and parks it.
+	if _, err := store.ClaimNextJob(ctx, map[string]bool{}); err != nil {
+		t.Fatalf("initial claim failed: %v", err)
+	}
+	if _, err := store.DeferJob(ctx, job.ID, time.Now().UTC().Add(-time.Minute), "retry wait exceeds worker budget"); err != nil {
+		t.Fatalf("DeferJob failed: %v", err)
+	}
+	if err := store.ReleasePR(ctx, job.PRKey); err != nil {
+		t.Fatalf("ReleasePR failed: %v", err)
+	}
+
+	// The PR head moves while the attempt waits.
+	liveHead.Store(newHead)
+
+	// The due deferred job re-enters the normal claim gate.
+	resumed, err := store.ClaimNextJob(ctx, map[string]bool{})
+	if err != nil || resumed == nil || resumed.ID != job.ID {
+		t.Fatalf("due deferred job must be re-claimed, got %+v, err %v", resumed, err)
+	}
+	if resumed.HeadSHA != oldHead {
+		t.Fatalf("setup broken: resumed job head = %s, want stale %s entering the executor gates", resumed.HeadSHA, oldHead)
+	}
+
+	cfg := &config.Config{
+		WebhookStateDir:      t.TempDir(),
+		WebhookWorkers:       1,
+		WebhookBacklog:       10,
+		WebhookDeliveryTTL:   24 * time.Hour,
+		WebhookDeliveryLimit: 100,
+		WebhookStateMaxBytes: 16777216,
+		WebhookBodyMaxBytes:  1048576,
+		EffortLevel:          "lite",
+		EnableSandbox:        false,
+		LLMBaseURL:           llmSrv.URL,
+		LLMAPIKey:            "test-key",
+		LLMModel:             "test-model",
+		GitHubToken:          "test-token",
+		AutoActions:          []string{"review"},
+	}
+	llmTestClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	engine := reviewer.NewEngineWithClients(cfg, ghTestClient, llmTestClient, nil)
+	srv := &Server{gh: ghTestClient, engine: engine, cfg: cfg}
+	exec := NewServerJobExecutor(srv, store)
+	if err := exec.executeReviewJob(ctx, resumed); err != nil {
+		t.Fatalf("executeReviewJob on resumed deferred job failed: %v", err)
+	}
+
+	// The resume must have retargeted through the head gate, not published stale.
+	got, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "completed" {
+		t.Fatalf("resumed job status = %q, want completed (error: %q)", got.Status, got.Error)
+	}
+	if got.HeadSHA != newHead {
+		t.Fatalf("resumed job head = %s, want live head %s (stale %s must be retargeted)", got.HeadSHA, newHead, oldHead)
+	}
+	st, err := store.GetPRState(ctx, job.PRKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastReviewedHead != newHead {
+		t.Fatalf("LastReviewedHead = %q, want live head %s; stale head %s must never be recorded as current", st.LastReviewedHead, newHead, oldHead)
+	}
+	marker := fmt.Sprintf("<!-- pr-review-output:%s -->", job.ID)
+	intent, err := store.GetOutputIntent(ctx, marker)
+	if err != nil {
+		t.Fatalf("GetOutputIntent failed: %v", err)
+	}
+	if intent.ExactHead != newHead {
+		t.Fatalf("committed intent ExactHead = %s, want live head %s; stale output must not be committed as current", intent.ExactHead, newHead)
+	}
+	if intent.Status != "completed" {
+		t.Fatalf("committed intent status = %q, want completed", intent.Status)
+	}
+
+	// Exactly one remote review-output create, and a single generation.
+	reviewPosts := 0
+	commentMu.Lock()
+	for _, b := range createdBodies {
+		if strings.Contains(b, "pr-review-output:"+job.ID) {
+			reviewPosts++
+		}
+	}
+	commentMu.Unlock()
+	if reviewPosts != 1 {
+		t.Fatalf("remote review-output creates = %d, want exactly 1 for the live head", reviewPosts)
+	}
+	if n := llmCalls.Load(); n != 1 {
+		t.Fatalf("LLM generation calls = %d, want exactly 1 (no stale regeneration)", n)
 	}
 }

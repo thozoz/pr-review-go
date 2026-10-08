@@ -267,3 +267,58 @@ func TestReport_LegacyReportWithoutLedger(t *testing.T) {
 		t.Fatalf("expected no Review Coverage section when ledger is nil, got:\n%s", markdown)
 	}
 }
+
+func TestReport_FullCoverage_WithFindings_NoApproval(t *testing.T) {
+	rawDiff := `diff --git a/main.go b/main.go
+index 123..456 100644
+--- a/main.go
++++ b/main.go
+@@ -1,3 +1,4 @@
+ package main
++func Hello() {}
+`
+	inv := diff.Parse(rawDiff)
+	ledger := diff.NewCoverageLedger(inv)
+	ledger.MarkFileExamined("main.go")
+
+	report := &ReviewReport{
+		PRTitle: "Test Full Coverage With Findings",
+		Score:   60,
+		Summary: "One issue found in fully examined changes.",
+		Findings: []Finding{
+			{
+				File:        "main.go",
+				Line:        2,
+				Severity:    "WARNING",
+				Title:       "Missing doc comment",
+				Description: "Exported function lacks a doc comment.",
+				Suggestion:  "Add a doc comment.",
+			},
+		},
+		Ledger: ledger,
+	}
+
+	markdown := FormatReportMarkdown(report)
+
+	// DIFF-01 / UAT-5-second-half: full coverage WITH findings must NOT approve.
+	lower := strings.ToLower(markdown)
+	if strings.Contains(lower, "ready to merge") {
+		t.Fatalf("full coverage with findings must NOT contain 'ready to merge' in any casing, got:\n%s", markdown)
+	}
+
+	// The finding itself must be rendered, not silently dropped.
+	if !strings.Contains(markdown, "Missing doc comment") {
+		t.Fatalf("expected finding title rendered, got:\n%s", markdown)
+	}
+	if !strings.Contains(markdown, "[WARNING] Missing doc comment (`main.go:2`)") {
+		t.Fatalf("expected finding header rendered, got:\n%s", markdown)
+	}
+
+	// Coverage state must read Full with no partial warning.
+	if !strings.Contains(markdown, "Status:** Full") {
+		t.Fatalf("expected coverage status Full, got:\n%s", markdown)
+	}
+	if strings.Contains(markdown, "Partial Review Warning") {
+		t.Fatalf("expected no partial review warning on full coverage, got:\n%s", markdown)
+	}
+}
