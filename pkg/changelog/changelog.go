@@ -3,6 +3,7 @@ package changelog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -38,6 +39,7 @@ func NewUpdater(cfg *config.Config) *Updater {
 }
 
 // RunAndPost updates only an unchanged CHANGELOG.md and reports the result on the PR.
+// It enforces atomic CAS publication using GitHub GraphQL createCommitOnBranch (D-16, SAFE-03).
 func (u *Updater) RunAndPost(ctx context.Context, owner, repo string, number int) error {
 	pr, err := u.gh.GetPR(ctx, owner, repo, number)
 	if err != nil {
@@ -46,9 +48,19 @@ func (u *Updater) RunAndPost(ctx context.Context, owner, repo string, number int
 	if pr.IsFork() {
 		return fmt.Errorf("refusing changelog update for fork PR")
 	}
-	diff, err := u.gh.GetRawDiff(ctx, owner, repo, number)
+	if pr.HeadRef == "" {
+		return fmt.Errorf("refusing changelog update: PR head ref is empty")
+	}
+	if err := github.ValidateCommitOID(pr.BaseSHA); err != nil {
+		return fmt.Errorf("refusing changelog update: invalid or missing base commit OID: %w", err)
+	}
+	if err := github.ValidateCommitOID(pr.HeadSHA); err != nil {
+		return fmt.Errorf("refusing changelog update: invalid or missing head commit OID: %w", err)
+	}
+
+	diff, err := u.gh.GetDiffAtCommits(ctx, owner, repo, pr.BaseSHA, pr.HeadSHA)
 	if err != nil {
-		return fmt.Errorf("failed to get PR diff: %w", err)
+		return fmt.Errorf("failed to get immutable diff: %w", err)
 	}
 	if ChangesChangelog(diff) {
 		return u.gh.PostComment(ctx, owner, repo, number, "## 📜 Changelog\n\n`CHANGELOG.md` already changed in this PR; no bot update created.")
@@ -58,6 +70,21 @@ func (u *Updater) RunAndPost(ctx context.Context, owner, repo string, number int
 	if err != nil {
 		return fmt.Errorf("failed to read %s: %w", changelogPath, err)
 	}
+
+	// Recheck PR head identity before generation to catch pre-generation races (D-16)
+	currentPR, err := u.gh.GetPR(ctx, owner, repo, number)
+	if err != nil {
+		return fmt.Errorf("failed to recheck PR head before generation: %w", err)
+	}
+	if currentPR.HeadSHA != pr.HeadSHA {
+		_ = u.gh.PostComment(ctx, owner, repo, number, "## 📜 Changelog\n\nBranch head moved before generation; rerun required.")
+		return fmt.Errorf("branch head moved from %s to %s before generation: rerun required: %w", pr.HeadSHA, currentPR.HeadSHA, &github.HeadMovedError{
+			ExpectedHeadOID: pr.HeadSHA,
+			ActualHeadOID:   currentPR.HeadSHA,
+			Message:         "branch head moved before generation",
+		})
+	}
+
 	entry, err := u.GenerateEntry(ctx, pr, diff)
 	if err != nil {
 		return err
@@ -66,8 +93,14 @@ func (u *Updater) RunAndPost(ctx context.Context, owner, repo string, number int
 	if err != nil {
 		return err
 	}
-	sha, err := u.gh.UpdateFile(ctx, owner, repo, changelogPath, pr.HeadRef, file.SHA, updated, "docs: update changelog")
+
+	sha, err := u.gh.CommitFileAtExpectedHead(ctx, owner, repo, pr.HeadRef, pr.HeadSHA, changelogPath, updated, "docs: update changelog")
 	if err != nil {
+		var headMovedErr *github.HeadMovedError
+		if errors.As(err, &headMovedErr) || errors.Is(err, github.ErrHeadMoved) {
+			_ = u.gh.PostComment(ctx, owner, repo, number, "## 📜 Changelog\n\nBranch head moved during changelog update; rerun required.")
+			return fmt.Errorf("branch head moved: rerun required: %w", err)
+		}
 		return fmt.Errorf("failed to commit changelog: %w", err)
 	}
 	return u.gh.PostComment(ctx, owner, repo, number, fmt.Sprintf("## 📜 Changelog\n\nUpdated `CHANGELOG.md` in [commit `%s`](https://github.com/%s/%s/commit/%s).", sha, owner, repo, sha))

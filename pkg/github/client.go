@@ -1,9 +1,16 @@
 package github
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/google/go-github/v68/github"
@@ -11,8 +18,9 @@ import (
 )
 
 type Client struct {
-	gh      *github.Client
-	appAuth *AppAuth
+	gh         *github.Client
+	appAuth    *AppAuth
+	graphQLURL string
 }
 
 // InlineSuggestion is a one-click replacement attached to a changed PR line.
@@ -145,6 +153,7 @@ func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PR
 
 	var headRepoOwner string
 	var headRepoName string
+	var headRepoID int64
 	var cloneURL string
 	var headRef string
 	var headSHA string
@@ -155,6 +164,7 @@ func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PR
 		if hr := head.GetRepo(); hr != nil {
 			cloneURL = hr.GetCloneURL()
 			headRepoName = hr.GetName()
+			headRepoID = hr.GetID()
 			if hrOwner := hr.GetOwner(); hrOwner != nil {
 				headRepoOwner = hrOwner.GetLogin()
 			}
@@ -169,13 +179,130 @@ func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PR
 		Body:          pr.GetBody(),
 		Author:        pr.GetUser().GetLogin(),
 		BaseRef:       pr.GetBase().GetRef(),
+		BaseSHA:       pr.GetBase().GetSHA(),
 		HeadRef:       headRef,
 		HeadSHA:       headSHA,
 		HeadRepoOwner: headRepoOwner,
 		HeadRepoName:  headRepoName,
+		HeadRepoID:    headRepoID,
 		CloneURL:      cloneURL,
 		CreatedAt:     pr.GetCreatedAt().Time,
 	}, nil
+}
+
+// GetRepoID returns the numeric GitHub repository ID for owner/repo.
+func (c *Client) GetRepoID(ctx context.Context, owner, repo string) (int64, error) {
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return 0, err
+	}
+	r, _, err := ghClient.Repositories.Get(ctx, owner, repo)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get repository %s/%s: %w", owner, repo, err)
+	}
+	if r.GetID() == 0 {
+		return 0, fmt.Errorf("%w: repository %s/%s has zero ID", ErrInvalidRepoID, owner, repo)
+	}
+	return r.GetID(), nil
+}
+
+// CreateRetrievalCredential creates a short-lived App token scoped to exactly one head repository
+// with contents:read permission. If the client is configured with a PAT instead of a GitHub App,
+// it returns ErrRetrievalAuthUnavailable; broad PAT substitution is explicitly denied (D-10, SAFE-01).
+func (c *Client) CreateRetrievalCredential(ctx context.Context, owner, repo string, repoID int64) (*RetrievalCredential, error) {
+	if c.appAuth == nil {
+		return nil, ErrRetrievalAuthUnavailable
+	}
+	return c.appAuth.CreateRetrievalCredential(ctx, owner, repo, repoID)
+}
+
+// RevokeRetrievalCredential revokes the scoped App retrieval token and zeroes it in memory.
+func (c *Client) RevokeRetrievalCredential(ctx context.Context, cred *RetrievalCredential) error {
+	if c.appAuth == nil {
+		if cred != nil {
+			cred.Zeroize()
+		}
+		return nil
+	}
+	return c.appAuth.RevokeRetrievalCredential(ctx, cred)
+}
+
+// AppAuth returns the underlying AppAuth instance if configured, or nil.
+func (c *Client) AppAuth() *AppAuth {
+	return c.appAuth
+}
+
+// NewScopedClient returns a new Client configured with the provided access token
+// while preserving custom BaseURL if set on this client.
+func (c *Client) NewScopedClient(token string) *Client {
+	client := NewClient(token)
+	if c != nil && c.gh != nil && c.gh.BaseURL != nil {
+		client.gh.BaseURL = c.gh.BaseURL
+	}
+	if c != nil {
+		client.graphQLURL = c.graphQLURL
+	}
+	return client
+}
+
+// GetCommit retrieves a commit by full SHA from the repository.
+func (c *Client) GetCommit(ctx context.Context, owner, repo, sha string) (*github.RepositoryCommit, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	commit, _, err := ghClient.Repositories.GetCommit(ctx, owner, repo, sha, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get commit %s: %w", sha, err)
+	}
+	return commit, nil
+}
+
+// GetTree retrieves a git tree by SHA, optionally recursive.
+func (c *Client) GetTree(ctx context.Context, owner, repo, sha string, recursive bool) (*github.Tree, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	tree, _, err := ghClient.Git.GetTree(ctx, owner, repo, sha, recursive)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tree for %s: %w", sha, err)
+	}
+	return tree, nil
+}
+
+// GetBlob retrieves a git blob by SHA.
+func (c *Client) GetBlob(ctx context.Context, owner, repo, sha string) (*github.Blob, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	blob, _, err := ghClient.Git.GetBlob(ctx, owner, repo, sha)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get blob %s: %w", sha, err)
+	}
+	return blob, nil
+}
+
+// GetBlobRaw retrieves raw bytes of a git blob by SHA.
+func (c *Client) GetBlobRaw(ctx context.Context, owner, repo, sha string) ([]byte, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := ghClient.Git.GetBlobRaw(ctx, owner, repo, sha)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get raw blob %s: %w", sha, err)
+	}
+	return data, nil
 }
 
 func (c *Client) GetRawDiff(ctx context.Context, owner, repo string, number int) (string, error) {
@@ -436,4 +563,286 @@ func (c *Client) AddLabels(ctx context.Context, owner, repo string, number int, 
 		return fmt.Errorf("failed to add labels: %w", err)
 	}
 	return nil
+}
+
+// SetGraphQLURL sets an explicit GraphQL endpoint override (for testing or custom enterprise setups).
+func (c *Client) SetGraphQLURL(u string) {
+	c.graphQLURL = u
+}
+
+func (c *Client) graphQLEndpointForClient(ghClient *github.Client) string {
+	if c != nil && c.graphQLURL != "" {
+		return c.graphQLURL
+	}
+	if ghClient != nil && ghClient.BaseURL != nil {
+		base := ghClient.BaseURL.String()
+		if strings.HasSuffix(base, "/api/v3/") {
+			return strings.TrimSuffix(base, "/api/v3/") + "/api/graphql"
+		}
+		return strings.TrimSuffix(base, "/") + "/graphql"
+	}
+	return "https://api.github.com/graphql"
+}
+
+var (
+	// ErrHeadMoved indicates that the branch head moved away from expectedHeadOid.
+	ErrHeadMoved = errors.New("branch head moved")
+	// ErrInvalidCommitOID indicates that a commit SHA is not a 40- or 64-character hex string.
+	ErrInvalidCommitOID = errors.New("commit SHA must be 40 or 64 hex characters (full OID required)")
+)
+
+// HeadMovedError indicates that an expected-head conditional commit mutation failed
+// because the branch head on GitHub moved away from the expected commit OID (D-16, SAFE-03).
+type HeadMovedError struct {
+	ExpectedHeadOID string
+	ActualHeadOID   string
+	Message         string
+}
+
+func (e *HeadMovedError) Error() string {
+	if e.ActualHeadOID != "" {
+		return fmt.Sprintf("branch head moved: expected %s, found %s (%s)", e.ExpectedHeadOID, e.ActualHeadOID, e.Message)
+	}
+	return fmt.Sprintf("branch head moved: expected %s (%s)", e.ExpectedHeadOID, e.Message)
+}
+
+func (e *HeadMovedError) Is(target error) bool {
+	return target == ErrHeadMoved
+}
+
+// ValidateCommitOID ensures the commit hash is a full 40-char (SHA-1) or 64-char (SHA-256) hex string.
+// Short prefixes, non-hex characters, and empty strings are rejected (SAFE-01, SAFE-03).
+func ValidateCommitOID(sha string) error {
+	shaLen := len(sha)
+	if shaLen != 40 && shaLen != 64 {
+		return fmt.Errorf("%w: got length %d (%q)", ErrInvalidCommitOID, shaLen, sha)
+	}
+	for i := 0; i < shaLen; i++ {
+		c := sha[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return fmt.Errorf("%w: invalid character %q at index %d", ErrInvalidCommitOID, string(c), i)
+		}
+	}
+	return nil
+}
+
+// GetDiffAtCommits retrieves the diff between baseOID and headOID using the GitHub commit comparison endpoint.
+// It requires complete 40 or 64 hex character OIDs (SAFE-03) and sends the GitHub diff media type.
+// Never generates from the mutable PR diff endpoint to prevent ABA head movement risks (D-16).
+func (c *Client) GetDiffAtCommits(ctx context.Context, owner, repo, baseOID, headOID string) (string, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	if owner == "" || repo == "" {
+		return "", fmt.Errorf("owner and repo must not be empty")
+	}
+	if err := ValidateCommitOID(baseOID); err != nil {
+		return "", fmt.Errorf("invalid base commit OID: %w", err)
+	}
+	if err := ValidateCommitOID(headOID); err != nil {
+		return "", fmt.Errorf("invalid head commit OID: %w", err)
+	}
+
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return "", err
+	}
+
+	diff, _, err := ghClient.Repositories.CompareCommitsRaw(ctx, owner, repo, baseOID, headOID, github.RawOptions{
+		Type: github.Diff,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get diff between %s and %s: %w", baseOID, headOID, err)
+	}
+	return diff, nil
+}
+
+const maxGraphQLResponseBytes = 1 << 20 // 1 MiB bound for response decoding
+
+type graphQLRequest struct {
+	Query     string         `json:"query"`
+	Variables map[string]any `json:"variables"`
+}
+
+type graphQLError struct {
+	Message    string         `json:"message"`
+	Type       string         `json:"type,omitempty"`
+	Path       []any          `json:"path,omitempty"`
+	Locations  []any          `json:"locations,omitempty"`
+	Extensions map[string]any `json:"extensions,omitempty"`
+}
+
+type graphQLResponse struct {
+	Data *struct {
+		CreateCommitOnBranch *struct {
+			Commit *struct {
+				OID string `json:"oid"`
+				URL string `json:"url"`
+			} `json:"commit"`
+			Ref *struct {
+				Name   string `json:"name"`
+				Target *struct {
+					OID string `json:"oid"`
+				} `json:"target"`
+			} `json:"ref"`
+		} `json:"createCommitOnBranch"`
+	} `json:"data"`
+	Errors []graphQLError `json:"errors"`
+}
+
+var headMovedPattern = regexp.MustCompile(`(?i)(expected branch to point to|expectedheadoid|head moved|head branch was modified|does not match the current head|not at expected head|expected.*point|conflict.*head)`)
+var actualHeadPattern = regexp.MustCompile(`(?:points to|found)\s+["']?([0-9a-fA-F]{40,64})["']?`)
+
+// CommitFileAtExpectedHead creates a single commit on branch containing only path with content,
+// conditional on the branch head matching expectedHeadOID exactly, using GitHub GraphQL createCommitOnBranch (D-16, SAFE-03).
+// If the branch head does not match expectedHeadOID, it maps the conflict to *HeadMovedError.
+func (c *Client) CommitFileAtExpectedHead(ctx context.Context, owner, repo, branch, expectedHeadOID, path, content, message string) (string, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	branch = strings.TrimSpace(branch)
+	path = strings.TrimSpace(path)
+	message = strings.TrimSpace(message)
+
+	if owner == "" || repo == "" {
+		return "", fmt.Errorf("owner and repo must not be empty")
+	}
+	if branch == "" {
+		return "", fmt.Errorf("branch must not be empty")
+	}
+	if path == "" {
+		return "", fmt.Errorf("file path must not be empty")
+	}
+	if message == "" {
+		return "", fmt.Errorf("commit message must not be empty")
+	}
+	if err := ValidateCommitOID(expectedHeadOID); err != nil {
+		return "", fmt.Errorf("invalid expectedHeadOID: %w", err)
+	}
+
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return "", err
+	}
+
+	branchName := strings.TrimPrefix(branch, "refs/heads/")
+	cleanPath := strings.TrimPrefix(path, "/")
+
+	reqPayload := graphQLRequest{
+		Query: `mutation CreateCommitOnBranch($input: CreateCommitOnBranchInput!) {
+  createCommitOnBranch(input: $input) {
+    commit {
+      oid
+      url
+    }
+    ref {
+      name
+      target {
+        oid
+      }
+    }
+  }
+}`,
+		Variables: map[string]any{
+			"input": map[string]any{
+				"branch": map[string]any{
+					"repositoryNameWithOwner": fmt.Sprintf("%s/%s", owner, repo),
+					"branchName":              branchName,
+				},
+				"expectedHeadOid": expectedHeadOID,
+				"message": map[string]any{
+					"headline": message,
+				},
+				"fileChanges": map[string]any{
+					"additions": []map[string]any{
+						{
+							"path":     cleanPath,
+							"contents": base64.StdEncoding.EncodeToString([]byte(content)),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	reqBody, err := json.Marshal(reqPayload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal graphql mutation request: %w", err)
+	}
+
+	endpoint := c.graphQLEndpointForClient(ghClient)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create graphql http request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+
+	httpClient := ghClient.Client()
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("graphql request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxGraphQLResponseBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to read bounded graphql response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		trimmedBody := strings.TrimSpace(string(bodyBytes))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return "", fmt.Errorf("graphql auth error (status %d): %s", resp.StatusCode, trimmedBody)
+		}
+		return "", fmt.Errorf("graphql unexpected http status %d: %s", resp.StatusCode, trimmedBody)
+	}
+
+	var gqlResp graphQLResponse
+	if err := json.Unmarshal(bodyBytes, &gqlResp); err != nil {
+		return "", fmt.Errorf("failed to decode graphql response: %w", err)
+	}
+
+	if len(gqlResp.Errors) > 0 {
+		var errorMsgs []string
+		isHeadMoved := false
+		var actualHead string
+
+		for _, e := range gqlResp.Errors {
+			errorMsgs = append(errorMsgs, e.Message)
+			if headMovedPattern.MatchString(e.Message) {
+				isHeadMoved = true
+				if match := actualHeadPattern.FindStringSubmatch(e.Message); len(match) > 1 {
+					actualHead = match[1]
+				}
+			}
+		}
+		combinedErrMsg := strings.Join(errorMsgs, "; ")
+		if isHeadMoved {
+			return "", &HeadMovedError{
+				ExpectedHeadOID: expectedHeadOID,
+				ActualHeadOID:   actualHead,
+				Message:         combinedErrMsg,
+			}
+		}
+		return "", fmt.Errorf("graphql error: %s", combinedErrMsg)
+	}
+
+	if gqlResp.Data == nil || gqlResp.Data.CreateCommitOnBranch == nil {
+		return "", fmt.Errorf("graphql response missing createCommitOnBranch data")
+	}
+	mutationData := gqlResp.Data.CreateCommitOnBranch
+	if mutationData.Commit == nil || mutationData.Commit.OID == "" {
+		return "", fmt.Errorf("graphql response missing created commit OID")
+	}
+	if err := ValidateCommitOID(mutationData.Commit.OID); err != nil {
+		return "", fmt.Errorf("graphql response contains invalid commit OID: %w", err)
+	}
+	if mutationData.Ref == nil {
+		return "", fmt.Errorf("graphql response missing ref data")
+	}
+
+	return mutationData.Commit.OID, nil
 }

@@ -163,3 +163,76 @@ func TestValidateSetupModeBypassesAuthAndLLM(t *testing.T) {
 		t.Fatalf("expected setup mode to bypass auth and LLM validation, got: %v", err)
 	}
 }
+
+func TestValidateSandboxResourceLimits(t *testing.T) {
+	baseCfg := func() *Config {
+		return &Config{
+			GitHubToken:   "token",
+			LLMAPIKey:     "key",
+			LLMModel:      "model",
+			LLMBaseURL:    "https://example.com",
+			EnableSandbox: true,
+		}
+	}
+
+	// 1. Defaults are set and valid
+	cfg := baseCfg()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default sandbox config should be valid: %v", err)
+	}
+	if cfg.SandboxCPUs != DefaultSandboxCPUs {
+		t.Errorf("expected default CPUs %v, got %v", DefaultSandboxCPUs, cfg.SandboxCPUs)
+	}
+	if cfg.SandboxMemoryBytes != DefaultSandboxMemoryBytes {
+		t.Errorf("expected default memory %v, got %v", DefaultSandboxMemoryBytes, cfg.SandboxMemoryBytes)
+	}
+	if cfg.SandboxDiskBytes != DefaultSandboxDiskBytes {
+		t.Errorf("expected default disk %v, got %v", DefaultSandboxDiskBytes, cfg.SandboxDiskBytes)
+	}
+
+	// 2. Reject negative/zero CPU
+	cfg = baseCfg()
+	cfg.SandboxCPUs = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative SandboxCPUs")
+	}
+
+	// 3. Reject negative/zero Memory
+	cfg = baseCfg()
+	cfg.SandboxMemoryBytes = 0
+	cfg.SandboxCPUs = 2.0
+	// 0 memory will be defaulted unless we explicitly test invalid
+	cfg.SandboxMemoryBytes = -100
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative SandboxMemoryBytes")
+	}
+
+	// 4. Reject negative/zero PIDs
+	cfg = baseCfg()
+	cfg.SandboxPidsLimit = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative SandboxPidsLimit")
+	}
+
+	// 5. Reject negative/zero Disk
+	cfg = baseCfg()
+	cfg.SandboxDiskBytes = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative SandboxDiskBytes")
+	}
+
+	// 6. Reject Disk > 3 GiB
+	cfg = baseCfg()
+	cfg.SandboxDiskBytes = 3221225473 // 3 GiB + 1 byte
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for SandboxDiskBytes exceeding 3 GiB")
+	}
+
+	// 7. Reject negative timeouts
+	cfg = baseCfg()
+	cfg.SandboxTimeoutExecution = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative SandboxTimeoutExecution")
+	}
+}
+
