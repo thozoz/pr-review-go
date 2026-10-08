@@ -58,6 +58,11 @@ type Config struct {
 	LLMMinInterval      time.Duration `json:"llm_min_interval"`
 	LLMResponseMaxBytes int64         `json:"llm_response_max_bytes"`
 	SandboxConcurrency  int           `json:"sandbox_concurrency"`
+
+	// Diff limits
+	DiffMaxBytes int64 `json:"diff_max_bytes"`
+	DiffMaxFiles int   `json:"diff_max_files"`
+	DiffMaxHunks int   `json:"diff_max_hunks"`
 }
 
 const (
@@ -73,6 +78,16 @@ const (
 	DefaultSandboxConcurrency   = 1
 	MinSandboxConcurrency       = 1
 	MaxSandboxConcurrency       = 16
+
+	DefaultDiffMaxBytes = 2097152 // 2 MiB
+	MinDiffMaxBytes     = 1024    // 1 KiB
+	MaxDiffMaxBytes     = 52428800 // 50 MiB
+	DefaultDiffMaxFiles = 2000
+	MinDiffMaxFiles     = 1
+	MaxDiffMaxFiles     = 20000
+	DefaultDiffMaxHunks = 20000
+	MinDiffMaxHunks     = 1
+	MaxDiffMaxHunks     = 200000
 
 	DefaultSandboxCPUs             = 2.0
 	DefaultSandboxMemoryBytes      = 2147483648 // 2 GiB
@@ -164,6 +179,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.ValidateCapacity(); err != nil {
+		return err
+	}
+
+	if err := c.ValidateDiff(); err != nil {
 		return err
 	}
 
@@ -331,6 +350,32 @@ func (c *Config) ValidateCapacity() error {
 	}
 	if c.SandboxConcurrency < MinSandboxConcurrency || c.SandboxConcurrency > MaxSandboxConcurrency {
 		return fmt.Errorf("invalid SandboxConcurrency: %d (must be between %d and %d)", c.SandboxConcurrency, MinSandboxConcurrency, MaxSandboxConcurrency)
+	}
+
+	return nil
+}
+
+// ValidateDiff validates and defaults diff budget limits.
+func (c *Config) ValidateDiff() error {
+	if c.DiffMaxBytes == 0 {
+		c.DiffMaxBytes = DefaultDiffMaxBytes
+	}
+	if c.DiffMaxBytes < MinDiffMaxBytes || c.DiffMaxBytes > MaxDiffMaxBytes {
+		return fmt.Errorf("invalid DiffMaxBytes: %d (must be between %d and %d)", c.DiffMaxBytes, MinDiffMaxBytes, MaxDiffMaxBytes)
+	}
+
+	if c.DiffMaxFiles == 0 {
+		c.DiffMaxFiles = DefaultDiffMaxFiles
+	}
+	if c.DiffMaxFiles < MinDiffMaxFiles || c.DiffMaxFiles > MaxDiffMaxFiles {
+		return fmt.Errorf("invalid DiffMaxFiles: %d (must be between %d and %d)", c.DiffMaxFiles, MinDiffMaxFiles, MaxDiffMaxFiles)
+	}
+
+	if c.DiffMaxHunks == 0 {
+		c.DiffMaxHunks = DefaultDiffMaxHunks
+	}
+	if c.DiffMaxHunks < MinDiffMaxHunks || c.DiffMaxHunks > MaxDiffMaxHunks {
+		return fmt.Errorf("invalid DiffMaxHunks: %d (must be between %d and %d)", c.DiffMaxHunks, MinDiffMaxHunks, MaxDiffMaxHunks)
 	}
 
 	return nil
@@ -590,6 +635,33 @@ func Load() *Config {
 		}
 	}
 
+	diffMaxBytes := int64(DefaultDiffMaxBytes)
+	if raw := os.Getenv("DIFF_MAX_BYTES"); raw != "" {
+		if val, err := strconv.ParseInt(raw, 10, 64); err == nil && val > 0 {
+			diffMaxBytes = val
+		} else {
+			diffMaxBytes = -1
+		}
+	}
+
+	diffMaxFiles := DefaultDiffMaxFiles
+	if raw := os.Getenv("DIFF_MAX_FILES"); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			diffMaxFiles = val
+		} else {
+			diffMaxFiles = -1
+		}
+	}
+
+	diffMaxHunks := DefaultDiffMaxHunks
+	if raw := os.Getenv("DIFF_MAX_HUNKS"); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			diffMaxHunks = val
+		} else {
+			diffMaxHunks = -1
+		}
+	}
+
 	return &Config{
 		GitHubToken:             token,
 		WebhookSecret:           webhookSecret,
@@ -628,5 +700,8 @@ func Load() *Config {
 		LLMMinInterval:          llmMinInterval,
 		LLMResponseMaxBytes:     llmResponseMaxBytes,
 		SandboxConcurrency:      sandboxConcurrency,
+		DiffMaxBytes:            diffMaxBytes,
+		DiffMaxFiles:            diffMaxFiles,
+		DiffMaxHunks:            diffMaxHunks,
 	}
 }

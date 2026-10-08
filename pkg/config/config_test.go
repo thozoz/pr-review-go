@@ -321,3 +321,95 @@ func TestValidateWebhookResourceLimits(t *testing.T) {
 	}
 }
 
+func TestValidateDiffLimits(t *testing.T) {
+	baseCfg := func() *Config {
+		return &Config{
+			GitHubToken:   "token",
+			LLMAPIKey:     "key",
+			LLMModel:      "model",
+			LLMBaseURL:    "https://example.com",
+			EnableSandbox: false,
+		}
+	}
+
+	// 1. Defaults are populated and valid
+	cfg := baseCfg()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default diff config should be valid: %v", err)
+	}
+	if cfg.DiffMaxBytes != DefaultDiffMaxBytes {
+		t.Errorf("expected default DiffMaxBytes %d, got %d", DefaultDiffMaxBytes, cfg.DiffMaxBytes)
+	}
+	if cfg.DiffMaxFiles != DefaultDiffMaxFiles {
+		t.Errorf("expected default DiffMaxFiles %d, got %d", DefaultDiffMaxFiles, cfg.DiffMaxFiles)
+	}
+	if cfg.DiffMaxHunks != DefaultDiffMaxHunks {
+		t.Errorf("expected default DiffMaxHunks %d, got %d", DefaultDiffMaxHunks, cfg.DiffMaxHunks)
+	}
+
+	// 2. Reject negative/out-of-range DiffMaxBytes
+	cfg = baseCfg()
+	cfg.DiffMaxBytes = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative DiffMaxBytes")
+	}
+	cfg = baseCfg()
+	cfg.DiffMaxBytes = 100 // < MinDiffMaxBytes (1024)
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for DiffMaxBytes < 1024")
+	}
+	cfg = baseCfg()
+	cfg.DiffMaxBytes = MaxDiffMaxBytes + 1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for DiffMaxBytes > MaxDiffMaxBytes")
+	}
+
+	// 3. Reject negative/out-of-range DiffMaxFiles
+	cfg = baseCfg()
+	cfg.DiffMaxFiles = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative DiffMaxFiles")
+	}
+	cfg = baseCfg()
+	cfg.DiffMaxFiles = MaxDiffMaxFiles + 1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for DiffMaxFiles > MaxDiffMaxFiles")
+	}
+
+	// 4. Reject negative/out-of-range DiffMaxHunks
+	cfg = baseCfg()
+	cfg.DiffMaxHunks = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative DiffMaxHunks")
+	}
+	cfg = baseCfg()
+	cfg.DiffMaxHunks = MaxDiffMaxHunks + 1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for DiffMaxHunks > MaxDiffMaxHunks")
+	}
+}
+
+func TestLoadDiffEnvRejectsZeroAndNegative(t *testing.T) {
+	os.Setenv("GITHUB_TOKEN", "token")
+	os.Setenv("LLM_API_KEY", "key")
+	os.Setenv("LLM_MODEL", "model")
+	os.Setenv("LLM_BASE_URL", "https://example.com")
+	os.Setenv("DIFF_MAX_BYTES", "0")
+	os.Setenv("DIFF_MAX_FILES", "-5")
+	os.Setenv("DIFF_MAX_HUNKS", "0")
+	defer func() {
+		os.Unsetenv("GITHUB_TOKEN")
+		os.Unsetenv("LLM_API_KEY")
+		os.Unsetenv("LLM_MODEL")
+		os.Unsetenv("LLM_BASE_URL")
+		os.Unsetenv("DIFF_MAX_BYTES")
+		os.Unsetenv("DIFF_MAX_FILES")
+		os.Unsetenv("DIFF_MAX_HUNKS")
+	}()
+
+	cfg := Load()
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error when DIFF_* env vars are 0 or negative")
+	}
+}
+
