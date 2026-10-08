@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/thozoz/pr-review-go/pkg/retry"
 )
 
 type fakeClock struct {
@@ -597,38 +599,105 @@ func TestChatCompletion_ReadFailure(t *testing.T) {
 	}
 }
 
-func TestChatCompletion_HTTPStatusesAndNoRetries(t *testing.T) {
-	statusCodes := []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusInternalServerError}
+func TestChatCompletion_HTTPStatusesAndRetries(t *testing.T) {
+	tests := []struct {
+		code          int
+		expectedCalls int32
+	}{
+		{code: http.StatusUnauthorized, expectedCalls: 1}, // 401 permanent: no retry
+		{code: http.StatusTooManyRequests, expectedCalls: 5}, // 429 transient: retries up to 5 attempts
+		{code: http.StatusInternalServerError, expectedCalls: 5}, // 500 transient: retries up to 5 attempts
+	}
 
-	for _, code := range statusCodes {
-		t.Run(fmt.Sprintf("status_%d", code), func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("status_%d", tc.code), func(t *testing.T) {
 			var requestCount int32
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				atomic.AddInt32(&requestCount, 1)
-				w.WriteHeader(code)
-				_, _ = w.Write([]byte(fmt.Sprintf("simulated error %d", code)))
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(fmt.Sprintf("simulated error %d", tc.code)))
 			}))
 			defer ts.Close()
 
+			clock := retry.NewBudget(time.Hour, nil) // dummy
+			_ = clock
 			client := NewClient(ts.URL, "key", "model")
 			client.SetHTTPClient(newFixtureClient(ts.URL))
+			// Speed up test timing
+			client.SetRetryPolicy(retry.Policy{
+				MaxAttempts: 5,
+				BaseDelay:   time.Millisecond,
+				MaxDelay:    5 * time.Millisecond,
+				MaxWait:     time.Second,
+			})
 
 			_, err := client.ChatCompletion(context.Background(), "sys", "usr")
 			if err == nil {
-				t.Fatalf("expected error for status %d, got nil", code)
+				t.Fatalf("expected error for status %d, got nil", tc.code)
 			}
-			expectedSubstr := fmt.Sprintf("api error (status %d)", code)
+			expectedSubstr := fmt.Sprintf("api error (status %d)", tc.code)
 			if !strings.Contains(err.Error(), expectedSubstr) {
 				t.Fatalf("expected error to contain %q, got: %v", expectedSubstr, err)
 			}
 
-			// Exactly one attempt — no retries in Phase 2
 			finalCount := atomic.LoadInt32(&requestCount)
-			if finalCount != 1 {
-				t.Fatalf("expected exactly 1 request for status %d, got %d", code, finalCount)
+			if finalCount != tc.expectedCalls {
+				t.Fatalf("expected %d requests for status %d, got %d", tc.expectedCalls, tc.code, finalCount)
 			}
 		})
 	}
+}
+
+func TestChatCompletion_RetryInsideSingleGatePermit(t *testing.T) {
+	var requestCount int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cnt := atomic.AddInt32(&requestCount, 1)
+		if cnt < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limit"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ChatResponse{
+			Choices: []ChatChoice{
+				{Message: ChatMessage{Role: "assistant", Content: "recovered under gate"}},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	gate, err := NewRequestGate(1, time.Millisecond, 1048576, nil)
+	if err != nil {
+		t.Fatalf("failed to create gate: %v", err)
+	}
+
+	client := NewClient(ts.URL, "key", "model")
+	client.SetHTTPClient(newFixtureClient(ts.URL))
+	client.SetRetryPolicy(retry.Policy{
+		MaxAttempts: 5,
+		BaseDelay:   time.Millisecond,
+		MaxDelay:    5 * time.Millisecond,
+		MaxWait:     time.Second,
+	})
+
+	ctx := WithAdmission(context.Background(), gate)
+	res, err := client.ChatCompletion(ctx, "sys", "usr")
+	if err != nil {
+		t.Fatalf("expected success on 3rd attempt, got: %v", err)
+	}
+	if res != "recovered under gate" {
+		t.Fatalf("expected 'recovered under gate', got %q", res)
+	}
+	if atomic.LoadInt32(&requestCount) != 3 {
+		t.Fatalf("expected 3 attempts, got %d", atomic.LoadInt32(&requestCount))
+	}
+
+	// Verify gate permit was released after the retry sequence completes
+	release, err := gate.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("expected gate permit to be released and re-acquirable: %v", err)
+	}
+	release()
 }
 
 func TestChatCompletion_ErrorEnvelope(t *testing.T) {

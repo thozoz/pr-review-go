@@ -70,6 +70,13 @@ type Config struct {
 	AgentFileReadBytes       int64 `json:"agent_file_read_bytes"`
 	AgentSearchMaxMatches    int   `json:"agent_search_max_matches"`
 	AgentModelViolationLimit int   `json:"agent_model_violation_limit"`
+
+	// Retry limits
+	RetryMaxAttempts int           `json:"retry_max_attempts"`
+	RetryBaseDelay   time.Duration `json:"retry_base_delay"`
+	RetryMaxDelay    time.Duration `json:"retry_max_delay"`
+	RetryMaxWait     time.Duration `json:"retry_max_wait"`
+	RetryJobBudget   time.Duration `json:"retry_job_budget"`
 }
 
 const (
@@ -111,6 +118,22 @@ const (
 	DefaultAgentModelViolationLimit = 3
 	MinAgentModelViolationLimit     = 1
 	MaxAgentModelViolationLimit     = 10
+
+	DefaultRetryMaxAttempts = 5
+	MinRetryMaxAttempts     = 1
+	MaxRetryMaxAttempts     = 10
+	DefaultRetryBaseDelay   = 1 * time.Second
+	MinRetryBaseDelay       = 10 * time.Millisecond
+	MaxRetryBaseDelay       = 10 * time.Second
+	DefaultRetryMaxDelay    = 30 * time.Second
+	MinRetryMaxDelay        = 1 * time.Second
+	MaxRetryMaxDelay        = 5 * time.Minute
+	DefaultRetryMaxWait     = 60 * time.Second
+	MinRetryMaxWait         = 1 * time.Second
+	MaxRetryMaxWait         = 10 * time.Minute
+	DefaultRetryJobBudget   = 5 * time.Minute
+	MinRetryJobBudget       = 10 * time.Second
+	MaxRetryJobBudget       = 30 * time.Minute
 
 	DefaultSandboxCPUs             = 2.0
 	DefaultSandboxMemoryBytes      = 2147483648 // 2 GiB
@@ -210,6 +233,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.ValidateAgent(); err != nil {
+		return err
+	}
+
+	if err := c.ValidateRetry(); err != nil {
 		return err
 	}
 
@@ -443,6 +470,46 @@ func (c *Config) ValidateAgent() error {
 	}
 	if c.AgentModelViolationLimit < MinAgentModelViolationLimit || c.AgentModelViolationLimit > MaxAgentModelViolationLimit {
 		return fmt.Errorf("invalid AgentModelViolationLimit: %d (must be between %d and %d)", c.AgentModelViolationLimit, MinAgentModelViolationLimit, MaxAgentModelViolationLimit)
+	}
+
+	return nil
+}
+
+// ValidateRetry validates and defaults retry attempts, backoff delays, max wait, and job budget.
+func (c *Config) ValidateRetry() error {
+	if c.RetryMaxAttempts == 0 {
+		c.RetryMaxAttempts = DefaultRetryMaxAttempts
+	}
+	if c.RetryMaxAttempts < MinRetryMaxAttempts || c.RetryMaxAttempts > MaxRetryMaxAttempts {
+		return fmt.Errorf("invalid RetryMaxAttempts: %d (must be between %d and %d)", c.RetryMaxAttempts, MinRetryMaxAttempts, MaxRetryMaxAttempts)
+	}
+
+	if c.RetryBaseDelay == 0 {
+		c.RetryBaseDelay = DefaultRetryBaseDelay
+	}
+	if c.RetryBaseDelay < MinRetryBaseDelay || c.RetryBaseDelay > MaxRetryBaseDelay {
+		return fmt.Errorf("invalid RetryBaseDelay: %v (must be between %v and %v)", c.RetryBaseDelay, MinRetryBaseDelay, MaxRetryBaseDelay)
+	}
+
+	if c.RetryMaxDelay == 0 {
+		c.RetryMaxDelay = DefaultRetryMaxDelay
+	}
+	if c.RetryMaxDelay < MinRetryMaxDelay || c.RetryMaxDelay > MaxRetryMaxDelay {
+		return fmt.Errorf("invalid RetryMaxDelay: %v (must be between %v and %v)", c.RetryMaxDelay, MinRetryMaxDelay, MaxRetryMaxDelay)
+	}
+
+	if c.RetryMaxWait == 0 {
+		c.RetryMaxWait = DefaultRetryMaxWait
+	}
+	if c.RetryMaxWait < MinRetryMaxWait || c.RetryMaxWait > MaxRetryMaxWait {
+		return fmt.Errorf("invalid RetryMaxWait: %v (must be between %v and %v)", c.RetryMaxWait, MinRetryMaxWait, MaxRetryMaxWait)
+	}
+
+	if c.RetryJobBudget == 0 {
+		c.RetryJobBudget = DefaultRetryJobBudget
+	}
+	if c.RetryJobBudget < MinRetryJobBudget || c.RetryJobBudget > MaxRetryJobBudget {
+		return fmt.Errorf("invalid RetryJobBudget: %v (must be between %v and %v)", c.RetryJobBudget, MinRetryJobBudget, MaxRetryJobBudget)
 	}
 
 	return nil
@@ -774,6 +841,51 @@ func Load() *Config {
 		}
 	}
 
+	retryMaxAttempts := DefaultRetryMaxAttempts
+	if raw := os.Getenv("RETRY_MAX_ATTEMPTS"); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			retryMaxAttempts = val
+		} else {
+			retryMaxAttempts = -1
+		}
+	}
+
+	retryBaseDelay := DefaultRetryBaseDelay
+	if raw := os.Getenv("RETRY_BASE_DELAY"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			retryBaseDelay = d
+		} else {
+			retryBaseDelay = -1
+		}
+	}
+
+	retryMaxDelay := DefaultRetryMaxDelay
+	if raw := os.Getenv("RETRY_MAX_DELAY"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			retryMaxDelay = d
+		} else {
+			retryMaxDelay = -1
+		}
+	}
+
+	retryMaxWait := DefaultRetryMaxWait
+	if raw := os.Getenv("RETRY_MAX_WAIT"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			retryMaxWait = d
+		} else {
+			retryMaxWait = -1
+		}
+	}
+
+	retryJobBudget := DefaultRetryJobBudget
+	if raw := os.Getenv("RETRY_JOB_BUDGET"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			retryJobBudget = d
+		} else {
+			retryJobBudget = -1
+		}
+	}
+
 	return &Config{
 		GitHubToken:             token,
 		WebhookSecret:           webhookSecret,
@@ -820,5 +932,10 @@ func Load() *Config {
 		AgentFileReadBytes:       agentFileReadBytes,
 		AgentSearchMaxMatches:    agentSearchMaxMatches,
 		AgentModelViolationLimit: agentModelViolationLimit,
+		RetryMaxAttempts:         retryMaxAttempts,
+		RetryBaseDelay:           retryBaseDelay,
+		RetryMaxDelay:            retryMaxDelay,
+		RetryMaxWait:             retryMaxWait,
+		RetryJobBudget:           retryJobBudget,
 	}
 }
