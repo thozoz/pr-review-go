@@ -69,6 +69,12 @@ type ReviewReport struct {
 	RawMarkdown         string
 	Ledger              *diff.CoverageLedger
 	Coverage            *CoverageReport
+
+	// Classification fields for re-review reporting (D-11, D-15)
+	Classification     *ClassifiedFindings
+	PersistingFindings []PersistingFinding
+	FixedFindings      []FixedFinding
+	NewFindings        []Finding
 }
 
 // GetCoverage returns report.Coverage if set, or derives it from report.Ledger.

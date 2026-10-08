@@ -2574,6 +2574,596 @@ func (m *mockSourceProviderWithTracker) PrepareSource(ctx context.Context, clone
 	return snap, cleanup, nil
 }
 
+func TestExecuteDecision_HappyPath(t *testing.T) {
+	const (
+		validHead = "2222222222222222222222222222222222222222"
+		validBase = "1111111111111111111111111111111111111111"
+		repoID    = int64(12345)
+		prNum     = 10
+	)
+
+	var (
+		reviewsCreated   atomic.Int32
+		commentsCreated  atomic.Int32
+		commentsEdited   atomic.Int32
+		lastStatusBody   string
+		statusMu         sync.Mutex
+		createdReviewEvt string
+	)
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/user":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1001, "login": "test-bot"})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/collaborators/trusted-dev/permission"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, fmt.Sprintf("/pulls/%d", prNum)):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": prNum,
+				"head":   map[string]any{"sha": validHead, "ref": "feat"},
+				"base":   map[string]any{"sha": validBase, "ref": "main"},
+			})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, fmt.Sprintf("/pulls/%d/reviews", prNum)):
+			reviewsCreated.Add(1)
+			var bodyMap map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			statusMu.Lock()
+			if evt, ok := bodyMap["event"].(string); ok {
+				createdReviewEvt = evt
+			}
+			statusMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 8801})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/issues/comments/9901"):
+			statusMu.Lock()
+			body := lastStatusBody
+			statusMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":   9901,
+				"body": body,
+				"user": map[string]any{"id": 1001, "login": "test-bot"},
+			})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+			commentsCreated.Add(1)
+			var bodyMap map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			statusMu.Lock()
+			lastStatusBody = bodyMap["body"]
+			statusMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":   9901,
+				"body": bodyMap["body"],
+				"user": map[string]any{"id": 1001, "login": "test-bot"},
+			})
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/issues/comments/9901"):
+			commentsEdited.Add(1)
+			var bodyMap map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			statusMu.Lock()
+			lastStatusBody = bodyMap["body"]
+			statusMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":   9901,
+				"body": bodyMap["body"],
+				"user": map[string]any{"id": 1001, "login": "test-bot"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := ghclient.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateDir := t.TempDir()
+	store, err := OpenJobStore(filepath.Join(stateDir, "decision_happy.db"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := &config.Config{
+		GitHubToken:     "test-token",
+		LLMAPIKey:       "test-key",
+		LLMModel:        "test-model",
+		LLMBaseURL:      "http://example.invalid",
+		WebhookSecret:   testSecret,
+		WebhookStateDir: stateDir,
+	}
+	srv := NewServer(cfg)
+	srv.gh = ghClient
+	srv.engine = nil // isolated test; no live review engine
+	srv.SetStore(store)
+	defer srv.Stop()
+
+	prKey, _ := MakePRKey("github.com", repoID, prNum)
+	job := Job{
+		Kind:      "approve",
+		Trigger:   "explicit",
+		Author:    "trusted-dev",
+		CommentID: 2001,
+		PRKey:     prKey,
+		Owner:     "org",
+		Repo:      "repo",
+		PRNumber:  prNum,
+		HeadSHA:   validHead,
+		BaseSHA:   validBase,
+	}
+
+	deliv := Delivery{
+		Host:        "github.com",
+		RepoID:      repoID,
+		DeliveryID:  "deliv-dec-happy",
+		EventKind:   "issue_comment",
+		ReceivedAt:  time.Now().UTC(),
+	}
+	res, err := store.Admit(context.Background(), deliv, []Job{job})
+	if err != nil || res.Status != AdmitAccepted {
+		t.Fatalf("admit failed: %v", err)
+	}
+
+	queued, _ := store.ListQueuedJobs(context.Background())
+	admittedJob := queued[0]
+
+	exec := NewServerJobExecutor(srv, store)
+	if err := exec.ExecuteJob(context.Background(), admittedJob); err != nil {
+		t.Fatalf("ExecuteJob failed: %v", err)
+	}
+
+	jobAfter, _ := store.GetJob(context.Background(), admittedJob.ID)
+	if jobAfter.Status != "completed" {
+		t.Fatalf("expected job status completed, got %s (err: %s)", jobAfter.Status, jobAfter.Error)
+	}
+
+	if reviewsCreated.Load() != 1 {
+		t.Fatalf("expected exactly 1 CreateReview call, got %d", reviewsCreated.Load())
+	}
+	if createdReviewEvt != "APPROVE" {
+		t.Fatalf("expected CreateReview event APPROVE, got %q", createdReviewEvt)
+	}
+
+	// Verify status comment was created and recycled (D-16)
+	if commentsCreated.Load() != 1 {
+		t.Fatalf("expected 1 initial status comment created, got %d", commentsCreated.Load())
+	}
+	if commentsEdited.Load() == 0 {
+		t.Fatalf("expected status comment to be edited/recycled, got 0 edits")
+	}
+
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	if !strings.Contains(lastStatusBody, "Decision APPROVE published") {
+		t.Fatalf("expected status body to contain completion note, got: %s", lastStatusBody)
+	}
+
+	// Verify ledger marked published
+	dec, err := srv.getDecisionLedger().GetDecision(context.Background(), prKey, validHead)
+	if err != nil || dec == nil {
+		t.Fatalf("expected decision record in ledger, got: %v, %v", dec, err)
+	}
+	if dec.Status != DecisionStatusPublished || dec.ReviewID != 8801 {
+		t.Fatalf("unexpected ledger record: %+v", dec)
+	}
+}
+
+func TestExecuteDecision_ReauthorizationDenied(t *testing.T) {
+	const (
+		validHead = "2222222222222222222222222222222222222222"
+		validBase = "1111111111111111111111111111111111111111"
+		repoID    = int64(12345)
+		prNum     = 10
+	)
+
+	var reviewsCreated atomic.Int32
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/collaborators/untrusted-dev/permission"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"permission": "read"}) // DENIED
+		case strings.Contains(r.URL.Path, "/reviews"):
+			reviewsCreated.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, _ := ghclient.NewTestClient(ghServer.URL)
+	stateDir := t.TempDir()
+	store, _ := OpenJobStore(filepath.Join(stateDir, "decision_denied.db"), StoreOptions{})
+	defer store.Close()
+
+	cfg := &config.Config{
+		GitHubToken:     "test-token",
+		LLMAPIKey:       "test-key",
+		LLMModel:        "test-model",
+		LLMBaseURL:      "http://example.invalid",
+		WebhookSecret:   testSecret,
+		WebhookStateDir: stateDir,
+	}
+	srv := NewServer(cfg)
+	srv.gh = ghClient
+	srv.engine = nil
+	srv.SetStore(store)
+	defer srv.Stop()
+
+	prKey, _ := MakePRKey("github.com", repoID, prNum)
+	job := Job{
+		Kind:      "approve",
+		Trigger:   "explicit",
+		Author:    "untrusted-dev",
+		CommentID: 2002,
+		PRKey:     prKey,
+		Owner:     "org",
+		Repo:      "repo",
+		PRNumber:  prNum,
+		HeadSHA:   validHead,
+		BaseSHA:   validBase,
+	}
+
+	deliv := Delivery{
+		Host:        "github.com",
+		RepoID:      repoID,
+		DeliveryID:  "deliv-dec-denied",
+		EventKind:   "issue_comment",
+		ReceivedAt:  time.Now().UTC(),
+	}
+	res, err := store.Admit(context.Background(), deliv, []Job{job})
+	if err != nil || res.Status != AdmitAccepted {
+		t.Fatalf("admit failed: %v", err)
+	}
+
+	queued, _ := store.ListQueuedJobs(context.Background())
+	admittedJob := queued[0]
+
+	exec := NewServerJobExecutor(srv, store)
+	err = exec.ExecuteJob(context.Background(), admittedJob)
+	if err == nil {
+		t.Fatalf("expected reauthorization error, got nil")
+	}
+
+	if reviewsCreated.Load() != 0 {
+		t.Fatalf("D-03 violation: unprivileged user triggered %d reviews", reviewsCreated.Load())
+	}
+
+	jobAfter, _ := store.GetJob(context.Background(), admittedJob.ID)
+	if jobAfter == nil || jobAfter.Status != "failed" || !strings.Contains(jobAfter.Error, "permission revoked") {
+		t.Fatalf("expected job status failed with permission revoked, got %+v", jobAfter)
+	}
+}
+
+func TestDecisionDuplicate_SecondCommandPostsWarningAndNoReview(t *testing.T) {
+	const (
+		validHead = "2222222222222222222222222222222222222222"
+		validBase = "1111111111111111111111111111111111111111"
+		repoID    = int64(12345)
+		prNum     = 10
+	)
+
+	var (
+		reviewsCreated   atomic.Int32
+		issueComments    []string
+		commentsMu       sync.Mutex
+		lastStatusBody   string
+	)
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/user":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1001, "login": "test-bot"})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/collaborators/"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, fmt.Sprintf("/pulls/%d", prNum)):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": prNum,
+				"head":   map[string]any{"sha": validHead, "ref": "feat"},
+				"base":   map[string]any{"sha": validBase, "ref": "main"},
+			})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, fmt.Sprintf("/pulls/%d/reviews", prNum)):
+			reviewsCreated.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 8802})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/issues/comments/"):
+			commentsMu.Lock()
+			body := lastStatusBody
+			commentsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9902, "body": body, "user": map[string]any{"id": 1001, "login": "test-bot"}})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+			var bodyMap map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			commentsMu.Lock()
+			lastStatusBody = bodyMap["body"]
+			issueComments = append(issueComments, bodyMap["body"])
+			commentsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9902, "body": bodyMap["body"], "user": map[string]any{"id": 1001, "login": "test-bot"}})
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/issues/comments/"):
+			var bodyMap map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			commentsMu.Lock()
+			lastStatusBody = bodyMap["body"]
+			commentsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9902, "body": bodyMap["body"], "user": map[string]any{"id": 1001, "login": "test-bot"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, _ := ghclient.NewTestClient(ghServer.URL)
+	stateDir := t.TempDir()
+	store, _ := OpenJobStore(filepath.Join(stateDir, "decision_dup.db"), StoreOptions{})
+	defer store.Close()
+
+	cfg := &config.Config{
+		GitHubToken:     "test-token",
+		LLMAPIKey:       "test-key",
+		LLMModel:        "test-model",
+		LLMBaseURL:      "http://example.invalid",
+		WebhookSecret:   testSecret,
+		WebhookStateDir: stateDir,
+	}
+	srv := NewServer(cfg)
+	srv.gh = ghClient
+	srv.engine = nil
+	srv.SetStore(store)
+	defer srv.Stop()
+
+	prKey, _ := MakePRKey("github.com", repoID, prNum)
+	job1 := Job{
+		Kind:      "approve",
+		Trigger:   "explicit",
+		Author:    "dev",
+		CommentID: 3001,
+		PRKey:     prKey,
+		Owner:     "org",
+		Repo:      "repo",
+		PRNumber:  prNum,
+		HeadSHA:   validHead,
+		BaseSHA:   validBase,
+	}
+
+	deliv1 := Delivery{
+		Host:        "github.com",
+		RepoID:      repoID,
+		DeliveryID:  "deliv-dup-1",
+		EventKind:   "issue_comment",
+		ReceivedAt:  time.Now().UTC(),
+	}
+	_, _ = store.Admit(context.Background(), deliv1, []Job{job1})
+	queued, _ := store.ListQueuedJobs(context.Background())
+	admittedJob1 := queued[0]
+
+	exec := NewServerJobExecutor(srv, store)
+
+	// 1. Run first command -> succeeds
+	if err := exec.ExecuteJob(context.Background(), admittedJob1); err != nil {
+		t.Fatalf("first command failed: %v", err)
+	}
+	if reviewsCreated.Load() != 1 {
+		t.Fatalf("expected 1 review created, got %d", reviewsCreated.Load())
+	}
+
+	// 2. Run second command with same head -> rejected with warning, zero additional reviews
+	job2 := Job{
+		Kind:      "request_changes",
+		Trigger:   "explicit",
+		Author:    "dev",
+		CommentID: 3002,
+		PRKey:     prKey,
+		Owner:     "org",
+		Repo:      "repo",
+		PRNumber:  prNum,
+		HeadSHA:   validHead,
+		BaseSHA:   validBase,
+	}
+
+	deliv2 := Delivery{
+		Host:        "github.com",
+		RepoID:      repoID,
+		DeliveryID:  "deliv-dup-2",
+		EventKind:   "issue_comment",
+		ReceivedAt:  time.Now().UTC(),
+	}
+	_, _ = store.Admit(context.Background(), deliv2, []Job{job2})
+	queued2, _ := store.ListQueuedJobs(context.Background())
+	var admittedJob2 *Job
+	for _, j := range queued2 {
+		if j.ID != admittedJob1.ID {
+			admittedJob2 = j
+			break
+		}
+	}
+	if admittedJob2 == nil {
+		t.Fatalf("expected second job admitted")
+	}
+
+	if err := exec.ExecuteJob(context.Background(), admittedJob2); err != nil {
+		t.Fatalf("second command returned unexpected execution error: %v", err)
+	}
+
+	// Verify no additional review was posted (D-04)
+	if reviewsCreated.Load() != 1 {
+		t.Fatalf("D-04 violation: second command created duplicate review (total: %d)", reviewsCreated.Load())
+	}
+
+	// Verify warning comment was posted
+	commentsMu.Lock()
+	defer commentsMu.Unlock()
+	foundWarning := false
+	for _, c := range issueComments {
+		if strings.Contains(c, "A decision review has already been submitted for commit") {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Fatalf("expected warning comment posted to issue, got: %v", issueComments)
+	}
+
+	job2After, _ := store.GetJob(context.Background(), admittedJob2.ID)
+	if job2After.Status != "failed" || !strings.Contains(job2After.Error, "decision already recorded") {
+		t.Fatalf("expected job2 status failed with duplicate record error, got %+v", job2After)
+	}
+}
+
+func TestDecisionHead_AdvancedMidFlowPostsOldSHANotice(t *testing.T) {
+	const (
+		oldHead = "2222222222222222222222222222222222222222"
+		newHead = "3333333333333333333333333333333333333333"
+		base    = "1111111111111111111111111111111111111111"
+		repoID  = int64(12345)
+		prNum   = 10
+	)
+
+	var (
+		reviewsCreated  atomic.Int32
+		commentsCreated atomic.Int32
+		lastStatusBody  string
+		statusMu        sync.Mutex
+	)
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/user":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1001, "login": "test-bot"})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/collaborators/"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, fmt.Sprintf("/pulls/%d", prNum)):
+			// Live PR has already moved to newHead!
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": prNum,
+				"head":   map[string]any{"sha": newHead, "ref": "feat"},
+				"base":   map[string]any{"sha": base, "ref": "main"},
+			})
+		case strings.Contains(r.URL.Path, "/reviews"):
+			reviewsCreated.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]any{})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/issues/comments/"):
+			statusMu.Lock()
+			body := lastStatusBody
+			statusMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9903, "body": body, "user": map[string]any{"id": 1001, "login": "test-bot"}})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, fmt.Sprintf("/issues/%d/comments", prNum)):
+			commentsCreated.Add(1)
+			var bodyMap map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			statusMu.Lock()
+			lastStatusBody = bodyMap["body"]
+			statusMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9903, "body": bodyMap["body"], "user": map[string]any{"id": 1001, "login": "test-bot"}})
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/issues/comments/"):
+			var bodyMap map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&bodyMap)
+			statusMu.Lock()
+			lastStatusBody = bodyMap["body"]
+			statusMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9903, "body": bodyMap["body"], "user": map[string]any{"id": 1001, "login": "test-bot"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, _ := ghclient.NewTestClient(ghServer.URL)
+	stateDir := t.TempDir()
+	store, _ := OpenJobStore(filepath.Join(stateDir, "decision_head.db"), StoreOptions{})
+	defer store.Close()
+
+	cfg := &config.Config{
+		GitHubToken:     "test-token",
+		LLMAPIKey:       "test-key",
+		LLMModel:        "test-model",
+		LLMBaseURL:      "http://example.invalid",
+		WebhookSecret:   testSecret,
+		WebhookStateDir: stateDir,
+	}
+	srv := NewServer(cfg)
+	srv.gh = ghClient
+	srv.engine = nil
+	srv.SetStore(store)
+	defer srv.Stop()
+
+	prKey, _ := MakePRKey("github.com", repoID, prNum)
+	job := Job{
+		Kind:      "approve",
+		Trigger:   "explicit",
+		Author:    "dev",
+		CommentID: 4001,
+		PRKey:     prKey,
+		Owner:     "org",
+		Repo:      "repo",
+		PRNumber:  prNum,
+		HeadSHA:   oldHead, // was queued for oldHead
+		BaseSHA:   base,
+	}
+
+	deliv := Delivery{
+		Host:        "github.com",
+		RepoID:      repoID,
+		DeliveryID:  "deliv-dec-head",
+		EventKind:   "issue_comment",
+		ReceivedAt:  time.Now().UTC(),
+	}
+	_, _ = store.Admit(context.Background(), deliv, []Job{job})
+	queued, _ := store.ListQueuedJobs(context.Background())
+	admittedJob := queued[0]
+
+	exec := NewServerJobExecutor(srv, store)
+	if err := exec.ExecuteJob(context.Background(), admittedJob); err != nil {
+		t.Fatalf("ExecuteJob failed: %v", err)
+	}
+
+	// Must NOT publish review for old head or new head (D-04)
+	if reviewsCreated.Load() != 0 {
+		t.Fatalf("D-04 violation: review published when head changed (got %d)", reviewsCreated.Load())
+	}
+
+	// Status comment should name the old SHA
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	if !strings.Contains(lastStatusBody, oldHead) || !strings.Contains(lastStatusBody, "voided by newer commit") {
+		t.Fatalf("expected status comment to mention old head %s was voided, got: %s", oldHead, lastStatusBody)
+	}
+
+	// Job should be superseded and retargeted to newHead
+	jobAfter, _ := store.GetJob(context.Background(), admittedJob.ID)
+	if jobAfter.Status != "superseded" || jobAfter.HeadSHA != newHead {
+		t.Fatalf("expected job to be superseded and retargeted to newHead, got %+v", jobAfter)
+	}
+}
+
 
 
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1026,6 +1027,195 @@ func TestReviewPR_SourceVerificationUnavailableWithoutInventedSuccess(t *testing
 	reportMd := FormatReportMarkdown(report)
 	if strings.Contains(reportMd, "PASSED") {
 		t.Fatalf("report markdown must not claim PASSED verification: %s", reportMd)
+	}
+}
+
+func TestDecisionBody_PartialWarningAndOmissionsAndFixed(t *testing.T) {
+	// D-15: decision body carries summary, partial-review warning, omission list,
+	// and fixed list together
+	rep := &ReviewReport{
+		PRNumber: 10,
+		PRTitle:  "Feature with partial review",
+		HeadSHA:  "2222222222222222222222222222222222222222",
+		Score:    70,
+		Summary:  "Review completed with omissions",
+		Coverage: &CoverageReport{
+			State:         CoverageStatePartial,
+			TotalHunks:    10,
+			ExaminedCount: 4,
+			SkippedCount:  6,
+			ExaminedHunks: []string{"fileA.go#1", "fileA.go#2"},
+			SkippedHunks:  []CoverageItem{{ID: "fileB.go#1", Reason: "not examined"}},
+			Omissions:     []CoverageItem{{ID: "fileC.go#1", Reason: "oversize hunk exceeded budget"}},
+		},
+		FixedFindings: []FixedFinding{
+			{Title: "Deadlock on shutdown", File: "worker.go", Severity: "CRITICAL", PriorSHA: "1111111111111111111111111111111111111111"},
+		},
+		PersistingFindings: []PersistingFinding{
+			{
+				Finding: Finding{
+					File:        "server.go",
+					Line:        55,
+					Severity:    "WARNING",
+					Title:       "Missing write timeout",
+					Description: "Server missing write timeout configuration",
+				},
+				PriorFile: "server.go",
+				PriorLine: 40,
+				PriorSHA:  "1111111111111111111111111111111111111111",
+			},
+		},
+		NewFindings: []Finding{
+			{
+				File:        "handler.go",
+				Line:        12,
+				Severity:    "NOTE",
+				Title:       "Redundant log entry",
+				Description: "Debug log redundant with middleware",
+			},
+		},
+	}
+
+	md := FormatReportMarkdown(rep)
+
+	// 1. Must carry Partial Review Warning (D-15, T-04-03-03)
+	if !strings.Contains(md, "Partial Review Warning") {
+		t.Errorf("expected Partial Review Warning, got markdown:\n%s", md)
+	}
+
+	// 2. Must carry Omissions list (D-15)
+	if !strings.Contains(md, "oversize hunk exceeded budget") {
+		t.Errorf("expected omission item in markdown, got:\n%s", md)
+	}
+
+	// 3. Must carry Fixed list (D-15, D-11)
+	if !strings.Contains(md, "Deadlock on shutdown") || !strings.Contains(md, "[RESOLVED]") {
+		t.Errorf("expected resolved finding in markdown, got:\n%s", md)
+	}
+
+	// 4. Must carry Persisting finding with prior location note (D-11)
+	if !strings.Contains(md, "Previously reported at `server.go:40` in commit `11111111`") {
+		t.Errorf("expected prior location note for persisting finding, got:\n%s", md)
+	}
+
+	// 5. Must carry New finding
+	if !strings.Contains(md, "Redundant log entry") {
+		t.Errorf("expected new finding in markdown, got:\n%s", md)
+	}
+}
+
+func TestRereview_ClassifiedBody(t *testing.T) {
+	// Full classification formatting test
+	const (
+		shaOld = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		shaNew = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+
+	prior := []PriorFinding{
+		{File: "auth.go", Line: 10, Severity: "CRITICAL", Title: "Token leak", HeadSHA: shaOld},
+		{File: "db.go", Line: 20, Severity: "WARNING", Title: "Unclosed cursor", HeadSHA: shaOld},
+	}
+
+	current := []Finding{
+		{File: "auth.go", Line: 25, Severity: "CRITICAL", Title: "Token leak", Description: "Token still leaking"},
+		{File: "cache.go", Line: 5, Severity: "NOTE", Title: "Cache ttl default", Description: "Consider 5m ttl"},
+	}
+
+	cls := ClassifyAgainstPrior(current, shaOld, prior)
+
+	rep := &ReviewReport{
+		PRNumber:           1,
+		PRTitle:            "Fix database issues",
+		HeadSHA:            shaNew,
+		Score:              80,
+		Summary:            "Re-review completed",
+		Classification:     &cls,
+		PersistingFindings: cls.Persisting,
+		FixedFindings:      cls.Fixed,
+		NewFindings:        cls.New,
+	}
+
+	md := FormatReportMarkdown(rep)
+
+	if !strings.Contains(md, "Resolved Findings") || !strings.Contains(md, "Unclosed cursor") {
+		t.Errorf("expected Resolved Findings section with Unclosed cursor, got:\n%s", md)
+	}
+	if !strings.Contains(md, "Persisting Findings") || !strings.Contains(md, "Token leak") {
+		t.Errorf("expected Persisting Findings section with Token leak, got:\n%s", md)
+	}
+	if !strings.Contains(md, "Previously reported at `auth.go:10` in commit `aaaaaaaa`") {
+		t.Errorf("expected line shift note in persisting finding, got:\n%s", md)
+	}
+	if !strings.Contains(md, "New Findings") || !strings.Contains(md, "Cache ttl default") {
+		t.Errorf("expected New Findings section with Cache ttl default, got:\n%s", md)
+	}
+}
+
+func TestStaleUntouched_ZeroEditDeleteResolveCalls(t *testing.T) {
+	// D-12: stale inline comments on old lines are left in place;
+	// this phase implements no bot-driven resolve, edit, or delete of prior comments.
+	var (
+		editCalls    atomic.Int32
+		deleteCalls  atomic.Int32
+		resolveCalls atomic.Int32
+		postCalls    atomic.Int32
+	)
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/comments/"):
+			editCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/threads") && strings.Contains(r.URL.Path, "/resolve"):
+			resolveCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/reviews"):
+			postCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9999})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute re-review publication on the client
+	suggestions := []github.InlineSuggestion{
+		{Path: "main.go", Line: 30, Body: "updated line"},
+	}
+	_, err = ghClient.PostDecisionReview(
+		context.Background(),
+		"org",
+		"repo",
+		1,
+		"2222222222222222222222222222222222222222",
+		github.EventApprove,
+		"## Verdict: Approved",
+		suggestions,
+	)
+	if err != nil {
+		t.Fatalf("unexpected PostDecisionReview error: %v", err)
+	}
+
+	if postCalls.Load() != 1 {
+		t.Fatalf("expected 1 CreateReview post, got %d", postCalls.Load())
+	}
+	if editCalls.Load() != 0 {
+		t.Fatalf("D-12 violation: bot attempted %d edits of stale comments", editCalls.Load())
+	}
+	if deleteCalls.Load() != 0 {
+		t.Fatalf("D-12 violation: bot attempted %d deletes of stale comments", deleteCalls.Load())
+	}
+	if resolveCalls.Load() != 0 {
+		t.Fatalf("D-12 violation: bot attempted %d thread resolves", resolveCalls.Load())
 	}
 }
 

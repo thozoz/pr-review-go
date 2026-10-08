@@ -157,5 +157,8 @@ func (o *StatusOutbox) processIntent(ctx context.Context, intent *OutputIntent) 
 	if commentID > 0 {
 		job.StatusCommentID = commentID
 		_ = o.store.UpdateJob(ctx, job)
+		intent.Status = "completed"
+		intent.CommentID = commentID
+		_ = o.store.UpdateOutputIntent(ctx, intent)
 	}
 }

@@ -469,6 +469,10 @@ func (c *Client) CanWriteRepository(ctx context.Context, owner, repo, username s
 // ClassUncertainWrite outcomes to reconciliation/operator attention instead
 // of blind POST retries, because the remote effect is unprovable.
 func ClassifyWriteError(err error) retry.Classification {
+	var dwe *DecisionWriteError
+	if errors.As(err, &dwe) {
+		return dwe.Classification
+	}
 	return retry.ClassifyError(err, retry.OpKindWrite)
 }
 
