@@ -46,6 +46,7 @@ var (
 	bucketIntents    = []byte("intents")
 	bucketCounters   = []byte("counters")
 	bucketComments   = []byte("comments")
+	bucketDecisions  = []byte("decisions")
 
 	keySchemaVersion = []byte("schema_version")
 )
@@ -323,6 +324,9 @@ func (s *BoltJobStore) initSchema() error {
 			if _, err := tx.CreateBucketIfNotExists(bucketComments); err != nil {
 				return err
 			}
+			if _, err := tx.CreateBucketIfNotExists(bucketDecisions); err != nil {
+				return err
+			}
 			return nil
 		}
 
@@ -339,7 +343,7 @@ func (s *BoltJobStore) initSchema() error {
 		}
 
 		// Ensure all buckets exist
-		for _, bName := range [][]byte{bucketDeliveries, bucketJobs, bucketPRs, bucketIntents, bucketCounters, bucketComments} {
+		for _, bName := range [][]byte{bucketDeliveries, bucketJobs, bucketPRs, bucketIntents, bucketCounters, bucketComments, bucketDecisions} {
 			if _, err := tx.CreateBucketIfNotExists(bName); err != nil {
 				return err
 			}
@@ -384,6 +388,13 @@ func (s *BoltJobStore) initSchema() error {
 		}
 		return nil
 	})
+}
+
+// DB returns the underlying bbolt.DB instance.
+func (s *BoltJobStore) DB() *bbolt.DB {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.db
 }
 
 func (s *BoltJobStore) Close() error {
