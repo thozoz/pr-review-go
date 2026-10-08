@@ -63,6 +63,13 @@ type Config struct {
 	DiffMaxBytes int64 `json:"diff_max_bytes"`
 	DiffMaxFiles int   `json:"diff_max_files"`
 	DiffMaxHunks int   `json:"diff_max_hunks"`
+
+	// Agent loop limits
+	AgentMaxTurns            int   `json:"agent_max_turns"`
+	AgentMaxToolBytes        int64 `json:"agent_max_tool_bytes"`
+	AgentFileReadBytes       int64 `json:"agent_file_read_bytes"`
+	AgentSearchMaxMatches    int   `json:"agent_search_max_matches"`
+	AgentModelViolationLimit int   `json:"agent_model_violation_limit"`
 }
 
 const (
@@ -88,6 +95,22 @@ const (
 	DefaultDiffMaxHunks = 20000
 	MinDiffMaxHunks     = 1
 	MaxDiffMaxHunks     = 200000
+
+	DefaultAgentMaxTurns            = 12
+	MinAgentMaxTurns                = 1
+	MaxAgentMaxTurns                = 32
+	DefaultAgentMaxToolBytes        = 204800 // 200 KiB
+	MinAgentMaxToolBytes            = 16384  // 16 KiB
+	MaxAgentMaxToolBytes            = 1048576 // 1 MiB
+	DefaultAgentFileReadBytes       = 30000  // 30 KB
+	MinAgentFileReadBytes           = 1024   // 1 KB
+	MaxAgentFileReadBytes           = 1048576 // 1 MiB
+	DefaultAgentSearchMaxMatches    = 50
+	MinAgentSearchMaxMatches        = 1
+	MaxAgentSearchMaxMatches        = 500
+	DefaultAgentModelViolationLimit = 3
+	MinAgentModelViolationLimit     = 1
+	MaxAgentModelViolationLimit     = 10
 
 	DefaultSandboxCPUs             = 2.0
 	DefaultSandboxMemoryBytes      = 2147483648 // 2 GiB
@@ -183,6 +206,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.ValidateDiff(); err != nil {
+		return err
+	}
+
+	if err := c.ValidateAgent(); err != nil {
 		return err
 	}
 
@@ -376,6 +403,46 @@ func (c *Config) ValidateDiff() error {
 	}
 	if c.DiffMaxHunks < MinDiffMaxHunks || c.DiffMaxHunks > MaxDiffMaxHunks {
 		return fmt.Errorf("invalid DiffMaxHunks: %d (must be between %d and %d)", c.DiffMaxHunks, MinDiffMaxHunks, MaxDiffMaxHunks)
+	}
+
+	return nil
+}
+
+// ValidateAgent validates and defaults agent loop limits.
+func (c *Config) ValidateAgent() error {
+	if c.AgentMaxTurns == 0 {
+		c.AgentMaxTurns = DefaultAgentMaxTurns
+	}
+	if c.AgentMaxTurns < MinAgentMaxTurns || c.AgentMaxTurns > MaxAgentMaxTurns {
+		return fmt.Errorf("invalid AgentMaxTurns: %d (must be between %d and %d)", c.AgentMaxTurns, MinAgentMaxTurns, MaxAgentMaxTurns)
+	}
+
+	if c.AgentMaxToolBytes == 0 {
+		c.AgentMaxToolBytes = DefaultAgentMaxToolBytes
+	}
+	if c.AgentMaxToolBytes < MinAgentMaxToolBytes || c.AgentMaxToolBytes > MaxAgentMaxToolBytes {
+		return fmt.Errorf("invalid AgentMaxToolBytes: %d (must be between %d and %d)", c.AgentMaxToolBytes, MinAgentMaxToolBytes, MaxAgentMaxToolBytes)
+	}
+
+	if c.AgentFileReadBytes == 0 {
+		c.AgentFileReadBytes = DefaultAgentFileReadBytes
+	}
+	if c.AgentFileReadBytes < MinAgentFileReadBytes || c.AgentFileReadBytes > MaxAgentFileReadBytes {
+		return fmt.Errorf("invalid AgentFileReadBytes: %d (must be between %d and %d)", c.AgentFileReadBytes, MinAgentFileReadBytes, MaxAgentFileReadBytes)
+	}
+
+	if c.AgentSearchMaxMatches == 0 {
+		c.AgentSearchMaxMatches = DefaultAgentSearchMaxMatches
+	}
+	if c.AgentSearchMaxMatches < MinAgentSearchMaxMatches || c.AgentSearchMaxMatches > MaxAgentSearchMaxMatches {
+		return fmt.Errorf("invalid AgentSearchMaxMatches: %d (must be between %d and %d)", c.AgentSearchMaxMatches, MinAgentSearchMaxMatches, MaxAgentSearchMaxMatches)
+	}
+
+	if c.AgentModelViolationLimit == 0 {
+		c.AgentModelViolationLimit = DefaultAgentModelViolationLimit
+	}
+	if c.AgentModelViolationLimit < MinAgentModelViolationLimit || c.AgentModelViolationLimit > MaxAgentModelViolationLimit {
+		return fmt.Errorf("invalid AgentModelViolationLimit: %d (must be between %d and %d)", c.AgentModelViolationLimit, MinAgentModelViolationLimit, MaxAgentModelViolationLimit)
 	}
 
 	return nil
@@ -662,6 +729,51 @@ func Load() *Config {
 		}
 	}
 
+	agentMaxTurns := DefaultAgentMaxTurns
+	if raw := os.Getenv("AGENT_MAX_TURNS"); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			agentMaxTurns = val
+		} else {
+			agentMaxTurns = -1
+		}
+	}
+
+	agentMaxToolBytes := int64(DefaultAgentMaxToolBytes)
+	if raw := os.Getenv("AGENT_MAX_TOOL_BYTES"); raw != "" {
+		if val, err := strconv.ParseInt(raw, 10, 64); err == nil && val > 0 {
+			agentMaxToolBytes = val
+		} else {
+			agentMaxToolBytes = -1
+		}
+	}
+
+	agentFileReadBytes := int64(DefaultAgentFileReadBytes)
+	if raw := os.Getenv("AGENT_FILE_READ_BYTES"); raw != "" {
+		if val, err := strconv.ParseInt(raw, 10, 64); err == nil && val > 0 {
+			agentFileReadBytes = val
+		} else {
+			agentFileReadBytes = -1
+		}
+	}
+
+	agentSearchMaxMatches := DefaultAgentSearchMaxMatches
+	if raw := os.Getenv("AGENT_SEARCH_MAX_MATCHES"); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			agentSearchMaxMatches = val
+		} else {
+			agentSearchMaxMatches = -1
+		}
+	}
+
+	agentModelViolationLimit := DefaultAgentModelViolationLimit
+	if raw := os.Getenv("AGENT_MODEL_VIOLATION_LIMIT"); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			agentModelViolationLimit = val
+		} else {
+			agentModelViolationLimit = -1
+		}
+	}
+
 	return &Config{
 		GitHubToken:             token,
 		WebhookSecret:           webhookSecret,
@@ -703,5 +815,10 @@ func Load() *Config {
 		DiffMaxBytes:            diffMaxBytes,
 		DiffMaxFiles:            diffMaxFiles,
 		DiffMaxHunks:            diffMaxHunks,
+		AgentMaxTurns:            agentMaxTurns,
+		AgentMaxToolBytes:        agentMaxToolBytes,
+		AgentFileReadBytes:       agentFileReadBytes,
+		AgentSearchMaxMatches:    agentSearchMaxMatches,
+		AgentModelViolationLimit: agentModelViolationLimit,
 	}
 }

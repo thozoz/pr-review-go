@@ -1,6 +1,7 @@
 package reviewer
 
 import (
+	"github.com/thozoz/pr-review-go/pkg/diff"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
@@ -43,4 +44,5 @@ type ReviewReport struct {
 	Findings            []Finding
 	Suggestions         []github.InlineSuggestion
 	RawMarkdown         string
+	Ledger              *diff.CoverageLedger
 }
