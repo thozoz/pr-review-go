@@ -1,6 +1,9 @@
 package reviewer
 
-import "github.com/thozoz/pr-review-go/pkg/github"
+import (
+	"github.com/thozoz/pr-review-go/pkg/github"
+	"github.com/thozoz/pr-review-go/pkg/sandbox"
+)
 
 type Finding struct {
 	File          string `json:"file"`
@@ -32,6 +35,8 @@ type ReviewReport struct {
 	Score               int
 	Summary             string
 	VerificationSummary string
+	VerificationStatus  sandbox.VerificationStatus
+	VerificationReason  string
 	RulesSource         string
 	DeduplicatedCount   int
 	CommentFollowups    []CommentTracking

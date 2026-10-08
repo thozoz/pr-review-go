@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -166,8 +167,16 @@ func TestCommentCommandPermissionAndImproveNotice(t *testing.T) {
 		wantNotice bool
 	}{
 		{"read-only comment denied", "read", http.StatusOK, false},
-		{"permission API failure denied", "", http.StatusNotFound, false},
+		{"triage comment denied", "triage", http.StatusOK, false},
+		{"none permission denied", "none", http.StatusOK, false},
+		{"empty permission denied", "", http.StatusOK, false},
+		{"permission API failure 404 denied", "", http.StatusNotFound, false},
+		{"permission API failure 500 denied", "", http.StatusInternalServerError, false},
+		{"permission API failure 401 denied", "", http.StatusUnauthorized, false},
+		{"permission API failure 403 denied", "", http.StatusForbidden, false},
 		{"writer sees unavailable notice", "write", http.StatusOK, true},
+		{"admin sees unavailable notice", "admin", http.StatusOK, true},
+		{"maintainer sees unavailable notice", "maintain", http.StatusOK, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			notices := make(chan string, 1)
@@ -175,7 +184,7 @@ func TestCommentCommandPermissionAndImproveNotice(t *testing.T) {
 				switch r.URL.Path {
 				case "/repos/org/repo/collaborators/member/permission":
 					if tc.status != http.StatusOK {
-						http.Error(w, "not found", tc.status)
+						http.Error(w, "permission check error", tc.status)
 						return
 					}
 					w.Header().Set("Content-Type", "application/json")
@@ -243,6 +252,59 @@ func TestCommentCommandPermissionAndImproveNotice(t *testing.T) {
 				}
 			case <-time.After(5 * time.Second):
 				t.Error("writer did not receive unavailable notice")
+			}
+		})
+	}
+}
+
+func TestCommentCommands_UnauthorizedCommandsDenied(t *testing.T) {
+	commands := []string{
+		"/review", "/describe", "/update_changelog", "/generate_labels",
+		"/labels", "/summarize", "/summary", "/add_docs", "/docs",
+		"@bot please explain", "/ask how does this work",
+	}
+
+	for _, cmd := range commands {
+		t.Run(cmd, func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/repos/org/repo/collaborators/untrusted/permission" {
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]string{"permission": "read"})
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer api.Close()
+
+			client, err := ghclient.NewTestClient(api.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.Config{GitHubToken: "test-token", LLMAPIKey: "test-key", LLMModel: "test-model", LLMBaseURL: "http://example.invalid", WebhookSecret: "secret"}
+			srv := NewServer(cfg)
+			srv.gh = client
+			dispatched := make(chan string, 1)
+			srv.dispatchHook = func(action, owner, repo string, prNum int) {
+				dispatched <- action
+			}
+
+			payload := []byte(fmt.Sprintf(`{"action":"created","issue":{"number":5,"pull_request":{"url":"https://api.github.com/repos/org/repo/pulls/5"}},"comment":{"body":%q,"user":{"login":"untrusted"}},"repository":{"name":"repo","owner":{"login":"org"}}}`, cmd))
+			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Event", "issue_comment")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Hub-Signature-256", signPayload("secret", payload))
+			rr := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("webhook status = %d, want 200", rr.Code)
+			}
+
+			select {
+			case act := <-dispatched:
+				t.Fatalf("unauthorized user command %q should NOT have dispatched, but dispatched: %s", cmd, act)
+			default:
+				// success: nothing dispatched
 			}
 		})
 	}

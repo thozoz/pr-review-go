@@ -189,15 +189,15 @@ func main() {
 			os.Exit(1)
 		}
 
-		runner := sandbox.NewRunner(0)
-		workDir, cleanup, err := runner.PrepareWorkspace(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+		runner := sandbox.NewPlatformRunner(cfg, ghClient, nil, nil)
+		snap, cleanup, err := runner.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ Failed to prepare workspace: %v\n", err)
+			fmt.Fprintf(os.Stderr, "❌ Failed to prepare snapshot: %v\n", err)
 			os.Exit(1)
 		}
 		defer cleanup()
 
-		items, err := docgen.FindUndocumentedGoItems(workDir)
+		items, err := docgen.FindUndocumentedGoItems(snap.SourceDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to scan for undocumented items: %v\n", err)
 			os.Exit(1)
@@ -210,7 +210,7 @@ func main() {
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("## 📝 Documentation Report: Found %d Undocumented Declarations\n\n", len(items)))
 			for _, it := range items {
-				relPath, _ := filepath.Rel(workDir, it.File)
+				relPath, _ := filepath.Rel(snap.SourceDir, it.File)
 				sb.WriteString(fmt.Sprintf("- `%s` (`%s` in `%s`)\n", it.Name, it.Kind, relPath))
 			}
 			reportText = sb.String()

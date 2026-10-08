@@ -25,12 +25,17 @@ func NewEngine(cfg *config.Config) *Engine {
 	if err := cfg.Validate(); err != nil {
 		panic(fmt.Sprintf("invalid config: %v", err))
 	}
+	gh := github.NewClientFromConfig(cfg)
 	return &Engine{
 		cfg:     cfg,
-		gh:      github.NewClientFromConfig(cfg),
-		sandbox: sandbox.NewRunner(0),
+		gh:      gh,
+		sandbox: sandbox.NewPlatformRunner(cfg, gh, nil, nil),
 		llm:     llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
+}
+
+func (e *Engine) SetSandbox(s *sandbox.Runner) {
+	e.sandbox = s
 }
 
 func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (*ReviewReport, error) {
@@ -60,15 +65,26 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 
 	// 4. Sandbox Verification (Optional/Configurable)
 	var verificationSummary = "Sandbox verification skipped."
+	var verificationStatus sandbox.VerificationStatus = sandbox.StatusUnavailable
+	var verificationReason string
 	sandboxVerified := false
-	if e.cfg.EnableSandbox {
-		workDir, cleanup, err := e.sandbox.PrepareWorkspace(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+	if e.cfg.EnableSandbox && e.sandbox != nil {
+		snapshot, cleanup, err := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 		if err == nil {
 			defer cleanup()
-			verReport, err := e.sandbox.VerifyProject(ctx, workDir)
+			verReport, err := e.sandbox.RunSnapshot(ctx, snapshot)
 			if err == nil {
+				verificationStatus = verReport.Status
+				verificationReason = verReport.Reason
 				verificationSummary = verReport.Summary
-				sandboxVerified = len(verReport.Results) > 0
+				if verReport.Status == sandbox.StatusPassed {
+					sandboxVerified = true
+				} else {
+					sandboxVerified = false
+					if verReport.Reason != "" {
+						verificationSummary = fmt.Sprintf("[%s] %s: %s", verReport.Status, verReport.Summary, verReport.Reason)
+					}
+				}
 				// If tests or build failed, append stderr/stdout snippet
 				for _, res := range verReport.Results {
 					if !res.Passed {
@@ -77,15 +93,21 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 							res.Command, res.ExitCode, res.Stdout, res.Stderr)
 					}
 				}
+			} else {
+				verificationStatus = sandbox.StatusUnavailable
+				verificationReason = err.Error()
+				verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
 			}
 		} else {
-			verificationSummary = fmt.Sprintf("Sandbox checkout failed: %v", err)
+			verificationStatus = sandbox.StatusUnavailable
+			verificationReason = err.Error()
+			verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
 		}
 	}
 
 	// 5. Build Prompts
-	systemPrompt := buildSystemPrompt(sandboxVerified)
-	userPrompt := buildUserPrompt(pr, diff, generalComments, threads, verificationSummary, sandboxVerified)
+	systemPrompt := buildSystemPrompt(verificationStatus)
+	userPrompt := buildUserPrompt(pr, diff, generalComments, threads, verificationSummary, verificationStatus)
 
 	// 6. Call LLM
 	rawResponse, err := e.llm.ChatCompletion(ctx, systemPrompt, userPrompt)
@@ -129,6 +151,8 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 		Score:               parsed.Score,
 		Summary:             parsed.Summary,
 		VerificationSummary: verificationSummary,
+		VerificationStatus:  verificationStatus,
+		VerificationReason:  verificationReason,
 		RulesSource:         "",
 		DeduplicatedCount:   skippedCount,
 		CommentFollowups:    parsed.CommentFollowups,
@@ -142,8 +166,26 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	return report, nil
 }
 
-func buildSystemPrompt(sandboxVerified bool) string {
-	if sandboxVerified {
+func parseVerificationStatus(status any) sandbox.VerificationStatus {
+	switch v := status.(type) {
+	case bool:
+		if v {
+			return sandbox.StatusPassed
+		}
+		return sandbox.StatusUnavailable
+	case sandbox.VerificationStatus:
+		return v
+	case string:
+		return sandbox.VerificationStatus(v)
+	default:
+		return sandbox.StatusUnavailable
+	}
+}
+
+func buildSystemPrompt(status any) string {
+	st := parseVerificationStatus(status)
+	switch st {
+	case sandbox.StatusPassed:
 		return `You are an elite, highly rigorous AI Code Reviewer.
 Your role is to analyze Pull Requests by combining three critical signals:
 1. Live Sandbox Verification (did the code compile, did tests pass in a real runner).
@@ -157,9 +199,77 @@ CRITICAL RULES:
 - Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
 - Set suggested_code only when it is a small, exact, safe replacement for one changed line. It must be compatible with verified sandbox results. Otherwise omit it.
 - Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
-	}
 
-	return `You are an elite, highly rigorous AI Code Reviewer.
+	case sandbox.StatusBuildFailed, sandbox.StatusTestFailed:
+		return `You are an elite, highly rigorous AI Code Reviewer.
+Your role is to analyze Pull Requests by combining three critical signals:
+1. Live Sandbox Verification (the code was executed in a real isolated runner and FAILED).
+2. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
+3. The Git Diff.
+
+NOTE: Real live sandbox verification was executed and encountered failures. Do not claim or assume tests passed.
+
+CRITICAL RULES:
+- Never hallucinate false bugs. Live sandbox verification proved real failure (compilation or unit tests). Accurately focus on verified build/test defects.
+- Do not claim builds or tests passed when live sandbox verification reported failure.
+- If an existing discussion thread shows a concern was already acknowledged, discussed, or dismissed by the author/reviewer, DO NOT repeat it as a new issue.
+- If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.
+- Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
+- Set suggested_code only when it is a small, exact, safe replacement for one changed line. Otherwise omit it.
+- Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
+
+	case sandbox.StatusTimeout:
+		return `You are an elite, highly rigorous AI Code Reviewer.
+Your role is to analyze Pull Requests by combining three critical signals:
+1. Live Sandbox Verification (execution exceeded time limits and timed out).
+2. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
+3. The Git Diff.
+
+NOTE: Live sandbox verification timed out (exceeded execution budget). Do not claim tests passed.
+
+CRITICAL RULES:
+- Never hallucinate false bugs. Do not claim builds or tests passed when execution timed out.
+- If an existing discussion thread shows a concern was already acknowledged, discussed, or dismissed by the author/reviewer, DO NOT repeat it as a new issue.
+- If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.
+- Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
+- Set suggested_code only when it is a small, exact, safe replacement for one changed line. Otherwise omit it.
+- Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
+
+	case sandbox.StatusResourceExhausted, sandbox.StatusDiskExhausted:
+		return `You are an elite, highly rigorous AI Code Reviewer.
+Your role is to analyze Pull Requests by combining three critical signals:
+1. Live Sandbox Verification (execution exceeded memory or storage quota).
+2. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
+3. The Git Diff.
+
+NOTE: Live sandbox verification exceeded resource limits. Do not claim tests passed.
+
+CRITICAL RULES:
+- Never hallucinate false bugs. Do not claim builds or tests passed when resource limits were exceeded.
+- If an existing discussion thread shows a concern was already acknowledged, discussed, or dismissed by the author/reviewer, DO NOT repeat it as a new issue.
+- If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.
+- Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
+- Set suggested_code only when it is a small, exact, safe replacement for one changed line. Otherwise omit it.
+- Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
+
+	case sandbox.StatusIncomplete:
+		return `You are an elite, highly rigorous AI Code Reviewer.
+Your role is to analyze Pull Requests by combining two critical signals:
+1. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
+2. The Git Diff.
+
+NOTE: Live sandbox verification was incomplete (unsupported dependencies, missing toolchain, or missing credentials). Do not claim or assume verification succeeded.
+
+CRITICAL RULES:
+- Never hallucinate false bugs. Do not claim builds or tests ran to completion or passed when verification was incomplete.
+- If an existing discussion thread shows a concern was already acknowledged, discussed, or dismissed by the author/reviewer, DO NOT repeat it as a new issue.
+- If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.
+- Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
+- Set suggested_code only when it is a small, exact, safe replacement for one changed line. Otherwise omit it.
+- Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
+
+	default:
+		return `You are an elite, highly rigorous AI Code Reviewer.
 Your role is to analyze Pull Requests by combining two critical signals:
 1. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
 2. The Git Diff.
@@ -173,9 +283,10 @@ CRITICAL RULES:
 - Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
 - Set suggested_code only when it is a small, exact, safe replacement for one changed line. Otherwise omit it.
 - Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
+	}
 }
 
-func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Comment, threads []github.DiscussionThread, verification string, sandboxVerified bool) string {
+func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Comment, threads []github.DiscussionThread, verification string, status any) string {
 	var b strings.Builder
 
 	b.WriteString(fmt.Sprintf("## PR Info\nTitle: %s\nAuthor: %s\nBase Branch: %s\nHead Branch: %s\n\n",
@@ -185,9 +296,21 @@ func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Commen
 		b.WriteString(fmt.Sprintf("### PR Description:\n%s\n\n", pr.Body))
 	}
 
-	if sandboxVerified {
+	st := parseVerificationStatus(status)
+	switch st {
+	case sandbox.StatusPassed:
 		b.WriteString("### Real Sandbox Environment Verification:\n")
-	} else {
+	case sandbox.StatusBuildFailed, sandbox.StatusTestFailed:
+		b.WriteString("### Real Sandbox Environment Verification (Failed):\n")
+	case sandbox.StatusTimeout:
+		b.WriteString("### Real Sandbox Environment Verification (Timeout):\n")
+	case sandbox.StatusDiskExhausted, sandbox.StatusResourceExhausted:
+		b.WriteString("### Real Sandbox Environment Verification (Resource Exhausted):\n")
+	case sandbox.StatusIncomplete:
+		b.WriteString("### Sandbox Verification (Incomplete):\n")
+	case sandbox.StatusUnsupportedLanguage:
+		b.WriteString("### Sandbox Verification (Unsupported Language):\n")
+	default:
 		b.WriteString("### Sandbox Verification (Skipped / Unavailable):\n")
 	}
 	b.WriteString(verification + "\n\n")

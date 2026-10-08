@@ -2,11 +2,14 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/thozoz/pr-review-go/pkg/github"
 )
 
 func TestVerifyProject_GoProject_SkipsExecutionWithoutContainerIsolation(t *testing.T) {
@@ -143,3 +146,245 @@ func TestVerifyProject_GenericProject(t *testing.T) {
 		t.Errorf("unexpected summary: %q", report.Summary)
 	}
 }
+
+func TestPrepareWorkspace_ReturnsUnavailableWithoutHostGit(t *testing.T) {
+	runner := NewRunner(10 * time.Second)
+	ctx := context.Background()
+
+	_, _, err := runner.PrepareWorkspace(ctx, "https://github.com/example/repo.git", "main", "0123456789abcdef0123456789abcdef01234567")
+	if err == nil {
+		t.Fatalf("expected error from PrepareWorkspace, got nil")
+	}
+	if !errors.Is(err, ErrSourceProviderUnavailable) {
+		t.Fatalf("expected ErrSourceProviderUnavailable, got: %v", err)
+	}
+}
+
+func TestSnapshotValidation_RejectsMalformedAndPrefixSHAs(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	testCases := []struct {
+		name      string
+		commitSHA string
+		dir       string
+		wantErr   bool
+	}{
+		{
+			name:      "empty SHA",
+			commitSHA: "",
+			dir:       tmpDir,
+			wantErr:   true,
+		},
+		{
+			name:      "short prefix SHA (7 chars)",
+			commitSHA: "abcdef0",
+			dir:       tmpDir,
+			wantErr:   true,
+		},
+		{
+			name:      "39 chars SHA",
+			commitSHA: "0123456789abcdef0123456789abcdef0123456",
+			dir:       tmpDir,
+			wantErr:   true,
+		},
+		{
+			name:      "40 chars non-hex SHA",
+			commitSHA: "0123456789abcdef0123456789abcdef0123456g",
+			dir:       tmpDir,
+			wantErr:   true,
+		},
+		{
+			name:      "nonexistent directory",
+			commitSHA: "0123456789abcdef0123456789abcdef01234567",
+			dir:       filepath.Join(tmpDir, "nonexistent"),
+			wantErr:   true,
+		},
+		{
+			name:      "valid 40 chars SHA",
+			commitSHA: "0123456789abcdef0123456789abcdef01234567",
+			dir:       tmpDir,
+			wantErr:   false,
+		},
+		{
+			name:      "valid 64 chars SHA",
+			commitSHA: "0123456789abcdef0123456789abcdef012345670123456789abcdef01234567",
+			dir:       tmpDir,
+			wantErr:   false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Snapshot{
+				CommitSHA: tc.commitSHA,
+				SourceDir: tc.dir,
+			}
+			err := s.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestSnapshotValidation_RejectsEscapingSymlinks(t *testing.T) {
+	outsideDir := t.TempDir()
+	sourceDir := t.TempDir()
+
+	targetFile := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(targetFile, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create symlink inside sourceDir pointing outside
+	linkPath := filepath.Join(sourceDir, "escape-link")
+	if err := os.Symlink(targetFile, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Snapshot{
+		CommitSHA: "0123456789abcdef0123456789abcdef01234567",
+		SourceDir: sourceDir,
+	}
+
+	err := s.Validate()
+	if err == nil {
+		t.Fatalf("expected error for escaping symlink, got nil")
+	}
+	if !strings.Contains(err.Error(), "escaping symlink") {
+		t.Fatalf("expected escaping symlink error, got: %v", err)
+	}
+}
+
+func TestVerifyProject_GoProject_ReportsIncompleteForUnvendoredDependencies(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	goModContent := "module example.com/testmod\n\ngo 1.22\n\nrequire github.com/example/external v1.0.0\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte(goModContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunnerWithConfig(nil, nil, nil)
+	report, err := runner.VerifyProject(context.Background(), tmpDir)
+	if err != nil {
+		t.Fatalf("VerifyProject failed: %v", err)
+	}
+
+	if report.Status != StatusIncomplete {
+		t.Errorf("expected StatusIncomplete, got %q", report.Status)
+	}
+	if !strings.Contains(report.Reason, "external dependencies require network gateway") {
+		t.Errorf("expected gateway reason, got: %q", report.Reason)
+	}
+}
+
+func TestCustomRules_BoundedHandleStreaming_Truncation(t *testing.T) {
+	tmpDir := t.TempDir()
+	largeRules := strings.Repeat("Rule line here\n", 2000) // ~30,000 bytes
+	if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(largeRules), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(0)
+	report := &VerificationReport{}
+	runner.extractCustomRules(tmpDir, report)
+
+	if !strings.Contains(report.CustomRules, "...[instructions truncated]...") {
+		t.Fatalf("expected custom rules to be truncated, got length %d", len(report.CustomRules))
+	}
+	if len(report.CustomRules) > 15100 {
+		t.Errorf("expected custom rules to be bounded near 15000 bytes, got %d", len(report.CustomRules))
+	}
+	if report.RulesSource != "AGENTS.md" {
+		t.Errorf("expected RulesSource AGENTS.md, got %q", report.RulesSource)
+	}
+}
+
+func TestCustomRules_EscapingSymlinkDenied(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	outsideDir := filepath.Join(baseDir, "outside")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	outsideRules := filepath.Join(outsideDir, "secret-rules.md")
+	if err := os.WriteFile(outsideRules, []byte("secret guidelines"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	linkPath := filepath.Join(workDir, "AGENTS.md")
+	if err := os.Symlink(outsideRules, linkPath); err != nil {
+		t.Skipf("skipping test: symlinks not supported on platform: %v", err)
+	}
+
+	runner := NewRunner(0)
+	report := &VerificationReport{}
+	runner.extractCustomRules(workDir, report)
+
+	if report.CustomRules != "" {
+		t.Fatalf("VULNERABILITY: custom rules extracted from escaping symlink: %q", report.CustomRules)
+	}
+}
+
+func TestPlatform_NewPlatformRunner_ConfiguresSourceProvider(t *testing.T) {
+	ghClient, _ := github.NewTestClient("https://github.com")
+	runner := NewPlatformRunner(nil, ghClient, nil, nil)
+
+	if runner.SourceProvider == nil {
+		t.Fatalf("expected SourceProvider to be configured on NewPlatformRunner")
+	}
+
+	apiSource, ok := runner.SourceProvider.(*APISnapshotSource)
+	if !ok {
+		t.Fatalf("expected APISnapshotSource, got %T", runner.SourceProvider)
+	}
+	if apiSource.Client != ghClient {
+		t.Errorf("expected ghClient to be preserved on APISnapshotSource")
+	}
+}
+
+func TestCustomRules_SwapAfterOpenDoesNotLeakSecret(t *testing.T) {
+	baseDir := t.TempDir()
+	workDir := filepath.Join(baseDir, "workspace")
+	outsideDir := filepath.Join(baseDir, "outside")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	outsideSecret := filepath.Join(outsideDir, "secret-rules.md")
+	secretContent := "super-secret-rules-token"
+	if err := os.WriteFile(outsideSecret, []byte(secretContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	victimFile := filepath.Join(workDir, "AGENTS.md")
+	benignContent := "# Benign Guidelines\nFollow rules."
+	if err := os.WriteFile(victimFile, []byte(benignContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := NewRunner(0)
+	report := &VerificationReport{}
+	runner.extractCustomRules(workDir, report)
+	if report.CustomRules != benignContent {
+		t.Fatalf("expected initial benign rules, got %q", report.CustomRules)
+	}
+
+	// Swap victim file with symlink to outside secret
+	_ = os.Remove(victimFile)
+	if err := os.Symlink(outsideSecret, victimFile); err == nil {
+		swappedReport := &VerificationReport{}
+		runner.extractCustomRules(workDir, swappedReport)
+		if strings.Contains(swappedReport.CustomRules, secretContent) {
+			t.Fatalf("VULNERABILITY: read outside secret after swap: %s", swappedReport.CustomRules)
+		}
+	}
+}
+

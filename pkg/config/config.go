@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -26,7 +27,32 @@ type Config struct {
 	PublicURL               string
 	GitHubAppID             int64
 	GitHubAppPrivateKeyPath string
+
+	// Sandbox resource and isolation controls
+	SandboxCPUs             float64       `json:"sandbox_cpus"`
+	SandboxMemoryBytes      int64         `json:"sandbox_memory_bytes"`
+	SandboxPidsLimit        int64         `json:"sandbox_pids_limit"`
+	SandboxDiskBytes        int64         `json:"sandbox_disk_bytes"`
+	SandboxTimeoutSource    time.Duration `json:"sandbox_timeout_source"`
+	SandboxTimeoutPrep      time.Duration `json:"sandbox_timeout_prep"`
+	SandboxTimeoutExecution time.Duration `json:"sandbox_timeout_execution"`
+	SandboxTimeoutCleanup   time.Duration `json:"sandbox_timeout_cleanup"`
+	SandboxImage            string        `json:"sandbox_image"`
+	SandboxSlotDir          string        `json:"sandbox_slot_dir"`
+	SandboxControlDir       string        `json:"sandbox_control_dir"`
 }
+
+const (
+	DefaultSandboxCPUs             = 2.0
+	DefaultSandboxMemoryBytes      = 2147483648 // 2 GiB
+	DefaultSandboxPidsLimit        = 256
+	DefaultSandboxDiskBytes        = 3221225472 // 3 GiB fixed fallback
+	MaxSandboxDiskBytes            = 3221225472 // 3 GiB maximum enforced
+	DefaultSandboxTimeoutSource    = 2 * time.Minute
+	DefaultSandboxTimeoutPrep      = 3 * time.Minute
+	DefaultSandboxTimeoutExecution = 5 * time.Minute
+	DefaultSandboxTimeoutCleanup   = 15 * time.Second
+)
 
 // Validate checks if required configuration is present and validates EffortLevel
 func (c *Config) Validate() error {
@@ -70,6 +96,77 @@ func (c *Config) Validate() error {
 	if c.LLMBaseURL == "" {
 		return fmt.Errorf("LLM_BASE_URL is required")
 	}
+
+	if c.EnableSandbox {
+		if err := c.ValidateSandboxResources(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidateSandboxResources validates and defaults sandbox CPU, memory, pids, disk, and timeout settings.
+func (c *Config) ValidateSandboxResources() error {
+	if c.SandboxCPUs == 0 {
+		c.SandboxCPUs = DefaultSandboxCPUs
+	}
+	if c.SandboxCPUs <= 0 {
+		return fmt.Errorf("invalid SandboxCPUs: %v (must be positive)", c.SandboxCPUs)
+	}
+
+	if c.SandboxMemoryBytes == 0 {
+		c.SandboxMemoryBytes = DefaultSandboxMemoryBytes
+	}
+	if c.SandboxMemoryBytes <= 0 {
+		return fmt.Errorf("invalid SandboxMemoryBytes: %d (must be positive)", c.SandboxMemoryBytes)
+	}
+
+	if c.SandboxPidsLimit == 0 {
+		c.SandboxPidsLimit = DefaultSandboxPidsLimit
+	}
+	if c.SandboxPidsLimit <= 0 {
+		return fmt.Errorf("invalid SandboxPidsLimit: %d (must be positive)", c.SandboxPidsLimit)
+	}
+
+	if c.SandboxDiskBytes == 0 {
+		c.SandboxDiskBytes = DefaultSandboxDiskBytes
+	}
+	if c.SandboxDiskBytes <= 0 {
+		return fmt.Errorf("invalid SandboxDiskBytes: %d (must be positive)", c.SandboxDiskBytes)
+	}
+	if c.SandboxDiskBytes > MaxSandboxDiskBytes {
+		return fmt.Errorf("invalid SandboxDiskBytes: %d exceeds maximum 3 GiB limit (%d bytes)", c.SandboxDiskBytes, MaxSandboxDiskBytes)
+	}
+
+	if c.SandboxTimeoutSource == 0 {
+		c.SandboxTimeoutSource = DefaultSandboxTimeoutSource
+	}
+	if c.SandboxTimeoutSource <= 0 {
+		return fmt.Errorf("invalid SandboxTimeoutSource: %v (must be positive)", c.SandboxTimeoutSource)
+	}
+
+	if c.SandboxTimeoutPrep == 0 {
+		c.SandboxTimeoutPrep = DefaultSandboxTimeoutPrep
+	}
+	if c.SandboxTimeoutPrep <= 0 {
+		return fmt.Errorf("invalid SandboxTimeoutPrep: %v (must be positive)", c.SandboxTimeoutPrep)
+	}
+
+	if c.SandboxTimeoutExecution == 0 {
+		c.SandboxTimeoutExecution = DefaultSandboxTimeoutExecution
+	}
+	if c.SandboxTimeoutExecution <= 0 {
+		return fmt.Errorf("invalid SandboxTimeoutExecution: %v (must be positive)", c.SandboxTimeoutExecution)
+	}
+
+	if c.SandboxTimeoutCleanup == 0 {
+		c.SandboxTimeoutCleanup = DefaultSandboxTimeoutCleanup
+	}
+	if c.SandboxTimeoutCleanup <= 0 {
+		return fmt.Errorf("invalid SandboxTimeoutCleanup: %v (must be positive)", c.SandboxTimeoutCleanup)
+	}
+
 	return nil
 }
 
@@ -141,6 +238,83 @@ func Load() *Config {
 		}
 	}
 
+	sandboxCPUs := DefaultSandboxCPUs
+	if raw := os.Getenv("SANDBOX_CPUS"); raw != "" {
+		if val, err := strconv.ParseFloat(raw, 64); err == nil {
+			sandboxCPUs = val
+		} else {
+			sandboxCPUs = -1
+		}
+	}
+
+	sandboxMemoryBytes := int64(DefaultSandboxMemoryBytes)
+	if raw := os.Getenv("SANDBOX_MEMORY_BYTES"); raw != "" {
+		if val, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			sandboxMemoryBytes = val
+		} else {
+			sandboxMemoryBytes = -1
+		}
+	}
+
+	sandboxPidsLimit := int64(DefaultSandboxPidsLimit)
+	if raw := os.Getenv("SANDBOX_PIDS_LIMIT"); raw != "" {
+		if val, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			sandboxPidsLimit = val
+		} else {
+			sandboxPidsLimit = -1
+		}
+	}
+
+	sandboxDiskBytes := int64(DefaultSandboxDiskBytes)
+	if raw := os.Getenv("SANDBOX_DISK_BYTES"); raw != "" {
+		if val, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			sandboxDiskBytes = val
+		} else {
+			sandboxDiskBytes = -1
+		}
+	}
+
+	sandboxTimeoutSource := DefaultSandboxTimeoutSource
+	if raw := os.Getenv("SANDBOX_TIMEOUT_SOURCE"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			sandboxTimeoutSource = d
+		} else {
+			sandboxTimeoutSource = -1
+		}
+	}
+
+	sandboxTimeoutPrep := DefaultSandboxTimeoutPrep
+	if raw := os.Getenv("SANDBOX_TIMEOUT_PREP"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			sandboxTimeoutPrep = d
+		} else {
+			sandboxTimeoutPrep = -1
+		}
+	}
+
+	sandboxTimeoutExecution := DefaultSandboxTimeoutExecution
+	if raw := os.Getenv("SANDBOX_TIMEOUT_EXECUTION"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			sandboxTimeoutExecution = d
+		} else {
+			sandboxTimeoutExecution = -1
+		}
+	}
+
+	sandboxTimeoutCleanup := DefaultSandboxTimeoutCleanup
+	if raw := os.Getenv("SANDBOX_TIMEOUT_CLEANUP"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil {
+			sandboxTimeoutCleanup = d
+		} else {
+			sandboxTimeoutCleanup = -1
+		}
+	}
+
+	sandboxControlDir := os.Getenv("SANDBOX_CONTROL_DIR")
+	if sandboxControlDir == "" {
+		sandboxControlDir = "/tmp/pr-review-sandbox-control"
+	}
+
 	return &Config{
 		GitHubToken:             token,
 		WebhookSecret:           webhookSecret,
@@ -155,5 +329,16 @@ func Load() *Config {
 		PublicURL:               publicURL,
 		GitHubAppID:             appID,
 		GitHubAppPrivateKeyPath: os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
+		SandboxCPUs:             sandboxCPUs,
+		SandboxMemoryBytes:      sandboxMemoryBytes,
+		SandboxPidsLimit:        sandboxPidsLimit,
+		SandboxDiskBytes:        sandboxDiskBytes,
+		SandboxTimeoutSource:    sandboxTimeoutSource,
+		SandboxTimeoutPrep:      sandboxTimeoutPrep,
+		SandboxTimeoutExecution: sandboxTimeoutExecution,
+		SandboxTimeoutCleanup:   sandboxTimeoutCleanup,
+		SandboxImage:            os.Getenv("SANDBOX_IMAGE"),
+		SandboxSlotDir:          os.Getenv("SANDBOX_SLOT_DIR"),
+		SandboxControlDir:       sandboxControlDir,
 	}
 }

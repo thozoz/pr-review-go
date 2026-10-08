@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/github"
@@ -26,12 +25,19 @@ type Assistant struct {
 }
 
 func NewAssistant(cfg *config.Config) *Assistant {
+	gh := github.NewClientFromConfig(cfg)
+	runner := sandbox.NewPlatformRunner(cfg, gh, nil, nil)
 	return &Assistant{
 		cfg:     cfg,
-		gh:      github.NewClientFromConfig(cfg),
-		sandbox: sandbox.NewRunner(2 * time.Minute),
+		gh:      gh,
+		sandbox: runner,
 		llm:     llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
+}
+
+// SetRunner injects a configured runner for testing or custom environments.
+func (a *Assistant) SetRunner(r *sandbox.Runner) {
+	a.sandbox = r
 }
 
 type ToolCallRequest struct {
@@ -47,12 +53,13 @@ func (a *Assistant) HandleMention(ctx context.Context, owner, repo string, numbe
 		return "", fmt.Errorf("failed to get PR: %w", err)
 	}
 
-	// Prepare sandbox workspace
-	workDir, cleanup, err := a.sandbox.PrepareWorkspace(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+	// Prepare sealed sandbox snapshot
+	snapshot, cleanup, err := a.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 	if err != nil {
-		return "", fmt.Errorf("failed to prepare sandbox workspace: %w", err)
+		return "", fmt.Errorf("failed to prepare sandbox snapshot: %w", err)
 	}
 	defer cleanup()
+	workDir := snapshot.SourceDir
 
 	systemPrompt := `You are an AI Coding Assistant operating on a Git Pull Request.
 You can inspect code, review changes, suggest fixes, and answer questions about the PR.
@@ -64,7 +71,7 @@ AVAILABLE ACTIONS:
 
 GENERAL AGENT RULES:
 - Inspect relevant files to answer questions, diagnose issues, or suggest fixes.
-- Direct command execution, file modifications, and automated git push are disabled because the assistant is read-only and the current environment lacks container isolation.
+- Direct command execution, file modifications, and automated git push are disabled because the assistant is strictly read-only in Phase 1.
 - You can make up to 6 iterative tool steps before providing your final answer.
 - Output MUST be a single strict JSON object matching: {"action": "...", ...}
 - Never include markdown codeblocks surrounding your JSON tool calls.`
@@ -120,7 +127,7 @@ func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolC
 		return content
 
 	case "write_file":
-		return "Error: write_file is disabled: the assistant is read-only and file modifications are not permitted."
+		return "Error: write_file is disabled: the assistant is strictly read-only and file modifications are not permitted."
 
 	case "list_files":
 		p := step.Path
@@ -137,10 +144,10 @@ func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolC
 		return listing
 
 	case "run_command":
-		return "Error: run_command is disabled: host command execution is not permitted without container isolation."
+		return "Error: run_command is disabled: host command execution is not permitted without container isolation; assistant remains read-only in Phase 1."
 
 	case "commit_and_push":
-		return "Error: commit_and_push is disabled: git operations are not permitted without container isolation."
+		return "Error: commit_and_push is disabled: git operations are not permitted without container isolation; assistant remains read-only in Phase 1."
 
 	default:
 		return fmt.Sprintf("Unknown action: %s", step.Action)

@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +27,41 @@ import (
 )
 
 const githubAPIURL = "https://api.github.com"
+
+var (
+	ErrRetrievalAuthUnavailable = errors.New("retrieval credentials unavailable: GitHub App authentication is required for scoped private source retrieval, PAT substitution is forbidden (D-10)")
+	ErrInvalidRepoID            = errors.New("invalid or empty repository ID")
+	ErrScopeTooBroad            = errors.New("retrieval credential scope too broad or unverified")
+)
+
+// RetrievalCredential holds a short-lived, least-privilege App token scoped to exactly one
+// head repository with contents:read permission for private source retrieval (D-10, SAFE-01).
+type RetrievalCredential struct {
+	Token        string            `json:"token"`
+	ExpiresAt    time.Time         `json:"expires_at"`
+	RepositoryID int64             `json:"repository_id"`
+	RepoOwner    string            `json:"repo_owner"`
+	RepoName     string            `json:"repo_name"`
+	Permissions  map[string]string `json:"permissions"`
+	revoked      bool
+}
+
+// Zeroize securely wipes the token from memory.
+func (c *RetrievalCredential) Zeroize() {
+	if c == nil {
+		return
+	}
+	c.Token = ""
+	c.revoked = true
+}
+
+// IsRevoked returns true if the credential has been revoked or zeroized.
+func (c *RetrievalCredential) IsRevoked() bool {
+	if c == nil {
+		return true
+	}
+	return c.revoked || c.Token == ""
+}
 
 // AppAuth manages repository-scoped GitHub App installation authentication.
 // It resolves installations per requested repository (rather than globally caching
@@ -269,6 +306,165 @@ func (a *AppAuth) createInstallationToken(ctx context.Context, installationID in
 		TokenType:   "Bearer",
 		Expiry:      expiry,
 	}, nil
+}
+
+// CreateRetrievalCredential requests an uncached, short-lived GitHub App installation token
+// restricted to exactly one head repository ID with contents:read permission (D-10, SAFE-01).
+// It verifies the returned token expiry, scope, and repository selection, rejecting broader or
+// unverifiable credentials. It does not alter the cached review client tokens in a.repos.
+func (a *AppAuth) CreateRetrievalCredential(ctx context.Context, owner, repo string, repoID int64) (*RetrievalCredential, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	if owner == "" || repo == "" {
+		return nil, fmt.Errorf("owner and repo must not be empty for retrieval credential")
+	}
+	if repoID <= 0 {
+		return nil, fmt.Errorf("%w: repository ID must be positive, got %d", ErrInvalidRepoID, repoID)
+	}
+
+	installationID, err := a.getRepoInstallationID(ctx, owner, repo)
+	if err != nil {
+		return nil, fmt.Errorf("get installation for %s/%s: %w", owner, repo, err)
+	}
+
+	jwt, err := a.getJWT()
+	if err != nil {
+		return nil, fmt.Errorf("generate jwt: %w", err)
+	}
+
+	tokenURL := fmt.Sprintf("%s/app/installations/%d/access_tokens", a.apiURL(), installationID)
+
+	requestBody := map[string]any{
+		"repository_ids": []int64{repoID},
+		"permissions": map[string]string{
+			"contents": "read",
+		},
+	}
+	bodyBytes, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal access token request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create access token request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request access token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("failed to create retrieval access token for installation %d (status %d): %s", installationID, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result struct {
+		Token               string            `json:"token"`
+		ExpiresAt           time.Time         `json:"expires_at"`
+		Permissions         map[string]string `json:"permissions"`
+		RepositorySelection string            `json:"repository_selection"`
+		Repositories        []struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+		} `json:"repositories"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode retrieval access token response: %w", err)
+	}
+
+	if result.Token == "" {
+		return nil, fmt.Errorf("empty access token returned for retrieval credential")
+	}
+
+	if result.ExpiresAt.IsZero() {
+		return nil, fmt.Errorf("zero expiry returned for retrieval credential")
+	}
+	if !result.ExpiresAt.After(time.Now()) {
+		return nil, fmt.Errorf("returned token already expired: %v", result.ExpiresAt)
+	}
+
+	// Verify permissions strictly: exactly contents:read, no other permissions (SAFE-01)
+	if len(result.Permissions) == 0 {
+		return nil, fmt.Errorf("%w: missing permissions in token response", ErrScopeTooBroad)
+	}
+	for perm, val := range result.Permissions {
+		if perm != "contents" {
+			return nil, fmt.Errorf("%w: token contains extra permission %q", ErrScopeTooBroad, perm)
+		}
+		if val != "read" {
+			return nil, fmt.Errorf("%w: contents permission is %q (only read permitted)", ErrScopeTooBroad, val)
+		}
+	}
+	if result.Permissions["contents"] != "read" {
+		return nil, fmt.Errorf("%w: contents:read permission missing", ErrScopeTooBroad)
+	}
+
+	// Verify repository selection: must not be "all"
+	if result.RepositorySelection != "" && result.RepositorySelection != "selected" {
+		return nil, fmt.Errorf("%w: unsupported repository_selection %q", ErrScopeTooBroad, result.RepositorySelection)
+	}
+
+	// If repositories are returned, ensure exactly one and matches repoID
+	if len(result.Repositories) > 0 {
+		if len(result.Repositories) != 1 {
+			return nil, fmt.Errorf("%w: granted access to %d repositories, expected 1", ErrScopeTooBroad, len(result.Repositories))
+		}
+		if result.Repositories[0].ID != repoID {
+			return nil, fmt.Errorf("%w: granted repository ID %d mismatch expected %d", ErrScopeTooBroad, result.Repositories[0].ID, repoID)
+		}
+	}
+
+	return &RetrievalCredential{
+		Token:        result.Token,
+		ExpiresAt:    result.ExpiresAt,
+		RepositoryID: repoID,
+		RepoOwner:    owner,
+		RepoName:     repo,
+		Permissions:  result.Permissions,
+	}, nil
+}
+
+// RevokeRetrievalCredential revokes the short-lived installation access token via DELETE /installation/token
+// and wipes the token string from memory (D-10, D-11).
+func (a *AppAuth) RevokeRetrievalCredential(ctx context.Context, cred *RetrievalCredential) error {
+	if cred == nil {
+		return nil
+	}
+	token := cred.Token
+	defer cred.Zeroize()
+
+	if token == "" || cred.revoked {
+		return nil
+	}
+
+	revokeURL := fmt.Sprintf("%s/installation/token", a.apiURL())
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, revokeURL, nil)
+	if err != nil {
+		return fmt.Errorf("create revoke request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("revoke access token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("failed to revoke access token (status %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	return nil
 }
 
 func (a *AppAuth) evictEntry(repoKey string, entry *repoEntry) {

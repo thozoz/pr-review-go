@@ -297,15 +297,15 @@ func (s *Server) dispatchAddDocs(owner, repo string, prNum int) {
 		return
 	}
 
-	runner := sandbox.NewRunner(0)
-	workDir, cleanup, err := runner.PrepareWorkspace(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+	runner := sandbox.NewPlatformRunner(s.cfg, s.gh, nil, nil)
+	snap, cleanup, err := runner.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 	if err != nil {
-		log.Printf("[docgen] Failed to checkout workspace for %s/%s #%d: %v", owner, repo, prNum, err)
+		log.Printf("[docgen] Failed to prepare snapshot for %s/%s #%d: %v", owner, repo, prNum, err)
 		return
 	}
 	defer cleanup()
 
-	items, err := docgen.FindUndocumentedGoItems(workDir)
+	items, err := docgen.FindUndocumentedGoItems(snap.SourceDir)
 	if err != nil {
 		log.Printf("[docgen] Failed scanning %s/%s #%d: %v", owner, repo, prNum, err)
 		return
@@ -318,7 +318,7 @@ func (s *Server) dispatchAddDocs(owner, repo string, prNum int) {
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("## 📝 Documentation Report: Found %d Undocumented Declarations\n\n", len(items)))
 		for _, it := range items {
-			relPath, _ := filepath.Rel(workDir, it.File)
+			relPath, _ := filepath.Rel(snap.SourceDir, it.File)
 			sb.WriteString(fmt.Sprintf("- `%s` (`%s` in `%s`)\n", it.Name, it.Kind, relPath))
 		}
 		reportText = sb.String()
