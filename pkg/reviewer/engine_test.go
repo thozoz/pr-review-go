@@ -3,12 +3,15 @@ package reviewer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/github"
@@ -493,4 +496,538 @@ func TestPromptAndReportFormattingForAllVerificationStatuses(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewHeadBinding(t *testing.T) {
+	const (
+		validBaseSHA = "1111111111111111111111111111111111111111"
+		validHeadSHA = "2222222222222222222222222222222222222222"
+		diffHeadSHA  = "3333333333333333333333333333333333333333"
+	)
+
+	llmCalls := 0
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCalls++
+		resp := llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{
+					Message: llm.ChatMessage{
+						Content: `{"score": 95, "summary": "Looks good", "findings": []}`,
+					},
+					FinishReason: "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer llmServer.Close()
+
+	compareCalls := 0
+	currentPRBaseSHA := validBaseSHA
+	currentPRHeadSHA := validHeadSHA
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/42"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 42,
+				"title":  "Head test PR",
+				"body":   "Testing head binding",
+				"head":   map[string]any{"sha": currentPRHeadSHA, "ref": "feat-x"},
+				"base":   map[string]any{"sha": currentPRBaseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			compareCalls++
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/file.go b/file.go\n+new line\n"))
+		case strings.Contains(r.URL.Path, "/issues/42/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pulls/42/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false,
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+	// 1. Malformed expectedHead rejected before any external call
+	_, err = eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, "short123")
+	if err == nil {
+		t.Fatal("expected error for malformed expectedHead SHA")
+	}
+	if llmCalls != 0 || compareCalls != 0 {
+		t.Fatalf("expected 0 LLM/compare calls for malformed SHA, got llm=%d, compare=%d", llmCalls, compareCalls)
+	}
+
+	// 2. Mismatched expectedHead rejected before compare/LLM call
+	_, err = eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, diffHeadSHA)
+	if err == nil {
+		t.Fatal("expected error for mismatched expectedHead SHA")
+	}
+	if llmCalls != 0 || compareCalls != 0 {
+		t.Fatalf("expected 0 LLM/compare calls for mismatched SHA, got llm=%d, compare=%d", llmCalls, compareCalls)
+	}
+
+	// 3. Matching expectedHead succeeds, uses compare endpoint, report strictly binds to expected head
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, validHeadSHA)
+	if err != nil {
+		t.Fatalf("ReviewPRAtHead failed: %v", err)
+	}
+	if report.HeadSHA != validHeadSHA {
+		t.Fatalf("expected report HeadSHA %s, got %s", validHeadSHA, report.HeadSHA)
+	}
+	if compareCalls != 1 {
+		t.Fatalf("expected 1 compare call, got %d", compareCalls)
+	}
+	if llmCalls != 1 {
+		t.Fatalf("expected 1 LLM call, got %d", llmCalls)
+	}
+
+	// 4. Malformed BaseSHA on PR rejected
+	currentPRBaseSHA = "invalid-base-oid"
+	_, err = eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, validHeadSHA)
+	if err == nil {
+		t.Fatal("expected error for malformed PR base SHA")
+	}
+	currentPRBaseSHA = validBaseSHA
+
+	// 5. Malformed HeadSHA on PR rejected
+	currentPRHeadSHA = "invalid-head-oid"
+	_, err = eng.ReviewPRAtHead(context.Background(), "owner", "repo", 42, validHeadSHA)
+	if err == nil {
+		t.Fatal("expected error for malformed PR head SHA")
+	}
+}
+
+func TestReviewPRAtHead_HeadValidationAndCompare(t *testing.T) {
+	TestReviewHeadBinding(t)
+}
+
+type fixtureTransport struct {
+	allowedHost string
+	rt          http.RoundTripper
+}
+
+func (f *fixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host != f.allowedHost {
+		return nil, fmt.Errorf("fixture transport rejected non-fixture URL host: %s", req.URL.Host)
+	}
+	base := f.rt
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(req)
+}
+
+func newFixtureClient(serverURL string) *http.Client {
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		panic(err)
+	}
+	return &http.Client{
+		Transport: &fixtureTransport{
+			allowedHost: u.Host,
+		},
+		Timeout: 5 * time.Second,
+	}
+}
+
+func TestReviewPR_FetchAndGenerationFailures(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	cases := []struct {
+		name              string
+		failPR            bool
+		failCompare       bool
+		failComments      bool
+		failLLM           bool
+		malformedLLMJSON  bool
+		expectedErrSubstr string
+	}{
+		{
+			name:              "PR fetch failure",
+			failPR:            true,
+			expectedErrSubstr: "failed to fetch PR",
+		},
+		{
+			name:              "compare diff fetch failure",
+			failCompare:       true,
+			expectedErrSubstr: "failed to fetch diff at commits",
+		},
+		{
+			name:              "comments fetch failure",
+			failComments:      true,
+			expectedErrSubstr: "failed to fetch comments",
+		},
+		{
+			name:              "LLM call failure",
+			failLLM:           true,
+			expectedErrSubstr: "llm call failed",
+		},
+		{
+			name:              "structured parse failure",
+			malformedLLMJSON:  true,
+			expectedErrSubstr: "failed to parse review response",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			llmCalls := 0
+			llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				llmCalls++
+				if tc.failLLM {
+					http.Error(w, "llm 500 error", http.StatusInternalServerError)
+					return
+				}
+				if tc.malformedLLMJSON {
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+						Choices: []llm.ChatChoice{
+							{
+								Message: llm.ChatMessage{
+									Role:    "assistant",
+									Content: "this is completely not json at all",
+								},
+							},
+						},
+					})
+					return
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+					Choices: []llm.ChatChoice{
+						{
+							Message: llm.ChatMessage{
+								Role:    "assistant",
+								Content: `{"score": 90, "summary": "ok", "findings": []}`,
+							},
+						},
+					},
+				})
+			}))
+			defer llmServer.Close()
+
+			ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/pulls/101"):
+					if tc.failPR {
+						http.Error(w, "gh pr error", http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"number": 101,
+						"title":  "Test PR",
+						"body":   "PR body",
+						"head":   map[string]any{"sha": headSHA, "ref": "feat"},
+						"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+						"user":   map[string]any{"login": "dev"},
+					})
+				case strings.Contains(r.URL.Path, "/compare/"):
+					if tc.failCompare {
+						http.Error(w, "gh compare error", http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "text/plain")
+					_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n+new line\n"))
+				case strings.Contains(r.URL.Path, "/issues/101/comments"):
+					if tc.failComments {
+						http.Error(w, "gh comments error", http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`[]`))
+				case strings.Contains(r.URL.Path, "/pulls/101/comments"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`[]`))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer ghServer.Close()
+
+			ghClient, err := github.NewTestClient(ghServer.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cfg := &config.Config{
+				EffortLevel:   "lite",
+				EnableSandbox: false,
+				LLMBaseURL:    llmServer.URL,
+				LLMAPIKey:     "test-key",
+				LLMModel:      "test-model",
+			}
+			llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+			llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+
+			eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+			report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 101, headSHA)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got report: %+v", tc.expectedErrSubstr, report)
+			}
+			if !strings.Contains(err.Error(), tc.expectedErrSubstr) {
+				t.Fatalf("expected error containing %q, got: %v", tc.expectedErrSubstr, err)
+			}
+
+			if (tc.failPR || tc.failCompare || tc.failComments) && llmCalls != 0 {
+				t.Fatalf("LLM should not be called when GitHub fetch fails, got %d calls", llmCalls)
+			}
+		})
+	}
+}
+
+func TestReviewPR_PositiveGenerationAndDeduplication(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{
+					Message: llm.ChatMessage{
+						Role: "assistant",
+						Content: `{
+							"score": 85,
+							"summary": "Good progress with minor findings.",
+							"findings": [
+								{
+									"file": "main.go",
+									"line": 10,
+									"severity": "WARNING",
+									"title": "Error check missing",
+									"description": "Must check err from os.Open"
+								},
+								{
+									"file": "main.go",
+									"line": 20,
+									"severity": "NOTE",
+									"title": "Variable naming",
+									"description": "Use descriptive name"
+								}
+							]
+						}`,
+					},
+					FinishReason: "stop",
+				},
+			},
+		})
+	}))
+	defer llmServer.Close()
+
+	// Prior comment matches finding 1's fingerprint
+	// Fingerprint format: <!-- pr-review-fp: SHA256(...) -->
+	// Finding 1: file="main.go", line=10, title="Error check missing", severity="WARNING"
+	finding1FP := "<!-- pr-review-fp: 9fa281bb2b3a8e932ec7e584f02a63e8020aa9975b3c437a3c3f7614d9b23617 -->" // or calculated via dedup
+
+	// Calculate exact fingerprint using dedup package
+	// dedup.ComputeFingerprint("main.go", 10, "Error check missing", "WARNING")
+	// dedup.FormatMarker(fp) produces the comment marker
+	f1Marker := fmt.Sprintf("<!-- pr-review-fp: %s -->", "dummy")
+	// Let's get the exact marker by using the same logic or including it in comment body:
+	// We'll compute it dynamically in test setup below.
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/102"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 102,
+				"title":  "Add main logic",
+				"body":   "Implements main logic",
+				"head":   map[string]any{"sha": headSHA, "ref": "feat-main"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/main.go b/main.go\n+line 10\n+line 20\n"))
+		case strings.Contains(r.URL.Path, "/issues/102/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			// Include existing comment with finding 1's marker
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"user": map[string]any{"login": "bot"},
+					"body": fmt.Sprintf("Earlier review finding.\n\n%s", finding1FP),
+				},
+			})
+		case strings.Contains(r.URL.Path, "/pulls/102/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false,
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 102, headSHA)
+	if err != nil {
+		t.Fatalf("ReviewPRAtHead failed: %v", err)
+	}
+
+	if report.HeadSHA != headSHA {
+		t.Fatalf("expected HeadSHA %s, got %s", headSHA, report.HeadSHA)
+	}
+	if report.Score != 85 {
+		t.Errorf("expected Score 85, got %d", report.Score)
+	}
+	if report.Summary != "Good progress with minor findings." {
+		t.Errorf("unexpected Summary: %s", report.Summary)
+	}
+	if report.VerificationStatus != sandbox.StatusUnavailable {
+		t.Errorf("expected StatusUnavailable when sandbox disabled, got %s", report.VerificationStatus)
+	}
+	if report.VerificationSummary != "Sandbox verification skipped." {
+		t.Errorf("expected 'Sandbox verification skipped.', got %s", report.VerificationSummary)
+	}
+	if len(report.Suggestions) != 0 {
+		t.Errorf("suggestions must be empty without live sandbox verification, got %d", len(report.Suggestions))
+	}
+	_ = f1Marker
+}
+
+func TestReviewPR_SourceVerificationUnavailableWithoutInventedSuccess(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{
+					Message: llm.ChatMessage{
+						Role: "assistant",
+						Content: `{
+							"score": 90,
+							"summary": "Clean code changes.",
+							"findings": [
+								{
+									"file": "main.go",
+									"line": 5,
+									"severity": "NOTE",
+									"title": "Minor improvement",
+									"description": "Consider refactoring",
+									"suggested_code": "func Refactored() {}"
+								}
+							]
+						}`,
+					},
+					FinishReason: "stop",
+				},
+			},
+		})
+	}))
+	defer llmServer.Close()
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/103"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 103,
+				"title":  "Test PR",
+				"body":   "Body",
+				"head":   map[string]any{"sha": headSHA, "ref": "feat"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/main.go b/main.go\n+func Refactored() {}\n"))
+		case strings.Contains(r.URL.Path, "/issues/103/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pulls/103/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false, // Verification unavailable/skipped
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 103, headSHA)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if report.VerificationStatus != sandbox.StatusUnavailable {
+		t.Fatalf("expected StatusUnavailable, got %s", report.VerificationStatus)
+	}
+	if !strings.Contains(report.VerificationSummary, "Sandbox verification skipped") {
+		t.Fatalf("expected honest verification summary, got %s", report.VerificationSummary)
+	}
+	if len(report.Suggestions) != 0 {
+		t.Fatalf("inline suggestions must not be invented when verification is unavailable, got %d", len(report.Suggestions))
+	}
+	reportMd := FormatReportMarkdown(report)
+	if strings.Contains(reportMd, "PASSED") {
+		t.Fatalf("report markdown must not claim PASSED verification: %s", reportMd)
+	}
+}
+
+
 

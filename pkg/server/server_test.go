@@ -209,15 +209,25 @@ func TestCommentCommandPermissionAndImproveNotice(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cfg := &config.Config{GitHubToken: "test-token", LLMAPIKey: "test-key", LLMModel: "test-model", LLMBaseURL: "http://example.invalid", WebhookSecret: "secret", AutoActions: []string{}}
+			cfg := &config.Config{
+				GitHubToken:     "test-token",
+				LLMAPIKey:       "test-key",
+				LLMModel:        "test-model",
+				LLMBaseURL:      "http://example.invalid",
+				WebhookSecret:   "secret",
+				WebhookStateDir: t.TempDir(),
+				AutoActions:     []string{},
+			}
 			srv := NewServer(cfg)
+			defer srv.Stop()
 			srv.gh = client
 			dispatched := make(chan string, 1)
 			srv.dispatchHook = func(action, owner, repo string, prNum int) {
 				dispatched <- action
 			}
-			payload := []byte(`{"action":"created","issue":{"number":12,"pull_request":{"url":"https://api.github.com/repos/org/repo/pulls/12"}},"comment":{"body":"/improve","user":{"login":"member"}},"repository":{"name":"repo","owner":{"login":"org"}}}`)
+			payload := []byte(`{"action":"created","issue":{"number":12,"pull_request":{"url":"https://api.github.com/repos/org/repo/pulls/12"}},"comment":{"id":101,"body":"/improve","user":{"login":"member"}},"repository":{"id":12345,"name":"repo","owner":{"login":"org"}}}`)
 			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("deliv-%d", time.Now().UnixNano()))
 			req.Header.Set("X-GitHub-Event", "issue_comment")
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("X-Hub-Signature-256", signPayload("secret", payload))
@@ -280,16 +290,25 @@ func TestCommentCommands_UnauthorizedCommandsDenied(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cfg := &config.Config{GitHubToken: "test-token", LLMAPIKey: "test-key", LLMModel: "test-model", LLMBaseURL: "http://example.invalid", WebhookSecret: "secret"}
+			cfg := &config.Config{
+				GitHubToken:     "test-token",
+				LLMAPIKey:       "test-key",
+				LLMModel:        "test-model",
+				LLMBaseURL:      "http://example.invalid",
+				WebhookSecret:   "secret",
+				WebhookStateDir: t.TempDir(),
+			}
 			srv := NewServer(cfg)
+			defer srv.Stop()
 			srv.gh = client
 			dispatched := make(chan string, 1)
 			srv.dispatchHook = func(action, owner, repo string, prNum int) {
 				dispatched <- action
 			}
 
-			payload := []byte(fmt.Sprintf(`{"action":"created","issue":{"number":5,"pull_request":{"url":"https://api.github.com/repos/org/repo/pulls/5"}},"comment":{"body":%q,"user":{"login":"untrusted"}},"repository":{"name":"repo","owner":{"login":"org"}}}`, cmd))
+			payload := []byte(fmt.Sprintf(`{"action":"created","issue":{"number":5,"pull_request":{"url":"https://api.github.com/repos/org/repo/pulls/5"}},"comment":{"id":102,"body":%q,"user":{"login":"untrusted"}},"repository":{"id":12345,"name":"repo","owner":{"login":"org"}}}`, cmd))
 			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("deliv-%d", time.Now().UnixNano()))
 			req.Header.Set("X-GitHub-Event", "issue_comment")
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("X-Hub-Signature-256", signPayload("secret", payload))

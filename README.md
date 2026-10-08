@@ -3,7 +3,7 @@
 AI PR Reviewer and read-only Interactive Assistant written in Go. Project build/test verification runs inside rootless Podman containers on Linux with dedicated 3 GiB storage slots and cgroups v2 boundaries; on non-Linux platforms (macOS/Windows) or unprovisioned systems, verification is safely reported as unavailable. Assistant mutations and one-click code suggestions remain permanently disabled.
 
 Inspired by GitHub Copilot's agentic architecture and PR-Agent:
-1. **Isolated Verification & Truthful Results**: On Linux with operator-configured Podman, PR builds and tests execute inside disposable rootless containers (`network=none`, 2 GiB RAM, 3 GiB fixed ext4 slot leases). On macOS, Windows, or systems without operator sandboxing, verification truthfully reports `unavailable` with 0 commands executed on the host. See [docs/SANDBOX.md](docs/SANDBOX.md).
+1. **Isolated Verification & Truthful Results**: On Linux with operator-configured Podman, PR builds and tests execute inside disposable rootless containers (`network=none`, 2 GiB RAM, 3 GiB fixed ext4 slot leases). On macOS, Windows, or systems without operator sandboxing, verification truthfully reports `unavailable` with 0 commands executed on the host.
 2. **Review Discussion & Thread Awareness**: Gathers existing PR comments and inline review discussions. Tracks whether previous review feedback was addressed in new commits and prevents repeating resolved debates.
 3. **Discussion Summarizer (`/summarize`)**: Instantly compiles all PR comments, debates, and reviewer feedback into an executive summary table (zero sandbox overhead).
 4. **Read-only PR Assistant (`@bot` / `/ask`)**: Allows repository writers to ask about PR files, using `read_file` and `list_files` within an `os.OpenRoot` confined snapshot. File writes, command execution, and pushes are permanently disabled.
@@ -31,7 +31,7 @@ pkg/
   assistant/           # Read-only interactive PR assistant (read_file, list_files)
   labeler/             # Auto-labeler based on PR contents
   changelog/           # Atomic changelog generation and expected-head CAS publication
-  server/              # GitHub Webhook server with HMAC validation & background runner
+  server/              # GitHub Webhook server with HMAC validation, durable bbolt queue & fixed workers
 deploy/
   sandbox/             # Trusted Containerfile and helper build recipe
   pr-review.service   # Systemd unit template for Proxmox CT / Linux server
@@ -66,12 +66,12 @@ pr-review-server -version
 ```
 
 The npm wrapper selects one of six platform packages through optional dependencies.
-Do not install with `--omit=optional`. npm publication is initially disabled;
-see [release setup](docs/RELEASING.md) for the one-time publisher configuration.
+Do not install with `--omit=optional`. npm publication is initially disabled and requires one-time npm Trusted Publisher configuration.
 
 ### 1. Build
 ```bash
 go build -o bin/pr-review-go ./cmd/pr-review-go
+go build -o bin/pr-review-server ./cmd/pr-review-server
 ```
 
 ### 2. Manual CLI Mode
@@ -109,20 +109,32 @@ export AUTO_ACTIONS="review,labels,describe"
 export WEBHOOK_SECRET="your-hmac-secret"
 export PORT=3000
 
-./bin/pr-review-go -server
+# Optional durable queue and capacity controls (defaults shown; WEBHOOK_STATE_DIR defaults to platform os.UserConfigDir()/pr-review-go/state):
+export WEBHOOK_STATE_DIR="$HOME/.config/pr-review-go/state"
+export WEBHOOK_WORKERS=2
+export WEBHOOK_BACKLOG=100
+export LLM_CONCURRENCY=2
+export LLM_MIN_INTERVAL=1s
+export SANDBOX_CONCURRENCY=1
+
+./bin/pr-review-server
 ```
 
-When running in server mode, incoming webhook triggers:
+When running in server mode:
+- **Durable bbolt Ledger & Bounded Retention**: Webhooks commit delivery receipts and job bundles atomically to `jobs.db` before returning HTTP 200. Bounded maintenance reclaims expired terminal records without evicting active work. Saturated queues return HTTP 503 (`Retry-After: 30`).
+- **Per-PR FIFO Serialization**: Work is serialized per pull request; distinct PRs process in parallel across fixed workers.
+- **Automatic Review Coalescing**: Subsequent commits during an active review coalesce into a single follow-up review of the latest commit; outdated reports are discarded before publication.
+- **Status Comment Recycling & Outbox**: A dedicated background StatusOutbox publishes durable queued status comments immediately; transitions recycle the same status comment per PR.
+- **Rerun Protection**: Repeated comment deliveries are deduplicated within the retention window; fresh `/review` comments on already-reviewed commits explicitly rerun and display `"This commit was already reviewed. Reviewing again."`.
+- **Offline Disaster Recovery**: Blocked or crashed jobs can be inspected and resolved using `WEBHOOK_STATE_DIR=/path ./bin/pr-review-server --queue-inspect` and `--queue-resolve` (`confirmed`, `rerun`, `cancel`). Full configuration tables and recovery runbooks ship with the local operator docs.
+
+Incoming webhook triggers:
 - `pull_request`: `opened` -> auto-labels + code review
-- `pull_request`: `synchronize` -> incremental review
+- `pull_request`: `synchronize` -> coalesced incremental review
 - Comment `/review` -> triggers code review; project build/tests remain disabled
 - Comment `/improve` -> posts an unavailable notice; no suggestions are generated
 - Comment `/describe` -> appends a purpose and file walkthrough to PR body
 - Comment `/update_changelog` -> commits one changelog entry when author has not edited it
-
-`AUTO_ACTIONS` accepts `review`, `labels`, `describe`, and `improve`, but `improve` is currently skipped. Set it empty
-to disable automatic actions. `review` also runs on later PR updates when selected;
-other automatic actions run only when the PR opens. Comment commands require repository write permission.
 - Comment `/summarize` or `/summary` -> triggers discussion summary
 - Comment `/labels` or `/generate_labels` -> triggers label generation
 - Comment `@bot <task>`, `@pr-review <task>`, or `/ask <task>` -> launches interactive sandbox assistant

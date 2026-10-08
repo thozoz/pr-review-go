@@ -2,6 +2,10 @@ package github
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -747,6 +751,256 @@ func TestCommitFileAtExpectedHead(t *testing.T) {
 		_, err := client.CommitFileAtExpectedHead(context.Background(), "owner", "repo", "main", expectedOID, "CHANGELOG.md", "c", "m")
 		if err == nil {
 			t.Fatalf("expected error for empty commit OID, got nil")
+		}
+	})
+}
+
+func TestServiceActor(t *testing.T) {
+	t.Run("PAT authenticated user success", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/user" {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{
+					"id":    4242,
+					"login": "service-bot",
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer ts.Close()
+
+		client, err := NewTestClient(ts.URL)
+		if err != nil {
+			t.Fatalf("NewTestClient error: %v", err)
+		}
+
+		actor, err := client.ServiceActor(context.Background(), "owner", "repo")
+		if err != nil {
+			t.Fatalf("unexpected ServiceActor error: %v", err)
+		}
+		if actor.ID != 4242 || actor.Login != "service-bot" {
+			t.Errorf("got actor %+v, want ID 4242, Login 'service-bot'", actor)
+		}
+
+		actorID, err := client.ServiceActorID(context.Background(), "owner", "repo")
+		if err != nil || actorID != 4242 {
+			t.Errorf("got ServiceActorID (%d, %v), want (4242, nil)", actorID, err)
+		}
+	})
+
+	t.Run("PAT permission error 401/403", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		_, err := client.ServiceActor(context.Background(), "owner", "repo")
+		if err == nil || !errors.Is(err, ErrServiceActorPermission) {
+			t.Errorf("expected ErrServiceActorPermission, got: %v", err)
+		}
+	})
+
+	t.Run("PAT malformed user response", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"id": 0, "login": ""}`))
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		_, err := client.ServiceActor(context.Background(), "owner", "repo")
+		if err == nil || !errors.Is(err, ErrServiceActorMalformed) {
+			t.Errorf("expected ErrServiceActorMalformed, got: %v", err)
+		}
+	})
+
+	t.Run("App JWT authenticated bot identity success", func(t *testing.T) {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatalf("rsa.GenerateKey error: %v", err)
+		}
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/app":
+				json.NewEncoder(w).Encode(map[string]any{
+					"id":   1001,
+					"slug": "pr-bot-app",
+					"name": "PR Bot App",
+				})
+			case "/users/pr-bot-app[bot]":
+				json.NewEncoder(w).Encode(map[string]any{
+					"id":    8899,
+					"login": "pr-bot-app[bot]",
+					"type":  "Bot",
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ts.Close()
+
+		client, err := NewTestAppClient(ts.URL, 1001, key)
+		if err != nil {
+			t.Fatalf("NewTestAppClient error: %v", err)
+		}
+
+		actor, err := client.ServiceActor(context.Background(), "owner", "repo")
+		if err != nil {
+			t.Fatalf("unexpected ServiceActor error for App client: %v", err)
+		}
+		if actor.ID != 8899 || actor.Login != "pr-bot-app[bot]" {
+			t.Errorf("got actor %+v, want ID 8899, Login 'pr-bot-app[bot]'", actor)
+		}
+	})
+}
+
+func TestOwnedCommentReconciliation(t *testing.T) {
+	serviceActor := &ServiceActor{ID: 5555, Login: "my-service-bot"}
+	marker := "<!-- pr-review-output:job-0001 -->"
+	bodyText := "## Review Output\nAll good!\n\n" + marker
+	h := sha256.Sum256([]byte(bodyText))
+	validDigest := hex.EncodeToString(h[:])
+
+	t.Run("matching service actor and marker and digest finds comment", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/10/comments") {
+				w.Header().Set("Content-Type", "application/json")
+				comments := []map[string]any{
+					{
+						"id":   101,
+						"body": "User comment mentioning something",
+						"user": map[string]any{"id": 9999, "login": "contributor"},
+					},
+					{
+						"id":   102,
+						"body": bodyText,
+						"user": map[string]any{"id": 5555, "login": "my-service-bot"},
+					},
+				}
+				json.NewEncoder(w).Encode(comments)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		match, err := client.FindOwnedComment(context.Background(), FindOwnedCommentOptions{
+			Owner:      "owner",
+			Repo:       "repo",
+			PRNumber:   10,
+			Marker:     marker,
+			BodyDigest: validDigest,
+			Actor:      serviceActor,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !match.Found || match.CommentID != 102 || match.Uncertain {
+			t.Errorf("got match %+v, want Found:true, CommentID:102, Uncertain:false", match)
+		}
+	})
+
+	t.Run("forged marker in ordinary user comment is ignored (T-02-05)", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/10/comments") {
+				w.Header().Set("Content-Type", "application/json")
+				comments := []map[string]any{
+					{
+						"id":   201,
+						"body": bodyText, // Copied marker and body by ordinary user!
+						"user": map[string]any{"id": 7777, "login": "attacker"},
+					},
+				}
+				json.NewEncoder(w).Encode(comments)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		match, err := client.FindOwnedComment(context.Background(), FindOwnedCommentOptions{
+			Owner:      "owner",
+			Repo:       "repo",
+			PRNumber:   10,
+			Marker:     marker,
+			BodyDigest: validDigest,
+			Actor:      serviceActor,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if match.Found {
+			t.Errorf("forged marker from ordinary user must not be accepted as owned output!")
+		}
+		if match.Uncertain {
+			t.Errorf("complete scan with no owned comments must return Uncertain: false")
+		}
+	})
+
+	t.Run("marker with mismatched body digest is ignored", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/repos/owner/repo/issues/10/comments") {
+				w.Header().Set("Content-Type", "application/json")
+				comments := []map[string]any{
+					{
+						"id":   301,
+						"body": "Modified content " + marker,
+						"user": map[string]any{"id": 5555, "login": "my-service-bot"},
+					},
+				}
+				json.NewEncoder(w).Encode(comments)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		match, err := client.FindOwnedComment(context.Background(), FindOwnedCommentOptions{
+			Owner:      "owner",
+			Repo:       "repo",
+			PRNumber:   10,
+			Marker:     marker,
+			BodyDigest: validDigest, // won't match "Modified content "
+			Actor:      serviceActor,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if match.Found {
+			t.Errorf("expected match.Found to be false for mismatched body digest")
+		}
+	})
+
+	t.Run("incomplete or failed scan yields uncertain, never absent", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer ts.Close()
+
+		client, _ := NewTestClient(ts.URL)
+		match, err := client.FindOwnedComment(context.Background(), FindOwnedCommentOptions{
+			Owner:      "owner",
+			Repo:       "repo",
+			PRNumber:   10,
+			Marker:     marker,
+			BodyDigest: validDigest,
+			Actor:      serviceActor,
+		})
+		if err == nil {
+			t.Fatalf("expected error from 500 response")
+		}
+		if !match.Uncertain {
+			t.Errorf("failed scan MUST return Uncertain: true, got false")
+		}
+		if match.Found {
+			t.Errorf("failed scan must not claim comment found")
 		}
 	})
 }

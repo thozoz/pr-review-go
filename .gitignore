@@ -31,6 +31,9 @@ dist/
 /.claude/
 /.codex/
 
+# Local-only docs (not published to GitHub)
+/docs/
+
 # npm packaging output
 node_modules/
 *.tgz

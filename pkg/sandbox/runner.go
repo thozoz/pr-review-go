@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
@@ -75,6 +76,7 @@ type Snapshot struct {
 	Manifest         map[string]string `json:"manifest,omitempty"` // path -> sha256
 	IsIncomplete     bool              `json:"is_incomplete,omitempty"`
 	IncompleteReason string            `json:"incomplete_reason,omitempty"`
+	hasPermit        bool
 }
 
 // Validate ensures the snapshot has a complete, valid commit SHA and a clean source tree.
@@ -236,7 +238,47 @@ func (r *Runner) PrepareSnapshot(ctx context.Context, cloneURL, headRef, headSHA
 	if r.SourceProvider == nil {
 		return nil, nil, ErrSourceProviderUnavailable
 	}
-	return r.SourceProvider.PrepareSource(ctx, cloneURL, headRef, headSHA)
+
+	gate := GateFromContext(ctx)
+	var releasePermit func()
+	if gate != nil && !HasActivePermit(ctx) {
+		rel, err := gate.Acquire(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		releasePermit = rel
+	}
+
+	prepCtx := ctx
+	if releasePermit != nil {
+		prepCtx = WithActivePermit(ctx)
+	}
+
+	snap, cleanup, err := r.SourceProvider.PrepareSource(prepCtx, cloneURL, headRef, headSHA)
+	if err != nil {
+		if releasePermit != nil {
+			releasePermit()
+		}
+		return nil, nil, err
+	}
+
+	if snap != nil && releasePermit != nil {
+		snap.hasPermit = true
+	}
+
+	var once sync.Once
+	wrappedCleanup := func() {
+		once.Do(func() {
+			if cleanup != nil {
+				cleanup()
+			}
+			if releasePermit != nil {
+				releasePermit()
+			}
+		})
+	}
+
+	return snap, wrappedCleanup, nil
 }
 
 // PrepareWorkspace adapts the legacy workspace preparation method to the safe snapshot model.
@@ -324,6 +366,19 @@ func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationRe
 func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*VerificationReport, error) {
 	report := &VerificationReport{
 		Results: make([]ExecutionResult, 0),
+	}
+
+	alreadyHeld := HasActivePermit(ctx) || (snapshot != nil && snapshot.hasPermit)
+	gate := GateFromContext(ctx)
+	if !alreadyHeld && gate != nil {
+		rel, err := gate.Acquire(ctx)
+		if err != nil {
+			report.Status = StatusCancelled
+			report.Reason = err.Error()
+			report.Summary = fmt.Sprintf("CANCELLED: %v", err)
+			return report, err
+		}
+		defer rel()
 	}
 
 	if snapshot != nil {
