@@ -39,6 +39,7 @@ type Server struct {
 	describer    *describer.Describer
 	changelog    *changelog.Updater
 	gh           *ghclient.Client
+	llm          *llm.Client
 	dispatchHook func(action, owner, repo string, prNum int)
 
 	store          JobStore
@@ -85,6 +86,7 @@ func NewServerWithClients(cfg *config.Config, gh *ghclient.Client, llmClient *ll
 		describer:  describer.NewDescriber(cfg),
 		changelog:  changelog.NewUpdater(cfg),
 		gh:         gh,
+		llm:        llmClient,
 	}
 }
 
