@@ -30,6 +30,7 @@ const githubAPIURL = "https://api.github.com"
 
 var (
 	ErrRetrievalAuthUnavailable = errors.New("retrieval credentials unavailable: GitHub App authentication is required for scoped private source retrieval, PAT substitution is forbidden (D-10)")
+	ErrPushAuthUnavailable      = errors.New("push credentials unavailable: GitHub App authentication is required for scoped commit push, PAT substitution is forbidden (D-29)")
 	ErrInvalidRepoID            = errors.New("invalid or empty repository ID")
 	ErrScopeTooBroad            = errors.New("retrieval credential scope too broad or unverified")
 	ErrServiceActorUnavailable  = errors.New("service actor unavailable")
@@ -60,6 +61,35 @@ func (c *RetrievalCredential) Zeroize() {
 
 // IsRevoked returns true if the credential has been revoked or zeroized.
 func (c *RetrievalCredential) IsRevoked() bool {
+	if c == nil {
+		return true
+	}
+	return c.revoked || c.Token == ""
+}
+
+// PushCredential holds a short-lived, least-privilege App token scoped to exactly one
+// head repository with contents:write permission for atomic PR commit pushes (D-29).
+type PushCredential struct {
+	Token        string            `json:"token"`
+	ExpiresAt    time.Time         `json:"expires_at"`
+	RepositoryID int64             `json:"repository_id"`
+	RepoOwner    string            `json:"repo_owner"`
+	RepoName     string            `json:"repo_name"`
+	Permissions  map[string]string `json:"permissions"`
+	revoked      bool
+}
+
+// Zeroize securely wipes the token from memory.
+func (c *PushCredential) Zeroize() {
+	if c == nil {
+		return
+	}
+	c.Token = ""
+	c.revoked = true
+}
+
+// IsRevoked returns true if the credential has been revoked or zeroized.
+func (c *PushCredential) IsRevoked() bool {
 	if c == nil {
 		return true
 	}
@@ -721,4 +751,158 @@ func parsePrivateKey(data []byte) (*rsa.PrivateKey, error) {
 		return nil, fmt.Errorf("private key is not RSA")
 	}
 	return rsaKey, nil
+}
+
+// CreatePushCredential requests an uncached, short-lived GitHub App installation token
+// restricted to exactly one head repository ID with contents:write permission (D-29).
+func (a *AppAuth) CreatePushCredential(ctx context.Context, owner, repo string, repoID int64) (*PushCredential, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	if owner == "" || repo == "" {
+		return nil, fmt.Errorf("owner and repo must not be empty for push credential")
+	}
+	if repoID <= 0 {
+		return nil, fmt.Errorf("%w: repository ID must be positive, got %d", ErrInvalidRepoID, repoID)
+	}
+
+	installationID, err := a.getRepoInstallationID(ctx, owner, repo)
+	if err != nil {
+		return nil, fmt.Errorf("get installation for %s/%s: %w", owner, repo, err)
+	}
+
+	jwt, err := a.getJWT()
+	if err != nil {
+		return nil, fmt.Errorf("generate jwt: %w", err)
+	}
+
+	tokenURL := fmt.Sprintf("%s/app/installations/%d/access_tokens", a.apiURL(), installationID)
+
+	requestBody := map[string]any{
+		"repository_ids": []int64{repoID},
+		"permissions": map[string]string{
+			"contents": "write",
+		},
+	}
+	bodyBytes, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal access token request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create access token request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request access token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("failed to create push access token for installation %d (status %d): %s", installationID, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result struct {
+		Token               string            `json:"token"`
+		ExpiresAt           time.Time         `json:"expires_at"`
+		Permissions         map[string]string `json:"permissions"`
+		RepositorySelection string            `json:"repository_selection"`
+		Repositories        []struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+		} `json:"repositories"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode push access token response: %w", err)
+	}
+
+	if result.Token == "" {
+		return nil, fmt.Errorf("empty access token returned for push credential")
+	}
+
+	if result.ExpiresAt.IsZero() {
+		return nil, fmt.Errorf("zero expiry returned for push credential")
+	}
+	if !result.ExpiresAt.After(time.Now()) {
+		return nil, fmt.Errorf("returned token already expired: %v", result.ExpiresAt)
+	}
+
+	if len(result.Permissions) == 0 {
+		return nil, fmt.Errorf("%w: missing permissions in token response", ErrScopeTooBroad)
+	}
+	for perm, val := range result.Permissions {
+		if perm != "contents" {
+			return nil, fmt.Errorf("%w: token contains extra permission %q", ErrScopeTooBroad, perm)
+		}
+		if val != "write" {
+			return nil, fmt.Errorf("%w: contents permission is %q (only write permitted)", ErrScopeTooBroad, val)
+		}
+	}
+	if result.Permissions["contents"] != "write" {
+		return nil, fmt.Errorf("%w: contents:write permission missing", ErrScopeTooBroad)
+	}
+
+	if result.RepositorySelection != "" && result.RepositorySelection != "selected" {
+		return nil, fmt.Errorf("%w: unsupported repository_selection %q", ErrScopeTooBroad, result.RepositorySelection)
+	}
+
+	if len(result.Repositories) > 0 {
+		if len(result.Repositories) != 1 {
+			return nil, fmt.Errorf("%w: granted access to %d repositories, expected 1", ErrScopeTooBroad, len(result.Repositories))
+		}
+		if result.Repositories[0].ID != repoID {
+			return nil, fmt.Errorf("%w: granted repository ID %d mismatch expected %d", ErrScopeTooBroad, result.Repositories[0].ID, repoID)
+		}
+	}
+
+	return &PushCredential{
+		Token:        result.Token,
+		ExpiresAt:    result.ExpiresAt,
+		RepositoryID: repoID,
+		RepoOwner:    owner,
+		RepoName:     repo,
+		Permissions:  result.Permissions,
+	}, nil
+}
+
+// RevokePushCredential revokes the installation access token via DELETE /installation/token
+// and wipes the token string from memory (D-29).
+func (a *AppAuth) RevokePushCredential(ctx context.Context, cred *PushCredential) error {
+	if cred == nil {
+		return nil
+	}
+	token := cred.Token
+	defer cred.Zeroize()
+
+	if token == "" || cred.revoked {
+		return nil
+	}
+
+	revokeURL := fmt.Sprintf("%s/installation/token", a.apiURL())
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, revokeURL, nil)
+	if err != nil {
+		return fmt.Errorf("create revoke request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("revoke access token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("failed to revoke access token (status %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	return nil
 }
