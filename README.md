@@ -132,8 +132,11 @@ Incoming webhook triggers:
 - `pull_request`: `opened` -> auto-labels + code review
 - `pull_request`: `synchronize` -> coalesced incremental review
 - Comment `/review` -> triggers code review; project build/tests remain disabled
+- Comment `/approve` -> publishes an APPROVE review from the bot identity, bound to the exact head SHA at execution time. Command-triggered only; automatic reviews stay COMMENT. One decision per head commit: a duplicate command for the same head is rejected with a warning comment, and a new commit requires a fresh command (the old record stays on the old commit in the GitHub UI). Whether the approval satisfies required reviews depends on repo branch protection; stale-approval dismissal on new commits ("Dismiss stale pull request approvals when new commits are pushed") is a repo setting the bot cannot control.
+- Comment `/request_changes` -> publishes a REQUEST_CHANGES review under the same exact-head, one-decision-per-head, and bot-identity rules as `/approve`.
 - Comment `/improve` -> posts an unavailable notice; no suggestions are generated
-- Comment `/describe` -> appends a purpose and file walkthrough to PR body
+- Comment `/describe` -> appends a purpose and file walkthrough to PR body. Mermaid architecture diagrams are opt-in (default OFF): set `ENABLE_MERMAID=1` or run an explicit `/describe` command to include a diagram; author text is never modified and re-runs replace only the diagram block.
+- Comment `/add_docs` or `/docs` -> posts documentation suggestions as a PR comment. Permanently report-only: never modifies code, commits, or pushes, including after any future push work.
 - Comment `/update_changelog` -> commits one changelog entry when author has not edited it
 - Comment `/summarize` or `/summary` -> triggers discussion summary
 - Comment `/labels` or `/generate_labels` -> triggers label generation
