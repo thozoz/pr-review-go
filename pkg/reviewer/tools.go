@@ -121,7 +121,8 @@ func (st *SnapshotTools) ReadFile(userPath string) (string, error) {
 		return "", fmt.Errorf("invalid path: contains null byte")
 	}
 	if filepath.IsAbs(userPath) || filepath.VolumeName(userPath) != "" ||
-		strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") {
+		strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") ||
+		(len(userPath) >= 2 && ((userPath[0] >= 'a' && userPath[0] <= 'z') || (userPath[0] >= 'A' && userPath[0] <= 'Z')) && userPath[1] == ':') {
 		return "", fmt.Errorf("absolute paths are not permitted")
 	}
 
@@ -191,7 +192,8 @@ func (st *SnapshotTools) ListFiles(userPath string) (string, error) {
 			return "", fmt.Errorf("invalid path: contains null byte")
 		}
 		if filepath.IsAbs(userPath) || filepath.VolumeName(userPath) != "" ||
-			strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") {
+			strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") ||
+			(len(userPath) >= 2 && ((userPath[0] >= 'a' && userPath[0] <= 'z') || (userPath[0] >= 'A' && userPath[0] <= 'Z')) && userPath[1] == ':') {
 			return "", fmt.Errorf("absolute paths are not permitted")
 		}
 		cleanRel := filepath.Clean(userPath)
