@@ -177,8 +177,8 @@ func Parse(rawDiff string, options ...ParseOptions) *ChangeInventory {
 			if fileCapHit {
 				continue
 			}
+			flushFile()
 			if len(inv.Files) >= opts.MaxFiles {
-				flushFile()
 				fileCapHit = true
 				inv.Truncated = true
 				inv.Omissions = append(inv.Omissions, &Omission{
@@ -187,7 +187,6 @@ func Parse(rawDiff string, options ...ParseOptions) *ChangeInventory {
 				continue
 			}
 
-			flushFile()
 			curFile = &FileDiff{
 				Hunks:       []*Hunk{},
 				HeaderLines: []string{line},

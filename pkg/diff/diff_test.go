@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -210,5 +211,318 @@ func TestCoverageLedgerStartsSkippedAndTracksExamined(t *testing.T) {
 	ledger.MarkExamined("pkg/bar/bar.go#H1")
 	if !ledger.IsComplete() {
 		t.Errorf("expected IsComplete() = true after all hunks examined")
+	}
+}
+
+func TestAdversarialDiffCorpus(t *testing.T) {
+	tests := []struct {
+		name      string
+		rawDiff   string
+		assertInv func(t *testing.T, inv *ChangeInventory)
+	}{
+		{
+			name: "rename with similarity content",
+			rawDiff: `diff --git a/old_name.go b/new_name.go
+similarity index 92%
+rename from old_name.go
+rename to new_name.go
+--- a/old_name.go
++++ b/new_name.go
+@@ -1,3 +1,4 @@
+ package old
++package new
+ func Main() {}
+`,
+			assertInv: func(t *testing.T, inv *ChangeInventory) {
+				if len(inv.Files) != 1 {
+					t.Fatalf("expected 1 file, got %d", len(inv.Files))
+				}
+				f := inv.Files[0]
+				if !f.IsRename {
+					t.Errorf("expected IsRename=true")
+				}
+				if f.Similarity != 92 {
+					t.Errorf("expected Similarity=92, got %d", f.Similarity)
+				}
+				if f.OldPath != "old_name.go" || f.Path != "new_name.go" {
+					t.Errorf("unexpected paths: old=%q, new=%q", f.OldPath, f.Path)
+				}
+				if len(f.Hunks) != 1 {
+					t.Errorf("expected 1 hunk, got %d", len(f.Hunks))
+				}
+			},
+		},
+		{
+			name: "binary patch markers",
+			rawDiff: `diff --git a/assets/image.png b/assets/image.png
+new file mode 100644
+index 0000000..abcdef1
+Binary files /dev/null and b/assets/image.png differ
+`,
+			assertInv: func(t *testing.T, inv *ChangeInventory) {
+				if len(inv.Files) != 1 {
+					t.Fatalf("expected 1 file, got %d", len(inv.Files))
+				}
+				f := inv.Files[0]
+				if !f.IsBinary {
+					t.Errorf("expected IsBinary=true")
+				}
+				windows := inv.Windows(50000)
+				if len(windows) == 0 {
+					t.Fatalf("expected at least 1 window")
+				}
+				foundBinaryOmission := false
+				for _, om := range windows[0].Omissions {
+					if om.Reason == "binary file" {
+						foundBinaryOmission = true
+					}
+				}
+				if !foundBinaryOmission {
+					t.Errorf("expected window omission for binary file")
+				}
+			},
+		},
+		{
+			name: "git binary patch header",
+			rawDiff: `diff --git a/assets/blob.bin b/assets/blob.bin
+index 1111111..2222222 100644
+GIT binary patch
+literal 1234
+`,
+			assertInv: func(t *testing.T, inv *ChangeInventory) {
+				if len(inv.Files) != 1 {
+					t.Fatalf("expected 1 file, got %d", len(inv.Files))
+				}
+				if !inv.Files[0].IsBinary {
+					t.Errorf("expected IsBinary=true for GIT binary patch")
+				}
+			},
+		},
+		{
+			name: "mode-only change",
+			rawDiff: `diff --git a/deploy.sh b/deploy.sh
+old mode 100644
+new mode 100755
+`,
+			assertInv: func(t *testing.T, inv *ChangeInventory) {
+				if len(inv.Files) != 1 {
+					t.Fatalf("expected 1 file, got %d", len(inv.Files))
+				}
+				f := inv.Files[0]
+				if !f.IsModeOnly {
+					t.Errorf("expected IsModeOnly=true")
+				}
+				if f.OldMode != "100644" || f.NewMode != "100755" {
+					t.Errorf("unexpected modes: old=%q, new=%q", f.OldMode, f.NewMode)
+				}
+				if len(f.Hunks) != 0 {
+					t.Errorf("expected 0 hunks for mode-only change, got %d", len(f.Hunks))
+				}
+				windows := inv.Windows(50000)
+				foundModeOmission := false
+				for _, om := range windows[0].Omissions {
+					if om.Reason == "mode change only" {
+						foundModeOmission = true
+					}
+				}
+				if !foundModeOmission {
+					t.Errorf("expected window omission for mode-only change")
+				}
+			},
+		},
+		{
+			name:    "empty diff",
+			rawDiff: "   \n\n  \t  \n",
+			assertInv: func(t *testing.T, inv *ChangeInventory) {
+				if len(inv.Files) != 0 {
+					t.Errorf("expected 0 files, got %d", len(inv.Files))
+				}
+				if inv.TotalHunks != 0 {
+					t.Errorf("expected 0 hunks, got %d", inv.TotalHunks)
+				}
+				if len(inv.Omissions) != 0 {
+					t.Errorf("expected 0 omissions, got %d", len(inv.Omissions))
+				}
+			},
+		},
+		{
+			name: "diff with only deletions",
+			rawDiff: `diff --git a/pkg/dep/dep.go b/pkg/dep/dep.go
+--- a/pkg/dep/dep.go
++++ b/pkg/dep/dep.go
+@@ -1,5 +1,2 @@
+-line 1
+-line 2
+-line 3
+ context 4
+ context 5
+`,
+			assertInv: func(t *testing.T, inv *ChangeInventory) {
+				if len(inv.Files) != 1 {
+					t.Fatalf("expected 1 file, got %d", len(inv.Files))
+				}
+				f := inv.Files[0]
+				if len(f.Hunks) != 1 {
+					t.Fatalf("expected 1 hunk, got %d", len(f.Hunks))
+				}
+				h := f.Hunks[0]
+				if len(h.AddedLines) != 0 {
+					t.Errorf("expected 0 added lines for deletions-only hunk, got %v", h.AddedLines)
+				}
+				changed := inv.ChangedPRLines()
+				if len(changed["pkg/dep/dep.go"]) != 0 {
+					t.Errorf("expected no added lines in ChangedPRLines for deleted lines")
+				}
+			},
+		},
+		{
+			name: "hunk header with zero new-side length",
+			rawDiff: `diff --git a/pkg/zero/zero.go b/pkg/zero/zero.go
+--- a/pkg/zero/zero.go
++++ b/pkg/zero/zero.go
+@@ -10,5 +15,0 @@
+-line 10
+-line 11
+-line 12
+-line 13
+-line 14
+`,
+			assertInv: func(t *testing.T, inv *ChangeInventory) {
+				if len(inv.Files) != 1 {
+					t.Fatalf("expected 1 file, got %d", len(inv.Files))
+				}
+				f := inv.Files[0]
+				if len(f.Hunks) != 1 {
+					t.Fatalf("expected 1 hunk, got %d", len(f.Hunks))
+				}
+				h := f.Hunks[0]
+				if h.NewStart != 15 || h.NewCount != 0 {
+					t.Errorf("expected newStart=15, newCount=0, got start=%d, count=%d", h.NewStart, h.NewCount)
+				}
+				if h.OldStart != 10 || h.OldCount != 5 {
+					t.Errorf("expected oldStart=10, oldCount=5, got start=%d, count=%d", h.OldStart, h.OldCount)
+				}
+			},
+		},
+		{
+			name: "malformed hunk header recorded never panics",
+			rawDiff: `diff --git a/pkg/bad/bad.go b/pkg/bad/bad.go
+--- a/pkg/bad/bad.go
++++ b/pkg/bad/bad.go
+@@ invalid hunk header @@
++some line
+@@ -not-a-number,5 +10,5 @@
++another line
+`,
+			assertInv: func(t *testing.T, inv *ChangeInventory) {
+				if len(inv.Omissions) < 2 {
+					t.Fatalf("expected at least 2 omissions for malformed hunk headers, got %d", len(inv.Omissions))
+				}
+				for _, om := range inv.Omissions {
+					if !strings.Contains(om.Reason, "malformed hunk header") {
+						t.Errorf("expected omission reason to mention malformed hunk header, got: %s", om.Reason)
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parse panicked on corpus input %q: %v", tt.name, r)
+				}
+			}()
+			inv := Parse(tt.rawDiff)
+			tt.assertInv(t, inv)
+		})
+	}
+}
+
+// TestAdversarial_3MiBSingleFileInput verifies that a 3MiB single-file input parses
+// without panic, stays under memory bounds, and records omission naming DIFF_MAX_BYTES.
+func TestAdversarial_3MiBSingleFileInput(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("diff --git a/pkg/huge/huge.go b/pkg/huge/huge.go\n--- a/pkg/huge/huge.go\n+++ b/pkg/huge/huge.go\n")
+
+	// Target 3 MiB: 3 * 1024 * 1024 = 3,145,728 bytes
+	linePayload := "+// " + strings.Repeat("x", 200) + "\n"
+	hunkHeader := "@@ -1,1000 +1,1000 @@\n"
+	sb.WriteString(hunkHeader)
+
+	for sb.Len() < 3*1024*1024 {
+		sb.WriteString(linePayload)
+	}
+
+	raw := sb.String()
+	if len(raw) < 3*1024*1024 {
+		t.Fatalf("expected diff size >= 3MiB, got %d", len(raw))
+	}
+
+	inv := Parse(raw) // Uses default DIFF_MAX_BYTES = 2 MiB
+	if !inv.Truncated {
+		t.Errorf("expected inventory Truncated=true on 3MiB input")
+	}
+
+	foundBoundReason := false
+	for _, om := range inv.Omissions {
+		if strings.Contains(om.Reason, "DIFF_MAX_BYTES") {
+			foundBoundReason = true
+			break
+		}
+	}
+	if !foundBoundReason {
+		t.Errorf("expected omission naming DIFF_MAX_BYTES, got omissions: %+v", inv.Omissions)
+	}
+
+	// Verify hunks parsed within the 2MiB cut remain intact
+	if len(inv.Files) == 0 {
+		t.Fatalf("expected at least 1 file parsed within budget")
+	}
+	f := inv.Files[0]
+	if len(f.Hunks) == 0 {
+		t.Fatalf("expected hunks parsed within budget")
+	}
+	for _, h := range f.Hunks {
+		if !strings.HasPrefix(h.Header, "@@") {
+			t.Errorf("corrupted hunk header: %s", h.Header)
+		}
+	}
+}
+
+// TestAdversarial_2500FileInput verifies that an input with 2500 files hits the DIFF_MAX_FILES cap (2000),
+// terminates parsing cleanly, and records the exact bound hit.
+func TestAdversarial_2500FileInput(t *testing.T) {
+	var sb strings.Builder
+	for i := 0; i < 2500; i++ {
+		sb.WriteString(fmt.Sprintf("diff --git a/f%d.go b/f%d.go\n--- a/f%d.go\n+++ b/f%d.go\n@@ -1,1 +1,2 @@\n+line%d\n", i, i, i, i, i))
+	}
+
+	raw := sb.String()
+	// Set MaxBytes generous so only the file limit (DIFF_MAX_FILES=2000) triggers
+	opts := ParseOptions{
+		MaxBytes: 20 * 1024 * 1024,
+		MaxFiles: 2000,
+		MaxHunks: 50000,
+	}
+
+	inv := Parse(raw, opts)
+	if len(inv.Files) != 2000 {
+		t.Fatalf("expected exactly 2000 files, got %d", len(inv.Files))
+	}
+	if !inv.Truncated {
+		t.Errorf("expected inventory Truncated=true on 2500 file input")
+	}
+
+	foundFileBound := false
+	for _, om := range inv.Omissions {
+		if strings.Contains(om.Reason, "DIFF_MAX_FILES") {
+			foundFileBound = true
+			break
+		}
+	}
+	if !foundFileBound {
+		t.Errorf("expected omission naming DIFF_MAX_FILES, got omissions: %+v", inv.Omissions)
 	}
 }
