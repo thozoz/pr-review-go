@@ -359,7 +359,7 @@ func (s *BoltJobStore) initSchema() error {
 				if err := json.Unmarshal(v, &j); err != nil {
 					continue
 				}
-				if j.Status == "queued" && j.Kind == "review" {
+				if j.Status == "queued" && (j.Kind == "review" || j.Kind == "approve" || j.Kind == "request_changes") {
 					marker := fmt.Sprintf("<!-- pr-review-status:%s -->", j.ID)
 					if intentsB.Get([]byte(marker)) == nil {
 						bodyWithMarker := fmt.Sprintf("⏳ Review queued; waiting for capacity\n\n%s", marker)
@@ -683,7 +683,7 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 				return err
 			}
 
-			if job.Kind == "review" {
+			if job.Kind == "review" || job.Kind == "approve" || job.Kind == "request_changes" {
 				marker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
 				bodyWithMarker := fmt.Sprintf("⏳ Review queued; waiting for capacity\n\n%s", marker)
 				h := sha256.Sum256([]byte(bodyWithMarker))
