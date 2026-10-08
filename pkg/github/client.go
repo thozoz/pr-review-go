@@ -250,6 +250,28 @@ func (c *Client) RevokeRetrievalCredential(ctx context.Context, cred *RetrievalC
 	return c.appAuth.RevokeRetrievalCredential(ctx, cred)
 }
 
+// CreatePushCredential requests an uncached, single-use GitHub App installation token
+// restricted to exactly one head repository ID with contents:write permission (D-29).
+// If the client was configured with a PAT or static token rather than AppAuth,
+// it returns ErrPushAuthUnavailable; broad PAT substitution is explicitly denied.
+func (c *Client) CreatePushCredential(ctx context.Context, owner, repo string, repoID int64) (*PushCredential, error) {
+	if c.appAuth == nil {
+		return nil, ErrPushAuthUnavailable
+	}
+	return c.appAuth.CreatePushCredential(ctx, owner, repo, repoID)
+}
+
+// RevokePushCredential revokes the scoped App push token and zeroes it in memory (D-29).
+func (c *Client) RevokePushCredential(ctx context.Context, cred *PushCredential) error {
+	if c.appAuth == nil {
+		if cred != nil {
+			cred.Zeroize()
+		}
+		return nil
+	}
+	return c.appAuth.RevokePushCredential(ctx, cred)
+}
+
 // AppAuth returns the underlying AppAuth instance if configured, or nil.
 func (c *Client) AppAuth() *AppAuth {
 	return c.appAuth
@@ -943,8 +965,8 @@ type graphQLResponse struct {
 	Errors []graphQLError `json:"errors"`
 }
 
-var headMovedPattern = regexp.MustCompile(`(?i)(expected branch to point to|expectedheadoid|head moved|head branch was modified|does not match the current head|not at expected head|expected.*point|conflict.*head)`)
-var actualHeadPattern = regexp.MustCompile(`(?:points to|found)\s+["']?([0-9a-fA-F]{40,64})["']?`)
+var headMovedPattern = regexp.MustCompile(`(?i)(expected branch to point to|expectedheadoid|head moved|head branch was modified|does not match the current head|not at expected head|expected.*point|expected update to|conflict.*head)`)
+var actualHeadPattern = regexp.MustCompile(`(?:points to|found|was)\s+["']?([0-9a-fA-F]{40,64})["']?`)
 
 // CommitFileAtExpectedHead creates a single commit on branch containing only path with content,
 // conditional on the branch head matching expectedHeadOID exactly, using GitHub GraphQL createCommitOnBranch (D-16, SAFE-03).
@@ -1013,6 +1035,258 @@ func (c *Client) CommitFileAtExpectedHead(ctx context.Context, owner, repo, bran
 						},
 					},
 				},
+			},
+		},
+	}
+
+	reqBody, err := json.Marshal(reqPayload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal graphql mutation request: %w", err)
+	}
+
+	endpoint := c.graphQLEndpointForClient(ghClient)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create graphql http request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+
+	httpClient := ghClient.Client()
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("graphql request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxGraphQLResponseBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to read bounded graphql response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		trimmedBody := strings.TrimSpace(string(bodyBytes))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return "", fmt.Errorf("graphql auth error (status %d): %s", resp.StatusCode, trimmedBody)
+		}
+		return "", fmt.Errorf("graphql unexpected http status %d: %s", resp.StatusCode, trimmedBody)
+	}
+
+	var gqlResp graphQLResponse
+	if err := json.Unmarshal(bodyBytes, &gqlResp); err != nil {
+		return "", fmt.Errorf("failed to decode graphql response: %w", err)
+	}
+
+	if len(gqlResp.Errors) > 0 {
+		var errorMsgs []string
+		isHeadMoved := false
+		var actualHead string
+
+		for _, e := range gqlResp.Errors {
+			errorMsgs = append(errorMsgs, e.Message)
+			if headMovedPattern.MatchString(e.Message) {
+				isHeadMoved = true
+				if match := actualHeadPattern.FindStringSubmatch(e.Message); len(match) > 1 {
+					actualHead = match[1]
+				}
+			}
+		}
+		combinedErrMsg := strings.Join(errorMsgs, "; ")
+		if isHeadMoved {
+			return "", &HeadMovedError{
+				ExpectedHeadOID: expectedHeadOID,
+				ActualHeadOID:   actualHead,
+				Message:         combinedErrMsg,
+			}
+		}
+		return "", fmt.Errorf("graphql error: %s", combinedErrMsg)
+	}
+
+	if gqlResp.Data == nil || gqlResp.Data.CreateCommitOnBranch == nil {
+		return "", fmt.Errorf("graphql response missing createCommitOnBranch data")
+	}
+	mutationData := gqlResp.Data.CreateCommitOnBranch
+	if mutationData.Commit == nil || mutationData.Commit.OID == "" {
+		return "", fmt.Errorf("graphql response missing created commit OID")
+	}
+	if err := ValidateCommitOID(mutationData.Commit.OID); err != nil {
+		return "", fmt.Errorf("graphql response contains invalid commit OID: %w", err)
+	}
+	if mutationData.Ref == nil {
+		return "", fmt.Errorf("graphql response missing ref data")
+	}
+
+	return mutationData.Commit.OID, nil
+}
+
+// SanitizeCommitHeadline formats a commit headline bound to 140 characters:
+// pr-review: <English-summary> "<original collapsed>" (<7-char-sha>)
+// If englishSummary is empty, it falls back to:
+// pr-review: "<original collapsed>" (<7-char-sha>)
+func SanitizeCommitHeadline(englishSummary, originalInstruction, shortSHA string) string {
+	cleanSHA := strings.ToLower(strings.TrimSpace(shortSHA))
+	if len(cleanSHA) != 7 || !isHex(cleanSHA) {
+		cleanSHA = "0000000"
+	}
+
+	cleanSummary := collapseWhitespace(englishSummary)
+	cleanOriginal := collapseWhitespace(originalInstruction)
+
+	if len(cleanOriginal) > 60 {
+		cleanOriginal = truncateWordBoundary(cleanOriginal, 60)
+	}
+
+	var headline string
+	if cleanSummary != "" {
+		headline = fmt.Sprintf("pr-review: %s %q (%s)", cleanSummary, cleanOriginal, cleanSHA)
+	} else {
+		headline = fmt.Sprintf("pr-review: %q (%s)", cleanOriginal, cleanSHA)
+	}
+
+	if len(headline) > 140 {
+		headline = headline[:137] + "..."
+	}
+	return headline
+}
+
+func collapseWhitespace(s string) string {
+	var b strings.Builder
+	inSpace := false
+	for _, r := range s {
+		if r < 32 || r == 127 {
+			continue
+		}
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if !inSpace && b.Len() > 0 {
+				b.WriteByte(' ')
+				inSpace = true
+			}
+		} else {
+			b.WriteRune(r)
+			inSpace = false
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func truncateWordBoundary(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	idx := strings.LastIndex(s[:max], " ")
+	if idx > 20 {
+		return s[:idx]
+	}
+	return s[:max]
+}
+
+func isHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// CommitFilesAtExpectedHead atomically commits multiple file additions and deletions
+// to the expected branch head via GitHub GraphQL createCommitOnBranch (D-22, D-24, D-31).
+func (c *Client) CommitFilesAtExpectedHead(ctx context.Context, owner, repo, branch, expectedHeadOID, messageHeadline string, files map[string]string, deletions []string) (string, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	branch = strings.TrimSpace(branch)
+	messageHeadline = strings.TrimSpace(messageHeadline)
+
+	if owner == "" || repo == "" {
+		return "", fmt.Errorf("owner and repo must not be empty")
+	}
+	if branch == "" {
+		return "", fmt.Errorf("branch must not be empty")
+	}
+	if len(files) == 0 && len(deletions) == 0 {
+		return "", fmt.Errorf("must provide at least one file addition or deletion")
+	}
+	if messageHeadline == "" {
+		return "", fmt.Errorf("commit message must not be empty")
+	}
+	if err := ValidateCommitOID(expectedHeadOID); err != nil {
+		return "", fmt.Errorf("invalid expectedHeadOID: %w", err)
+	}
+
+	var totalBytes int64
+	for _, content := range files {
+		totalBytes += int64(len(content))
+	}
+	const maxAdditionBytes = 1 * 1024 * 1024 // 1 MiB limit
+	if totalBytes > maxAdditionBytes {
+		return "", fmt.Errorf("total file additions size %d bytes exceeds 1 MiB limit", totalBytes)
+	}
+
+	ghClient, err := c.ghForRepo(ctx, owner, repo)
+	if err != nil {
+		return "", err
+	}
+
+	branchName := strings.TrimPrefix(branch, "refs/heads/")
+
+	var additions []map[string]any
+	for path, content := range files {
+		cleanPath := strings.TrimPrefix(strings.TrimSpace(path), "/")
+		additions = append(additions, map[string]any{
+			"path":     cleanPath,
+			"contents": base64.StdEncoding.EncodeToString([]byte(content)),
+		})
+	}
+
+	var fileDeletions []map[string]any
+	for _, delPath := range deletions {
+		cleanPath := strings.TrimPrefix(strings.TrimSpace(delPath), "/")
+		if cleanPath != "" {
+			fileDeletions = append(fileDeletions, map[string]any{
+				"path": cleanPath,
+			})
+		}
+	}
+
+	fileChanges := map[string]any{
+		"additions": additions,
+	}
+	if len(fileDeletions) > 0 {
+		fileChanges["deletions"] = fileDeletions
+	}
+
+	reqPayload := graphQLRequest{
+		Query: `mutation CreateCommitOnBranch($input: CreateCommitOnBranchInput!) {
+  createCommitOnBranch(input: $input) {
+    commit {
+      oid
+      url
+    }
+    ref {
+      name
+      target {
+        oid
+      }
+    }
+  }
+}`,
+		Variables: map[string]any{
+			"input": map[string]any{
+				"branch": map[string]any{
+					"repositoryNameWithOwner": fmt.Sprintf("%s/%s", owner, repo),
+					"branchName":              branchName,
+				},
+				"expectedHeadOid": expectedHeadOID,
+				"message": map[string]any{
+					"headline": messageHeadline,
+				},
+				"fileChanges": fileChanges,
 			},
 		},
 	}

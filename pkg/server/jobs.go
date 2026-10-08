@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
+	"github.com/thozoz/pr-review-go/pkg/assistant"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/reviewer"
@@ -21,11 +25,19 @@ type JobExecutor interface {
 	ExecuteJob(ctx context.Context, job *Job) error
 }
 
+// EditSnapshotRunner abstracts snapshot preparation and container verification for edit jobs.
+type EditSnapshotRunner interface {
+	PrepareSnapshot(ctx context.Context, cloneURL, headRef, headSHA string) (*sandbox.Snapshot, func(), error)
+	RunSnapshot(ctx context.Context, snapshot *sandbox.Snapshot) (*sandbox.VerificationReport, error)
+}
+
 // ServerJobExecutor executes jobs using server components and GitHub/LLM clients.
 type ServerJobExecutor struct {
-	server *Server
-	store  JobStore
-	ledger *DecisionLedger
+	server    *Server
+	store     JobStore
+	ledger    *DecisionLedger
+	runner    EditSnapshotRunner
+	llmClient LLMCaller
 }
 
 func NewServerJobExecutor(s *Server, store JobStore) *ServerJobExecutor {
@@ -35,10 +47,45 @@ func NewServerJobExecutor(s *Server, store JobStore) *ServerJobExecutor {
 	}
 }
 
+func (e *ServerJobExecutor) SetRunner(r EditSnapshotRunner) {
+	e.runner = r
+}
+
+func (e *ServerJobExecutor) SetLLMCaller(l LLMCaller) {
+	e.llmClient = l
+}
+
+func (e *ServerJobExecutor) getRunner() EditSnapshotRunner {
+	if e.runner != nil {
+		return e.runner
+	}
+	if e.server != nil && e.server.cfg != nil {
+		return sandbox.NewPlatformRunner(e.server.cfg, e.server.gh, nil, nil)
+	}
+	return sandbox.NewRunner(0)
+}
+
+func (e *ServerJobExecutor) getLLMCaller() LLMCaller {
+	if e.llmClient != nil {
+		return e.llmClient
+	}
+	if e.server != nil && e.server.llm != nil {
+		return e.server.llm
+	}
+	if e.server != nil && e.server.cfg != nil {
+		return llm.NewClient(e.server.cfg.LLMBaseURL, e.server.cfg.LLMAPIKey, e.server.cfg.LLMModel)
+	}
+	return nil
+}
+
 func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 	var timeout time.Duration
 	switch job.Kind {
 	case "review":
+		timeout = 10 * time.Minute
+	case "edit":
+		// Edit jobs hold a per-PR execution slot on the shared pool with a 10-minute timeout
+		// while executing isolated edits, container verification, and CAS push (see plan 05-05 docs).
 		timeout = 10 * time.Minute
 	case "labels", "summary", "improve":
 		timeout = 2 * time.Minute
@@ -94,6 +141,8 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 		return e.executeRequestChangesJob(jobCtx, job)
 	case "assistant":
 		return e.executeAssistantJob(jobCtx, job)
+	case "edit":
+		return e.executeEditJob(jobCtx, job)
 	default:
 		job.Status = "failed"
 		job.Error = fmt.Sprintf("unknown job kind: %s", job.Kind)
@@ -766,6 +815,369 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 	}
 	successText := fmt.Sprintf("✅ Decision %s published for commit %s", event, shaShort)
 	_ = e.publishStatus(ctx, pub, job, successText)
+
+	job.Status = "completed"
+	now := time.Now().UTC()
+	job.FinishedAt = &now
+	_ = e.store.UpdateJob(ctx, job)
+	return nil
+}
+
+func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error {
+	if e.server == nil || e.server.gh == nil {
+		job.Status = "failed"
+		job.Error = "github client unavailable"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return errors.New("github client unavailable")
+	}
+
+	gh := e.server.gh
+	pub := NewPublication(e.store, gh)
+
+	// 1. Inherited executor reauth already covered job start.
+	// Run ClassifyEditIntent first to verify user intent and capture englishSummary.
+	llmCaller := e.getLLMCaller()
+	if llmCaller == nil {
+		job.Status = "failed"
+		job.Error = "llm client unavailable"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return errors.New("llm client unavailable")
+	}
+
+	verdict, vErr := ClassifyEditIntent(ctx, llmCaller, job.Payload)
+	if vErr != nil || verdict.Intent != "commit" || verdict.Confidence < IntentCommitThreshold {
+		log.Printf("[jobs] Edit intent confirmation required for %s: intent=%s conf=%.2f err=%v",
+			job.ID, verdict.Intent, verdict.Confidence, vErr)
+		confirmMsg := "⚠️ I am not sure if you want me to commit code changes directly to this branch. If you want me to apply and commit edits, please re-request with explicit commit instructions like `/improve --commit` or `@pr-review fix the error and commit`.\n\n" +
+			"Değişiklik yapıp commit atmamı istiyorsanız lütfen açıkça belirtin (örneğin `/improve --commit` veya `@pr-review hatayı düzelt ve gönder`)."
+		_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, confirmMsg)
+		if job.StatusCommentID > 0 {
+			_ = e.publishStatus(ctx, pub, job, "⚠️ Edit intent unclear or low-confidence; confirm comment posted.")
+		}
+		job.Status = "completed"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+	englishSummary := verdict.Summary
+
+	// 2. GetPR live head; on error apply existing budgetWait/deferForExhaustedBudget path; ValidateCommitOID on live HeadSHA.
+	livePR, prErr := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
+	if prErr != nil {
+		log.Printf("[jobs] Failed fetching live PR for %s: %v", job.ID, prErr)
+		if wait, ok := budgetWait(prErr); ok {
+			return e.deferForExhaustedBudget(ctx, job, wait, fmt.Sprintf("retry wait exceeds worker budget: %v", prErr))
+		}
+		job.Status = "failed"
+		job.Error = prErr.Error()
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return prErr
+	}
+
+	if err := ghclient.ValidateCommitOID(livePR.HeadSHA); err != nil {
+		job.Status = "failed"
+		job.Error = fmt.Sprintf("invalid live head SHA %s: %v", livePR.HeadSHA, err)
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return fmt.Errorf("invalid live head SHA: %w", err)
+	}
+
+	// 3. IsFork true (including nil metadata fail-closed) posts fork-refusal explanation comment and completes with zero snapshot work per D-24.
+	if livePR == nil || livePR.IsFork() {
+		log.Printf("[jobs] Fork PR edit refused for %s per D-24", job.ID)
+		forkMsg := "🚫 Automated code edits are disabled on pull requests originating from forks for security reasons (D-24). Please apply improvements manually."
+		_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, forkMsg)
+		if job.StatusCommentID > 0 {
+			_ = e.publishStatus(ctx, pub, job, "🚫 Edits disabled on fork pull requests.")
+		}
+		job.Status = "completed"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+
+	// 4. Status transition to editing via recycled owned comment.
+	if err := e.publishStatus(ctx, pub, job, "✏️ Preparing and applying edits in isolated container..."); err != nil {
+		return err
+	}
+
+	// 5. PrepareSnapshot with exact job.HeadSHA; on ErrSourceProviderUnavailable or non-Linux StatusUnavailable post honest-degradation notice and complete per D-27.
+	runner := e.getRunner()
+	snapshot, cleanup, snapErr := runner.PrepareSnapshot(ctx, livePR.CloneURL, livePR.HeadRef, job.HeadSHA)
+	if snapErr != nil {
+		if errors.Is(snapErr, sandbox.ErrSourceProviderUnavailable) {
+			unavailMsg := "⚠️ Automated code editing is currently unavailable: container isolation or source provider is unavailable on this host. No changes were made."
+			_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, unavailMsg)
+			if job.StatusCommentID > 0 {
+				_ = e.publishStatus(ctx, pub, job, "⚠️ Edit unavailable: container isolation not configured.")
+			}
+			job.Status = "completed"
+			now := time.Now().UTC()
+			job.FinishedAt = &now
+			_ = e.store.UpdateJob(ctx, job)
+			return nil
+		}
+		job.Status = "failed"
+		job.Error = snapErr.Error()
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return snapErr
+	}
+	defer cleanup()
+
+	// Load LastBotCommitSHA plus EditHistory from PRState, compute prior diff via GetDiffAtCommits capped at 60000 bytes with truncation marker
+	prState, _ := e.store.GetPRState(ctx, job.PRKey)
+	var priorDiff string
+	if prState != nil && prState.LastBotCommitSHA != "" && prState.LastBotCommitSHA != job.HeadSHA {
+		d, err := gh.GetDiffAtCommits(ctx, job.Owner, job.Repo, prState.LastBotCommitSHA, job.HeadSHA)
+		if err == nil {
+			const maxDiffBytes = 60000
+			if len(d) > maxDiffBytes {
+				d = d[:maxDiffBytes] + "\n...[prior diff truncated at 60000 bytes]..."
+			}
+			priorDiff = d
+		}
+	}
+
+	var stickyBuf strings.Builder
+	if prState != nil {
+		if prState.LastBotCommitSHA != "" {
+			stickyBuf.WriteString(fmt.Sprintf("Prior bot commit: %s\n", prState.LastBotCommitSHA))
+		}
+		if len(prState.EditHistory) > 0 {
+			stickyBuf.WriteString("Previous edit instructions:\n")
+			for idx, h := range prState.EditHistory {
+				stickyBuf.WriteString(fmt.Sprintf("- %d: %s\n", idx+1, h))
+			}
+		}
+	}
+	if priorDiff != "" {
+		stickyBuf.WriteString(fmt.Sprintf("\nPrior diff against base:\n```diff\n%s\n```\n", priorDiff))
+	}
+	stickyContext := stickyBuf.String()
+
+	editResult, editErr := assistant.RunGatedEditLoop(ctx, llmCaller, snapshot.SourceDir, job.Payload, stickyContext, assistant.DefaultEditCaps())
+	if editErr != nil {
+		log.Printf("[jobs] Gated edit loop failed for %s: %v", job.ID, editErr)
+		job.Status = "failed"
+		job.Error = editErr.Error()
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return editErr
+	}
+
+	if len(editResult.FilesChanged) == 0 {
+		noChangeMsg := "ℹ️ No files were modified during the editing session."
+		_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, noChangeMsg)
+		if job.StatusCommentID > 0 {
+			_ = e.publishStatus(ctx, pub, job, "ℹ️ No edits were made.")
+		}
+		job.Status = "completed"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+
+	// 6. Status verifying; run Runner.RunSnapshot on the edited tree;
+	// push gate is report Status strictly equal to StatusPassed, anything else posts verification-failure comment with zero push calls.
+	if err := e.publishStatus(ctx, pub, job, "🧪 Running verification inside container..."); err != nil {
+		return err
+	}
+
+	report, repErr := runner.RunSnapshot(ctx, snapshot)
+	if repErr != nil || report == nil || report.Status != sandbox.StatusPassed {
+		repStatus := "unknown"
+		repReason := "runner error"
+		if report != nil {
+			repStatus = string(report.Status)
+			repReason = report.Reason
+		} else if repErr != nil {
+			repReason = repErr.Error()
+		}
+		log.Printf("[jobs] Edit verification failed for %s (status=%s, reason=%s, err=%v)", job.ID, repStatus, repReason, repErr)
+		failMsg := fmt.Sprintf("❌ Verification failed for proposed edits (status: %s, reason: %s). Changes will not be committed.", repStatus, repReason)
+		_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, failMsg)
+		if job.StatusCommentID > 0 {
+			_ = e.publishStatus(ctx, pub, job, fmt.Sprintf("❌ Verification failed (%s); zero pushes.", repStatus))
+		}
+		job.Status = "failed"
+		job.Error = fmt.Sprintf("verification status %s: %s", repStatus, repReason)
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+
+	// Snapshot verified file bytes into memory at green time
+	verifiedFiles := make(map[string]string)
+	for _, fpath := range editResult.FilesChanged {
+		fullPath := filepath.Join(snapshot.SourceDir, filepath.FromSlash(fpath))
+		data, err := os.ReadFile(fullPath)
+		if err != nil {
+			log.Printf("[jobs] Failed reading green-time file %s for %s: %v", fpath, job.ID, err)
+			job.Status = "failed"
+			job.Error = fmt.Sprintf("failed reading green file %s: %v", fpath, err)
+			now := time.Now().UTC()
+			job.FinishedAt = &now
+			_ = e.store.UpdateJob(ctx, job)
+			return err
+		}
+		verifiedFiles[fpath] = string(data)
+	}
+
+	// 7. Push-time re-verify CanWriteRepository for job.Author with fresh 5s timeout fail-closed
+	reauthCtx, reauthCancel := context.WithTimeout(ctx, 5*time.Second)
+	allowed, reauthErr := gh.CanWriteRepository(reauthCtx, job.Owner, job.Repo, job.Author)
+	reauthCancel()
+	if reauthErr != nil || !allowed {
+		log.Printf("[jobs] Push-time reauthorization denied for job %s by %q on %s/%s: allowed=%v err=%v",
+			job.ID, job.Author, job.Owner, job.Repo, allowed, reauthErr)
+		deniedMsg := fmt.Sprintf("🚫 Push-time reauthorization denied for @%s: collaborator permissions were revoked or could not be verified (D-26). Changes were not pushed.", job.Author)
+		_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, deniedMsg)
+		if job.StatusCommentID > 0 {
+			_ = e.publishStatus(ctx, pub, job, "🚫 Push-time reauthorization denied.")
+		}
+		job.Status = "failed"
+		job.Error = fmt.Sprintf("push-time reauthorization denied: actor %s", job.Author)
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+
+	// 8. GetPR live head again; live not equal to job.HeadSHA posts stale-abort comment, marks superseded, zero push
+	livePR2, prErr2 := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
+	if prErr2 != nil || livePR2 == nil {
+		job.Status = "failed"
+		job.Error = "failed fetching live PR head before push"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return fmt.Errorf("failed fetching live PR head before push: %v", prErr2)
+	}
+
+	shortSHA := job.HeadSHA
+	if len(shortSHA) > 7 {
+		shortSHA = shortSHA[:7]
+	}
+
+	if livePR2.HeadSHA != job.HeadSHA {
+		log.Printf("[jobs] Head moved during edit/verify for %s (job=%s, live=%s)", job.ID, job.HeadSHA, livePR2.HeadSHA)
+		staleMsg := fmt.Sprintf("⏭️ Branch head changed since request for commit %s. Commit was not applied; please re-request on the latest commit.", shortSHA)
+		_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, staleMsg)
+		if job.StatusCommentID > 0 {
+			_ = e.publishStatus(ctx, pub, job, fmt.Sprintf("⏭️ Head moved since commit %s; superseded.", shortSHA))
+		}
+		job.Status = "superseded"
+		job.HeadSHA = livePR2.HeadSHA
+		job.BaseSHA = livePR2.BaseSHA
+		job.Error = "head moved during edit processing"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+
+	// Mint PushCredential via CreatePushCredential for head repoID only, revoke in defer
+	cred, credErr := gh.CreatePushCredential(ctx, job.Owner, job.Repo, job.PRKey.RepoID)
+	if credErr == nil && cred != nil {
+		defer func() {
+			_ = gh.RevokePushCredential(context.Background(), cred)
+		}()
+	}
+
+	headline := ghclient.SanitizeCommitHeadline(englishSummary, job.Payload, shortSHA)
+	newOID, commitErr := gh.CommitFilesAtExpectedHead(ctx, job.Owner, job.Repo, livePR2.HeadRef, job.HeadSHA, headline, verifiedFiles, nil)
+	if commitErr != nil {
+		if errors.Is(commitErr, ghclient.ErrHeadMoved) {
+			log.Printf("[jobs] Head moved during commit mutation for %s: %v", job.ID, commitErr)
+			staleMsg := fmt.Sprintf("⏭️ Branch head changed since request for commit %s. Commit was not applied; please re-request on the latest commit.", shortSHA)
+			_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, staleMsg)
+			if job.StatusCommentID > 0 {
+				_ = e.publishStatus(ctx, pub, job, fmt.Sprintf("⏭️ Head moved since commit %s; superseded.", shortSHA))
+			}
+			job.Status = "superseded"
+			job.Error = "head moved during commit mutation"
+			now := time.Now().UTC()
+			job.FinishedAt = &now
+			_ = e.store.UpdateJob(ctx, job)
+			return nil
+		}
+		if strings.Contains(commitErr.Error(), "403") || strings.Contains(commitErr.Error(), "422") {
+			log.Printf("[jobs] Commit mutation rejected for %s: %v", job.ID, commitErr)
+			refuseMsg := fmt.Sprintf("🚫 Commit mutation rejected by GitHub (%v). Changes could not be pushed.", commitErr)
+			_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, refuseMsg)
+			if job.StatusCommentID > 0 {
+				_ = e.publishStatus(ctx, pub, job, "🚫 Commit mutation rejected by GitHub.")
+			}
+			job.Status = "failed"
+			job.Error = commitErr.Error()
+			now := time.Now().UTC()
+			job.FinishedAt = &now
+			_ = e.store.UpdateJob(ctx, job)
+			return nil
+		}
+		if ghclient.IsUncertainWriteError(commitErr) {
+			log.Printf("[jobs] Uncertain write error during commit mutation for %s: %v", job.ID, commitErr)
+			e.markNeedsAttention(ctx, job, fmt.Sprintf("uncertain commit mutation; requires operator resolution: %v", commitErr))
+			return commitErr
+		}
+
+		job.Status = "failed"
+		job.Error = commitErr.Error()
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return commitErr
+	}
+
+	// 9. On success persist LastBotCommitSHA, LastBotBaseSHA, and appended instruction (cap 5) to PRState,
+	// post final summary comment, transition recycled status to pushed.
+	if prState == nil {
+		prState = &PRState{
+			PRKey:  job.PRKey,
+			Owner:  job.Owner,
+			Repo:   job.Repo,
+			Number: job.PRNumber,
+		}
+	}
+	prState.LastBotCommitSHA = newOID
+	prState.LastBotBaseSHA = job.BaseSHA
+	prState.AppendEditInstruction(job.Payload)
+	_ = e.store.UpdatePRState(ctx, prState)
+
+	var sb strings.Builder
+	sb.WriteString("### 🤖 Applied Edits Summary\n\n")
+	sb.WriteString(fmt.Sprintf("**Commit:** `%s`\n", newOID))
+	sb.WriteString(fmt.Sprintf("**Verification:** `%s`\n\n", report.Status))
+	sb.WriteString("**Files Changed:**\n")
+	for _, f := range editResult.FilesChanged {
+		sb.WriteString(fmt.Sprintf("- `%s`\n", f))
+	}
+	if editResult.OmissionNotice != "" {
+		sb.WriteString(fmt.Sprintf("\n⚠️ **Notice:** %s\n", editResult.OmissionNotice))
+	}
+
+	_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, sb.String())
+
+	newShortOID := newOID
+	if len(newShortOID) > 7 {
+		newShortOID = newShortOID[:7]
+	}
+	pushedText := fmt.Sprintf("✅ Edits verified and committed as `%s`", newShortOID)
+	_ = e.publishStatus(ctx, pub, job, pushedText)
 
 	job.Status = "completed"
 	now := time.Now().UTC()
