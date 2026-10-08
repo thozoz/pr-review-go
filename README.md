@@ -3,7 +3,7 @@
 AI PR Reviewer and read-only Interactive Assistant written in Go. Project build/test verification runs inside rootless Podman containers on Linux with dedicated 3 GiB storage slots and cgroups v2 boundaries; on non-Linux platforms (macOS/Windows) or unprovisioned systems, verification is safely reported as unavailable. Assistant mutations and one-click code suggestions remain permanently disabled.
 
 Inspired by GitHub Copilot's agentic architecture and PR-Agent:
-1. **Isolated Verification & Truthful Results**: On Linux with operator-configured Podman, PR builds and tests execute inside disposable rootless containers (`network=none`, 2 GiB RAM, 3 GiB fixed ext4 slot leases). On macOS, Windows, or systems without operator sandboxing, verification truthfully reports `unavailable` with 0 commands executed on the host. See [docs/SANDBOX.md](docs/SANDBOX.md).
+1. **Isolated Verification & Truthful Results**: On Linux with operator-configured Podman, PR builds and tests execute inside disposable rootless containers (`network=none`, 2 GiB RAM, 3 GiB fixed ext4 slot leases). On macOS, Windows, or systems without operator sandboxing, verification truthfully reports `unavailable` with 0 commands executed on the host.
 2. **Review Discussion & Thread Awareness**: Gathers existing PR comments and inline review discussions. Tracks whether previous review feedback was addressed in new commits and prevents repeating resolved debates.
 3. **Discussion Summarizer (`/summarize`)**: Instantly compiles all PR comments, debates, and reviewer feedback into an executive summary table (zero sandbox overhead).
 4. **Read-only PR Assistant (`@bot` / `/ask`)**: Allows repository writers to ask about PR files, using `read_file` and `list_files` within an `os.OpenRoot` confined snapshot. File writes, command execution, and pushes are permanently disabled.
@@ -66,8 +66,7 @@ pr-review-server -version
 ```
 
 The npm wrapper selects one of six platform packages through optional dependencies.
-Do not install with `--omit=optional`. npm publication is initially disabled;
-see [release setup](docs/RELEASING.md) for the one-time publisher configuration.
+Do not install with `--omit=optional`. npm publication is initially disabled and requires one-time npm Trusted Publisher configuration.
 
 ### 1. Build
 ```bash
@@ -127,9 +126,7 @@ When running in server mode:
 - **Automatic Review Coalescing**: Subsequent commits during an active review coalesce into a single follow-up review of the latest commit; outdated reports are discarded before publication.
 - **Status Comment Recycling & Outbox**: A dedicated background StatusOutbox publishes durable queued status comments immediately; transitions recycle the same status comment per PR.
 - **Rerun Protection**: Repeated comment deliveries are deduplicated within the retention window; fresh `/review` comments on already-reviewed commits explicitly rerun and display `"This commit was already reviewed. Reviewing again."`.
-- **Offline Disaster Recovery**: Blocked or crashed jobs can be inspected and resolved using `WEBHOOK_STATE_DIR=/path ./bin/pr-review-server --queue-inspect` and `--queue-resolve` (`confirmed`, `rerun`, `cancel`).
-
-For full configuration tables, capacity limits, redelivery warnings, and recovery runbooks, see [docs/WEBHOOK_OPERATIONS.md](docs/WEBHOOK_OPERATIONS.md).
+- **Offline Disaster Recovery**: Blocked or crashed jobs can be inspected and resolved using `WEBHOOK_STATE_DIR=/path ./bin/pr-review-server --queue-inspect` and `--queue-resolve` (`confirmed`, `rerun`, `cancel`). Full configuration tables and recovery runbooks ship with the local operator docs.
 
 Incoming webhook triggers:
 - `pull_request`: `opened` -> auto-labels + code review
