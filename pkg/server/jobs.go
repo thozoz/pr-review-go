@@ -9,7 +9,9 @@ import (
 	"time"
 
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
+	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/llm"
+	"github.com/thozoz/pr-review-go/pkg/retry"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
 
@@ -93,6 +95,58 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 	}
 }
 
+// deferCap resolves the maximum park duration for a deferred attempt: the
+// configured DeferMaxWait when available, otherwise the package default.
+func (e *ServerJobExecutor) deferCap() time.Duration {
+	if e.server != nil && e.server.cfg != nil && e.server.cfg.DeferMaxWait > 0 {
+		return e.server.cfg.DeferMaxWait
+	}
+	return config.DefaultDeferMaxWait
+}
+
+// budgetWait extracts the required retry wait when err signals that the
+// worker-useful retry budget is exhausted. ok is false for any other error.
+func budgetWait(err error) (wait time.Duration, ok bool) {
+	var budgetErr *retry.ExceedsWorkerBudgetError
+	if errors.As(err, &budgetErr) {
+		return budgetErr.RequiredWait, true
+	}
+	if errors.Is(err, retry.ErrJobBudgetExhausted) {
+		return 0, true
+	}
+	return 0, false
+}
+
+// deferForExhaustedBudget parks the job as a durable deferred attempt due at
+// now + min(requiredWait, cap) and frees the worker: the job returns to
+// queued (ClaimNextJob skips it until due) and the caller must return nil so
+// the scheduler releases the PR slot. A visible waiting notice reuses the
+// same owned status comment; its failure is cosmetic and never fails the
+// deferral itself. On claim the executor's normal pre-generation head checks
+// retarget moved heads, so deferred attempts always resume with latest-head
+// semantics and pre-publication head/generation gates still apply.
+func (e *ServerJobExecutor) deferForExhaustedBudget(ctx context.Context, job *Job, requiredWait time.Duration, reason string) error {
+	cap := e.deferCap()
+	wait := requiredWait
+	if wait <= 0 || wait > cap {
+		wait = cap
+	}
+	due := time.Now().UTC().Add(wait)
+	deferred, err := e.store.DeferJob(ctx, job.ID, due, reason)
+	if err != nil {
+		return fmt.Errorf("persist deferred attempt: %w", err)
+	}
+	*job = *deferred
+	log.Printf("[jobs] Deferred %s until %s (%s); worker released", job.ID, due.Format(time.RFC3339), reason)
+	if e.server != nil && e.server.gh != nil {
+		pub := NewPublication(e.store, e.server.gh)
+		if _, serr := pub.PublishStatus(ctx, job, fmt.Sprintf("⏳ Rate limited; retry deferred until %s. Worker released; review resumes automatically.", due.Format(time.RFC3339))); serr != nil {
+			log.Printf("[jobs] Deferred-status notice for %s failed (continuing): %v", job.ID, serr)
+		}
+	}
+	return nil
+}
+
 func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) error {
 	gh := e.server.gh
 	engine := e.server.engine
@@ -117,6 +171,9 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	livePR, prErr := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
 	if prErr != nil {
 		log.Printf("[jobs] Failed fetching live PR for %s: %v", job.ID, prErr)
+		if wait, ok := budgetWait(prErr); ok {
+			return e.deferForExhaustedBudget(ctx, job, wait, fmt.Sprintf("retry wait exceeds worker budget: %v", prErr))
+		}
 		job.Status = "failed"
 		job.Error = prErr.Error()
 		now := time.Now().UTC()
@@ -199,6 +256,9 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	report, err := engine.ReviewPRAtHead(ctx, job.Owner, job.Repo, job.PRNumber, job.HeadSHA)
 	if err != nil {
 		log.Printf("[jobs] Review failed for %s: %v", job.ID, err)
+		if wait, ok := budgetWait(err); ok {
+			return e.deferForExhaustedBudget(ctx, job, wait, fmt.Sprintf("retry wait exceeds worker budget: %v", err))
+		}
 		if job.StatusCommentID > 0 {
 			_, _ = pub.PublishStatus(ctx, job, fmt.Sprintf("❌ Review failed: %v", err))
 		}
@@ -375,10 +435,44 @@ func (e *ServerJobExecutor) executeDescribeJob(ctx context.Context, job *Job) er
 	return err
 }
 
+// markNeedsAttention records an unprovable write outcome as needs_attention
+// via the existing operator resolve path: the job stays nonterminal with no
+// FinishedAt, and only its own PR is blocked per HasBlockedAction semantics.
+func (e *ServerJobExecutor) markNeedsAttention(ctx context.Context, job *Job, reason string) {
+	job.Status = "needs_attention"
+	job.Error = reason
+	job.FinishedAt = nil
+	if err := e.store.UpdateJob(ctx, job); err != nil {
+		log.Printf("[jobs] Failed persisting needs_attention for %s: %v", job.ID, err)
+		return
+	}
+	st, err := e.store.GetPRState(ctx, job.PRKey)
+	if err != nil {
+		if !errors.Is(err, ErrPRNotFound) {
+			log.Printf("[jobs] Failed reading PR state for %s: %v", job.ID, err)
+			return
+		}
+		st = &PRState{PRKey: job.PRKey, Owner: job.Owner, Repo: job.Repo, Number: job.PRNumber}
+	}
+	st.HasBlockedAction = true
+	st.BlockedReason = fmt.Sprintf("job %s is needs_attention", job.ID)
+	if err := e.store.UpdatePRState(ctx, st); err != nil {
+		log.Printf("[jobs] Failed marking PR %s blocked for %s: %v", job.PRKey, job.ID, err)
+	}
+}
+
 func (e *ServerJobExecutor) executeImproveJob(ctx context.Context, job *Job) error {
 	const message = "## PR Improvement Suggestions\n\nOne-click suggestions are unavailable until isolated project verification is configured. No build or tests were run."
 	err := e.server.gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, message)
 	if err != nil {
+		// An ambiguous write must never be retried blindly: without owned
+		// proof the outcome is unprovable, so the job becomes
+		// needs_attention for operator resolution via the existing
+		// --queue-resolve path. Exactly one remote create was attempted.
+		if ghclient.IsUncertainWriteError(err) {
+			e.markNeedsAttention(ctx, job, fmt.Sprintf("uncertain comment write; requires operator resolution: %v", err))
+			return err
+		}
 		job.Status = "failed"
 		job.Error = err.Error()
 	} else {
@@ -460,6 +554,9 @@ type Scheduler struct {
 	activePRs   map[string]bool
 	llmGate     llm.RequestGate
 	sandboxGate sandbox.AdmissionGate
+	// deferPollInterval bounds the idle wake when deferred attempts are
+	// parked: workers sleep at most this long before re-checking due jobs.
+	deferPollInterval time.Duration
 	mu          sync.Mutex
 	wakeCh      chan struct{}
 	stopCh      chan struct{}
@@ -472,13 +569,25 @@ func NewScheduler(store JobStore, executor JobExecutor, workers int) *Scheduler 
 		workers = 2
 	}
 	return &Scheduler{
-		store:     store,
-		executor:  executor,
-		workers:   workers,
-		activePRs: make(map[string]bool),
-		wakeCh:    make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
+		store:             store,
+		executor:          executor,
+		workers:           workers,
+		activePRs:         make(map[string]bool),
+		deferPollInterval: config.DefaultDeferPollInterval,
+		wakeCh:            make(chan struct{}, 1),
+		stopCh:            make(chan struct{}),
 	}
+}
+
+// SetDeferPollInterval overrides the bounded idle poll for due deferred
+// attempts. Non-positive values keep the current setting.
+func (s *Scheduler) SetDeferPollInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deferPollInterval = d
 }
 
 // SetLLMGate assigns a shared LLM RequestGate to the scheduler.
@@ -601,7 +710,7 @@ func (s *Scheduler) workerLoop(ctx context.Context, workerID int) {
 		if job == nil {
 			select {
 			case <-s.wakeCh:
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(s.idleWait(ctx)):
 			case <-s.stopCh:
 				return
 			case <-ctx.Done():
@@ -625,6 +734,34 @@ func (s *Scheduler) workerLoop(ctx context.Context, workerID int) {
 		_ = s.executor.ExecuteJob(execCtx, job)
 		s.releaseJob(job)
 	}
+}
+
+// idleWait bounds how long a worker sleeps when no job is claimable. With no
+// parked deferral it stays at the fast 100ms poll; when deferred attempts are
+// waiting it sleeps until the earliest due time, capped by the configured
+// poll interval, so due jobs resume promptly without hot-spinning.
+func (s *Scheduler) idleWait(ctx context.Context) time.Duration {
+	const fastPoll = 100 * time.Millisecond
+	s.mu.Lock()
+	poll := s.deferPollInterval
+	s.mu.Unlock()
+	if poll <= 0 {
+		poll = config.DefaultDeferPollInterval
+	}
+	due, ok, err := s.store.EarliestDeferredDue(ctx)
+	if err != nil || !ok {
+		return fastPoll
+	}
+	until := time.Until(due)
+	if until <= 0 {
+		// Due but unclaimable (blocked PR or active worker): back off to the
+		// bounded poll instead of spinning.
+		return poll
+	}
+	if until > poll {
+		return poll
+	}
+	return until
 }
 
 func (s *Scheduler) claimNextJob(ctx context.Context) *Job {

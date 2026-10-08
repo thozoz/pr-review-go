@@ -16,13 +16,25 @@ import (
 	"strings"
 
 	"github.com/google/go-github/v68/github"
+	"github.com/thozoz/pr-review-go/pkg/retry"
 	"golang.org/x/oauth2"
 )
 
 type Client struct {
-	gh         *github.Client
-	appAuth    *AppAuth
-	graphQLURL string
+	gh          *github.Client
+	appAuth     *AppAuth
+	graphQLURL  string
+	retryPolicy retry.Policy
+}
+
+// SetRetryPolicy customizes retry policy for GitHub read operations.
+func (c *Client) SetRetryPolicy(p retry.Policy) {
+	c.retryPolicy = p
+}
+
+// SetClock allows injecting a fake clock for testing.
+func (c *Client) SetClock(clk retry.Clock) {
+	c.retryPolicy.Clock = clk
 }
 
 // InlineSuggestion is a one-click replacement attached to a changed PR line.
@@ -54,14 +66,18 @@ func (c *Client) ghForRepo(ctx context.Context, owner, repo string) (*github.Cli
 
 func NewClient(token string) *Client {
 	if token == "" {
-		return &Client{gh: github.NewClient(nil)}
+		return &Client{
+			gh:          github.NewClient(nil),
+			retryPolicy: retry.DefaultPolicy(),
+		}
 	}
 	ctx := context.Background()
 	var httpClient = oauth2.NewClient(ctx, oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token},
 	))
 	return &Client{
-		gh: github.NewClient(httpClient),
+		gh:          github.NewClient(httpClient),
+		retryPolicy: retry.DefaultPolicy(),
 	}
 }
 
@@ -76,7 +92,10 @@ func NewTestClient(baseURL string) (*Client, error) {
 		u.Path += "/"
 	}
 	gh.BaseURL = u
-	return &Client{gh: gh}, nil
+	return &Client{
+		gh:          gh,
+		retryPolicy: retry.DefaultPolicy(),
+	}, nil
 }
 
 // NewTestClientWithToken creates a GitHub client pointed at a custom base URL with a static token for testing.
@@ -143,53 +162,55 @@ func ParsePRURL(prURL string) (owner string, repo string, number int, err error)
 func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PRDetails, error) {
 	owner = strings.TrimSpace(owner)
 	repo = strings.TrimSpace(repo)
-	ghClient, err := c.ghForRepo(ctx, owner, repo)
-	if err != nil {
-		return nil, err
-	}
+	return retry.Do(ctx, c.retryPolicy, retry.OpKindRead, func(attemptCtx context.Context) (*PRDetails, error) {
+		ghClient, err := c.ghForRepo(attemptCtx, owner, repo)
+		if err != nil {
+			return nil, err
+		}
 
-	pr, _, err := ghClient.PullRequests.Get(ctx, owner, repo, number)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pull request: %w", err)
-	}
+		pr, _, err := ghClient.PullRequests.Get(attemptCtx, owner, repo, number)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get pull request: %w", err)
+		}
 
-	var headRepoOwner string
-	var headRepoName string
-	var headRepoID int64
-	var cloneURL string
-	var headRef string
-	var headSHA string
+		var headRepoOwner string
+		var headRepoName string
+		var headRepoID int64
+		var cloneURL string
+		var headRef string
+		var headSHA string
 
-	if head := pr.GetHead(); head != nil {
-		headRef = head.GetRef()
-		headSHA = head.GetSHA()
-		if hr := head.GetRepo(); hr != nil {
-			cloneURL = hr.GetCloneURL()
-			headRepoName = hr.GetName()
-			headRepoID = hr.GetID()
-			if hrOwner := hr.GetOwner(); hrOwner != nil {
-				headRepoOwner = hrOwner.GetLogin()
+		if head := pr.GetHead(); head != nil {
+			headRef = head.GetRef()
+			headSHA = head.GetSHA()
+			if hr := head.GetRepo(); hr != nil {
+				cloneURL = hr.GetCloneURL()
+				headRepoName = hr.GetName()
+				headRepoID = hr.GetID()
+				if hrOwner := hr.GetOwner(); hrOwner != nil {
+					headRepoOwner = hrOwner.GetLogin()
+				}
 			}
 		}
-	}
 
-	return &PRDetails{
-		Owner:         owner,
-		Repo:          repo,
-		Number:        number,
-		Title:         pr.GetTitle(),
-		Body:          pr.GetBody(),
-		Author:        pr.GetUser().GetLogin(),
-		BaseRef:       pr.GetBase().GetRef(),
-		BaseSHA:       pr.GetBase().GetSHA(),
-		HeadRef:       headRef,
-		HeadSHA:       headSHA,
-		HeadRepoOwner: headRepoOwner,
-		HeadRepoName:  headRepoName,
-		HeadRepoID:    headRepoID,
-		CloneURL:      cloneURL,
-		CreatedAt:     pr.GetCreatedAt().Time,
-	}, nil
+		return &PRDetails{
+			Owner:         owner,
+			Repo:          repo,
+			Number:        number,
+			Title:         pr.GetTitle(),
+			Body:          pr.GetBody(),
+			Author:        pr.GetUser().GetLogin(),
+			BaseRef:       pr.GetBase().GetRef(),
+			BaseSHA:       pr.GetBase().GetSHA(),
+			HeadRef:       headRef,
+			HeadSHA:       headSHA,
+			HeadRepoOwner: headRepoOwner,
+			HeadRepoName:  headRepoName,
+			HeadRepoID:    headRepoID,
+			CloneURL:      cloneURL,
+			CreatedAt:     pr.GetCreatedAt().Time,
+		}, nil
+	})
 }
 
 // GetRepoID returns the numeric GitHub repository ID for owner/repo.
@@ -266,45 +287,51 @@ func (c *Client) GetCommit(ctx context.Context, owner, repo, sha string) (*githu
 func (c *Client) GetTree(ctx context.Context, owner, repo, sha string, recursive bool) (*github.Tree, error) {
 	owner = strings.TrimSpace(owner)
 	repo = strings.TrimSpace(repo)
-	ghClient, err := c.ghForRepo(ctx, owner, repo)
-	if err != nil {
-		return nil, err
-	}
-	tree, _, err := ghClient.Git.GetTree(ctx, owner, repo, sha, recursive)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tree for %s: %w", sha, err)
-	}
-	return tree, nil
+	return retry.Do(ctx, c.retryPolicy, retry.OpKindRead, func(attemptCtx context.Context) (*github.Tree, error) {
+		ghClient, err := c.ghForRepo(attemptCtx, owner, repo)
+		if err != nil {
+			return nil, err
+		}
+		tree, _, err := ghClient.Git.GetTree(attemptCtx, owner, repo, sha, recursive)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get tree for %s: %w", sha, err)
+		}
+		return tree, nil
+	})
 }
 
 // GetBlob retrieves a git blob by SHA.
 func (c *Client) GetBlob(ctx context.Context, owner, repo, sha string) (*github.Blob, error) {
 	owner = strings.TrimSpace(owner)
 	repo = strings.TrimSpace(repo)
-	ghClient, err := c.ghForRepo(ctx, owner, repo)
-	if err != nil {
-		return nil, err
-	}
-	blob, _, err := ghClient.Git.GetBlob(ctx, owner, repo, sha)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get blob %s: %w", sha, err)
-	}
-	return blob, nil
+	return retry.Do(ctx, c.retryPolicy, retry.OpKindRead, func(attemptCtx context.Context) (*github.Blob, error) {
+		ghClient, err := c.ghForRepo(attemptCtx, owner, repo)
+		if err != nil {
+			return nil, err
+		}
+		blob, _, err := ghClient.Git.GetBlob(attemptCtx, owner, repo, sha)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get blob %s: %w", sha, err)
+		}
+		return blob, nil
+	})
 }
 
 // GetBlobRaw retrieves raw bytes of a git blob by SHA.
 func (c *Client) GetBlobRaw(ctx context.Context, owner, repo, sha string) ([]byte, error) {
 	owner = strings.TrimSpace(owner)
 	repo = strings.TrimSpace(repo)
-	ghClient, err := c.ghForRepo(ctx, owner, repo)
-	if err != nil {
-		return nil, err
-	}
-	data, _, err := ghClient.Git.GetBlobRaw(ctx, owner, repo, sha)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get raw blob %s: %w", sha, err)
-	}
-	return data, nil
+	return retry.Do(ctx, c.retryPolicy, retry.OpKindRead, func(attemptCtx context.Context) ([]byte, error) {
+		ghClient, err := c.ghForRepo(attemptCtx, owner, repo)
+		if err != nil {
+			return nil, err
+		}
+		data, _, err := ghClient.Git.GetBlobRaw(attemptCtx, owner, repo, sha)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get raw blob %s: %w", sha, err)
+		}
+		return data, nil
+	})
 }
 
 func (c *Client) GetRawDiff(ctx context.Context, owner, repo string, number int) (string, error) {
@@ -434,6 +461,21 @@ func (c *Client) CanWriteRepository(ctx context.Context, owner, repo, username s
 	default:
 		return false, nil
 	}
+}
+
+// ClassifyWriteError classifies an error from a GitHub write operation
+// (comment create/edit, label or body mutation) using the shared retry
+// classifier. It is the write-path reconcile-first guard: callers must route
+// ClassUncertainWrite outcomes to reconciliation/operator attention instead
+// of blind POST retries, because the remote effect is unprovable.
+func ClassifyWriteError(err error) retry.Classification {
+	return retry.ClassifyError(err, retry.OpKindWrite)
+}
+
+// IsUncertainWriteError reports whether a write error has an unprovable
+// remote outcome (timeout, lost response, ambiguous 5xx on POST).
+func IsUncertainWriteError(err error) bool {
+	return ClassifyWriteError(err) == retry.ClassUncertainWrite
 }
 
 // CreateComment creates a comment on an issue or pull request and returns its numeric ID.
@@ -848,18 +890,20 @@ func (c *Client) GetDiffAtCommits(ctx context.Context, owner, repo, baseOID, hea
 		return "", fmt.Errorf("invalid head commit OID: %w", err)
 	}
 
-	ghClient, err := c.ghForRepo(ctx, owner, repo)
-	if err != nil {
-		return "", err
-	}
+	return retry.Do(ctx, c.retryPolicy, retry.OpKindRead, func(attemptCtx context.Context) (string, error) {
+		ghClient, err := c.ghForRepo(attemptCtx, owner, repo)
+		if err != nil {
+			return "", err
+		}
 
-	diff, _, err := ghClient.Repositories.CompareCommitsRaw(ctx, owner, repo, baseOID, headOID, github.RawOptions{
-		Type: github.Diff,
+		diff, _, err := ghClient.Repositories.CompareCommitsRaw(attemptCtx, owner, repo, baseOID, headOID, github.RawOptions{
+			Type: github.Diff,
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to get diff between %s and %s: %w", baseOID, headOID, err)
+		}
+		return diff, nil
 	})
-	if err != nil {
-		return "", fmt.Errorf("failed to get diff between %s and %s: %w", baseOID, headOID, err)
-	}
-	return diff, nil
 }
 
 const maxGraphQLResponseBytes = 1 << 20 // 1 MiB bound for response decoding
