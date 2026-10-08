@@ -34,30 +34,89 @@ func NewEngine(cfg *config.Config) *Engine {
 	}
 }
 
+// NewEngineWithClients creates an Engine with injected dependencies for isolated tests.
+func NewEngineWithClients(cfg *config.Config, gh *github.Client, llmClient *llm.Client, sandboxRunner *sandbox.Runner) *Engine {
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
+	return &Engine{
+		cfg:     cfg,
+		gh:      gh,
+		sandbox: sandboxRunner,
+		llm:     llmClient,
+	}
+}
+
 func (e *Engine) SetSandbox(s *sandbox.Runner) {
 	e.sandbox = s
 }
 
-func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (*ReviewReport, error) {
-	// 1. Fetch PR details
+// ReviewPRAtHead verifies the expected commit OID, fetches PR details, ensures
+// the PR head matches expectedHead, retrieves the diff using GetDiffAtCommits,
+// and executes the review bound to that immutable head.
+func (e *Engine) ReviewPRAtHead(ctx context.Context, owner, repo string, number int, expectedHead string) (*ReviewReport, error) {
+	if err := github.ValidateCommitOID(expectedHead); err != nil {
+		return nil, fmt.Errorf("invalid expected head commit OID: %w", err)
+	}
+
 	pr, err := e.gh.GetPR(ctx, owner, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch PR: %w", err)
 	}
 
-	// 2. Fetch Raw Diff with size limit
+	if err := github.ValidateCommitOID(pr.BaseSHA); err != nil {
+		return nil, fmt.Errorf("invalid PR base commit OID: %w", err)
+	}
+	if err := github.ValidateCommitOID(pr.HeadSHA); err != nil {
+		return nil, fmt.Errorf("invalid PR head commit OID: %w", err)
+	}
+
+	if pr.HeadSHA != expectedHead {
+		return nil, fmt.Errorf("expected head SHA %s does not match PR head SHA %s", expectedHead, pr.HeadSHA)
+	}
+
+	diff, err := e.gh.GetDiffAtCommits(ctx, owner, repo, pr.BaseSHA, pr.HeadSHA)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch diff at commits: %w", err)
+	}
+
+	report, err := e.executeReview(ctx, pr, diff)
+	if err != nil {
+		return nil, err
+	}
+	if report.HeadSHA != expectedHead {
+		return nil, fmt.Errorf("report head SHA %s does not match expected head %s", report.HeadSHA, expectedHead)
+	}
+	return report, nil
+}
+
+func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (*ReviewReport, error) {
+	pr, err := e.gh.GetPR(ctx, owner, repo, number)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch PR: %w", err)
+	}
+
+	if err := github.ValidateCommitOID(pr.BaseSHA); err == nil && github.ValidateCommitOID(pr.HeadSHA) == nil {
+		return e.ReviewPRAtHead(ctx, owner, repo, number, pr.HeadSHA)
+	}
+
 	diff, err := e.gh.GetRawDiff(ctx, owner, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch diff: %w", err)
 	}
+	return e.executeReview(ctx, pr, diff)
+}
 
-	// Limit diff size to prevent token overflow
+func (e *Engine) executeReview(ctx context.Context, pr *github.PRDetails, diff string) (*ReviewReport, error) {
+	owner := pr.Owner
+	repo := pr.Repo
+	number := pr.Number
+
 	const maxDiffSize = 120000 // ~120KB, roughly 30k tokens
 	if len(diff) > maxDiffSize {
 		diff = diff[:maxDiffSize] + "\n\n... [diff truncated, exceeded size limit] ..."
 	}
 
-	// 3. Fetch Comments & Discussions
 	generalComments, threads, err := e.gh.GetComments(ctx, owner, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch comments: %w", err)
@@ -71,8 +130,18 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	if e.cfg.EnableSandbox && e.sandbox != nil {
 		snapshot, cleanup, err := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 		if err == nil {
-			defer cleanup()
+			var cleaned bool
+			cleanOnce := func() {
+				if !cleaned && cleanup != nil {
+					cleaned = true
+					cleanup()
+				}
+			}
+			defer cleanOnce()
+
 			verReport, err := e.sandbox.RunSnapshot(ctx, snapshot)
+			cleanOnce() // Immediate post-verification snapshot cleanup before completion request
+
 			if err == nil {
 				verificationStatus = verReport.Status
 				verificationReason = verReport.Reason
