@@ -678,6 +678,80 @@ func FormatReportMarkdown(r *ReviewReport) string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("## 🤖 PR Review Report: %s (Score: %d/100)\n\n", r.PRTitle, r.Score))
+
+	cov := r.GetCoverage()
+	isPartial := cov != nil && cov.State == CoverageStatePartial
+
+	if isPartial {
+		sb.WriteString(fmt.Sprintf("> ⚠️ **Partial Review Warning:** Review coverage is incomplete (%d of %d hunks examined, %d skipped). Unexamined changes have not been verified and are not cleared for merge.\n\n",
+			cov.ExaminedCount, cov.TotalHunks, cov.SkippedCount))
+	}
+
+	if cov != nil {
+		sb.WriteString("### 📊 Review Coverage\n")
+		if isPartial {
+			sb.WriteString(fmt.Sprintf("- **Status:** Partial (%d/%d hunks examined, %d skipped)\n",
+				cov.ExaminedCount, cov.TotalHunks, cov.SkippedCount))
+		} else {
+			sb.WriteString(fmt.Sprintf("- **Status:** Full (%d/%d hunks examined)\n",
+				cov.ExaminedCount, cov.TotalHunks))
+		}
+
+		const maxItems = 25
+
+		if len(cov.ExaminedHunks) > 0 {
+			sb.WriteString("- **Examined Hunks:**\n")
+			limit := len(cov.ExaminedHunks)
+			if limit > maxItems {
+				limit = maxItems
+			}
+			for i := 0; i < limit; i++ {
+				sb.WriteString(fmt.Sprintf("  - `%s`\n", cov.ExaminedHunks[i]))
+			}
+			if len(cov.ExaminedHunks) > maxItems {
+				sb.WriteString(fmt.Sprintf("  - *... and %d more examined hunks (%d total examined)*\n",
+					len(cov.ExaminedHunks)-maxItems, cov.ExaminedCount))
+			}
+		}
+
+		if len(cov.SkippedHunks) > 0 {
+			sb.WriteString("- **Skipped Hunks:**\n")
+			limit := len(cov.SkippedHunks)
+			if limit > maxItems {
+				limit = maxItems
+			}
+			for i := 0; i < limit; i++ {
+				item := cov.SkippedHunks[i]
+				reason := item.Reason
+				if reason == "" {
+					reason = "not examined"
+				}
+				sb.WriteString(fmt.Sprintf("  - `%s`: %s\n", item.ID, reason))
+			}
+			if len(cov.SkippedHunks) > maxItems {
+				sb.WriteString(fmt.Sprintf("  - *... and %d more skipped hunks (%d total skipped)*\n",
+					len(cov.SkippedHunks)-maxItems, len(cov.SkippedHunks)))
+			}
+		}
+
+		if len(cov.Omissions) > 0 {
+			sb.WriteString("- **Omissions & Unsupported Changes:**\n")
+			limit := len(cov.Omissions)
+			if limit > maxItems {
+				limit = maxItems
+			}
+			for i := 0; i < limit; i++ {
+				item := cov.Omissions[i]
+				sb.WriteString(fmt.Sprintf("  - `%s`: %s\n", item.ID, item.Reason))
+			}
+			if len(cov.Omissions) > maxItems {
+				sb.WriteString(fmt.Sprintf("  - *... and %d more omissions (%d total omissions)*\n",
+					len(cov.Omissions)-maxItems, len(cov.Omissions)))
+			}
+		}
+		sb.WriteString("\n")
+	}
+
 	if r.RulesSource != "" {
 		sb.WriteString(fmt.Sprintf("📋 **Custom Guidelines Enforced:** `%s`\n\n", r.RulesSource))
 	}
@@ -700,9 +774,17 @@ func FormatReportMarkdown(r *ReviewReport) string {
 
 	if len(r.Findings) == 0 {
 		if r.DeduplicatedCount > 0 {
-			sb.WriteString(fmt.Sprintf("### 🎯 Findings\nAll %d detected issues were already reported previously and have been deduplicated.\n\n", r.DeduplicatedCount))
+			if isPartial {
+				sb.WriteString(fmt.Sprintf("### 🎯 Findings\nAll %d detected issues were already reported previously and have been deduplicated.\n\n*Note: Review coverage was partial; unexamined changes have not been verified.*\n\n", r.DeduplicatedCount))
+			} else {
+				sb.WriteString(fmt.Sprintf("### 🎯 Findings\nAll %d detected issues were already reported previously and have been deduplicated.\n\n", r.DeduplicatedCount))
+			}
 		} else {
-			sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected. Looks ready to merge!\n\n")
+			if isPartial {
+				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected in examined files. (Review was partial; unexamined changes have not been verified and are not cleared for merge.)\n\n")
+			} else {
+				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected. Looks ready to merge!\n\n")
+			}
 		}
 	} else {
 		sb.WriteString("### 🎯 Findings\n")
