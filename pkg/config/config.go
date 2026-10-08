@@ -81,6 +81,13 @@ type Config struct {
 	// Deferral controls for durable parking of long retry waits
 	DeferMaxWait      time.Duration `json:"defer_max_wait"`
 	DeferPollInterval time.Duration `json:"defer_poll_interval"`
+
+	// Mermaid diagram controls (D-06, D-08)
+	EnableMermaid             bool  `json:"enable_mermaid"`
+	MermaidDirectionThreshold int   `json:"mermaid_direction_threshold"`
+	MermaidMaxNodes           int   `json:"mermaid_max_nodes"`
+	MermaidMaxEdges           int   `json:"mermaid_max_edges"`
+	MermaidMaxBytes           int64 `json:"mermaid_max_bytes"`
 }
 
 const (
@@ -180,6 +187,20 @@ const (
 	DefaultWebhookShutdownTimeout = 30 * time.Second
 	MinWebhookShutdownTimeout     = 1 * time.Second
 	MaxWebhookShutdownTimeout     = 300 * time.Second
+
+	DefaultEnableMermaid             = false
+	DefaultMermaidDirectionThreshold = 5
+	MinMermaidDirectionThreshold     = 1
+	MaxMermaidDirectionThreshold     = 100
+	DefaultMermaidMaxNodes           = 50
+	MinMermaidMaxNodes               = 2
+	MaxMermaidMaxNodes               = 500
+	DefaultMermaidMaxEdges           = 100
+	MinMermaidMaxEdges               = 1
+	MaxMermaidMaxEdges               = 1000
+	DefaultMermaidMaxBytes           = 32768 // 32 KiB
+	MinMermaidMaxBytes               = 512
+	MaxMermaidMaxBytes               = 262144 // 256 KiB
 )
 
 // Validate checks if required configuration is present and validates EffortLevel
@@ -252,6 +273,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.ValidateDefer(); err != nil {
+		return err
+	}
+
+	if err := c.ValidateMermaid(); err != nil {
 		return err
 	}
 
@@ -547,6 +572,39 @@ func (c *Config) ValidateDefer() error {
 	}
 	if c.DeferPollInterval < MinDeferPollInterval || c.DeferPollInterval > MaxDeferPollInterval {
 		return fmt.Errorf("invalid DeferPollInterval: %v (must be between %v and %v)", c.DeferPollInterval, MinDeferPollInterval, MaxDeferPollInterval)
+	}
+
+	return nil
+}
+
+// ValidateMermaid validates and defaults Mermaid diagram generation settings (D-06, D-08).
+func (c *Config) ValidateMermaid() error {
+	if c.MermaidDirectionThreshold == 0 {
+		c.MermaidDirectionThreshold = DefaultMermaidDirectionThreshold
+	}
+	if c.MermaidDirectionThreshold < MinMermaidDirectionThreshold || c.MermaidDirectionThreshold > MaxMermaidDirectionThreshold {
+		return fmt.Errorf("invalid MermaidDirectionThreshold: %d (must be between %d and %d)", c.MermaidDirectionThreshold, MinMermaidDirectionThreshold, MaxMermaidDirectionThreshold)
+	}
+
+	if c.MermaidMaxNodes == 0 {
+		c.MermaidMaxNodes = DefaultMermaidMaxNodes
+	}
+	if c.MermaidMaxNodes < MinMermaidMaxNodes || c.MermaidMaxNodes > MaxMermaidMaxNodes {
+		return fmt.Errorf("invalid MermaidMaxNodes: %d (must be between %d and %d)", c.MermaidMaxNodes, MinMermaidMaxNodes, MaxMermaidMaxNodes)
+	}
+
+	if c.MermaidMaxEdges == 0 {
+		c.MermaidMaxEdges = DefaultMermaidMaxEdges
+	}
+	if c.MermaidMaxEdges < MinMermaidMaxEdges || c.MermaidMaxEdges > MaxMermaidMaxEdges {
+		return fmt.Errorf("invalid MermaidMaxEdges: %d (must be between %d and %d)", c.MermaidMaxEdges, MinMermaidMaxEdges, MaxMermaidMaxEdges)
+	}
+
+	if c.MermaidMaxBytes == 0 {
+		c.MermaidMaxBytes = DefaultMermaidMaxBytes
+	}
+	if c.MermaidMaxBytes < MinMermaidMaxBytes || c.MermaidMaxBytes > MaxMermaidMaxBytes {
+		return fmt.Errorf("invalid MermaidMaxBytes: %d (must be between %d and %d)", c.MermaidMaxBytes, MinMermaidMaxBytes, MaxMermaidMaxBytes)
 	}
 
 	return nil
@@ -941,6 +999,47 @@ func Load() *Config {
 		}
 	}
 
+	enableMermaid := DefaultEnableMermaid
+	if raw := os.Getenv("ENABLE_MERMAID"); raw != "" {
+		enableMermaid = strings.EqualFold(raw, "true") || raw == "1"
+	}
+
+	mermaidDirectionThreshold := DefaultMermaidDirectionThreshold
+	if raw := os.Getenv("MERMAID_DIRECTION_THRESHOLD"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			mermaidDirectionThreshold = n
+		} else {
+			mermaidDirectionThreshold = -1
+		}
+	}
+
+	mermaidMaxNodes := DefaultMermaidMaxNodes
+	if raw := os.Getenv("MERMAID_MAX_NODES"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			mermaidMaxNodes = n
+		} else {
+			mermaidMaxNodes = -1
+		}
+	}
+
+	mermaidMaxEdges := DefaultMermaidMaxEdges
+	if raw := os.Getenv("MERMAID_MAX_EDGES"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			mermaidMaxEdges = n
+		} else {
+			mermaidMaxEdges = -1
+		}
+	}
+
+	mermaidMaxBytes := int64(DefaultMermaidMaxBytes)
+	if raw := os.Getenv("MERMAID_MAX_BYTES"); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			mermaidMaxBytes = n
+		} else {
+			mermaidMaxBytes = -1
+		}
+	}
+
 	return &Config{
 		GitHubToken:             token,
 		WebhookSecret:           webhookSecret,
@@ -992,7 +1091,12 @@ func Load() *Config {
 		RetryMaxDelay:            retryMaxDelay,
 		RetryMaxWait:             retryMaxWait,
 		RetryJobBudget:           retryJobBudget,
-		DeferMaxWait:             deferMaxWait,
-		DeferPollInterval:        deferPollInterval,
+		DeferMaxWait:              deferMaxWait,
+		DeferPollInterval:         deferPollInterval,
+		EnableMermaid:             enableMermaid,
+		MermaidDirectionThreshold: mermaidDirectionThreshold,
+		MermaidMaxNodes:           mermaidMaxNodes,
+		MermaidMaxEdges:           mermaidMaxEdges,
+		MermaidMaxBytes:           mermaidMaxBytes,
 	}
 }

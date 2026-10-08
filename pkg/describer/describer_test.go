@@ -242,3 +242,134 @@ func TestRunAndUpdate_IdempotencyMarkerUntouched(t *testing.T) {
 		t.Fatalf("expected updated=false when marker already present in PR body (idempotency)")
 	}
 }
+
+func TestDiagramBlock_ReplaceOnlySubBlock(t *testing.T) {
+	// D-07: author text plus Purpose plus Walkthrough byte-identical before and after diagram
+	// insertion and across re-runs (T-04-04-01)
+	authorText := "## Author Notes\nThis is handcrafted author text that must NEVER be touched.\n\nFixes #123."
+	generatedProse := "## Purpose\nAdds awesome feature.\n\n## Walkthrough\n| File | Change |\n| a.go | New function |"
+
+	initialBody := authorText + "\n\n---\n\n" + marker + "\n" + generatedProse
+	diagram1 := "```mermaid\nflowchart LR\n    A --> B\n```"
+	block1 := formatDiagramBlock(diagram1)
+
+	// 1. Backfill diagram into initial body
+	bodyWithDiagram1 := backfillDiagramBlock(initialBody, block1)
+
+	// Verify author text and prose are intact
+	if !strings.HasPrefix(bodyWithDiagram1, authorText) {
+		t.Fatalf("author text was modified after diagram insertion")
+	}
+	if !strings.Contains(bodyWithDiagram1, generatedProse) {
+		t.Fatalf("generated prose was modified after diagram insertion")
+	}
+
+	// 2. Re-run: replace diagram with new diagram
+	diagram2 := "```mermaid\nflowchart TD\n    A --> B --> C\n```"
+	block2 := formatDiagramBlock(diagram2)
+
+	bodyWithDiagram2 := replaceDiagramBlock(bodyWithDiagram1, block2)
+
+	// Verify author text and generated prose are 100% byte-identical
+	if !strings.HasPrefix(bodyWithDiagram2, authorText) {
+		t.Fatalf("author text modified across diagram replacement")
+	}
+	if !strings.Contains(bodyWithDiagram2, generatedProse) {
+		t.Fatalf("generated prose modified across diagram replacement")
+	}
+	if strings.Contains(bodyWithDiagram2, "flowchart LR") {
+		t.Fatalf("old diagram was not cleanly replaced")
+	}
+	if !strings.Contains(bodyWithDiagram2, "flowchart TD") {
+		t.Fatalf("new diagram was not inserted")
+	}
+}
+
+func TestAuthorPreserved_ReRunPreservesAuthor(t *testing.T) {
+	const authorHeader = "## My Custom Summary\nDon't touch me!"
+	body := appendDescription(authorHeader, "## Purpose\nDone.")
+	if !strings.HasPrefix(body, authorHeader) {
+		t.Fatalf("author header not preserved")
+	}
+}
+
+func TestBackfill_LegacySectionWithoutDiagramMarker(t *testing.T) {
+	// D-07: legacy single-marker section backfills by appending diagram block below
+	// existing generated content without rewriting Purpose or Walkthrough
+	const legacyProse = "## Purpose\nLegacy purpose.\n\n## Walkthrough\n| F | C |\n| f.go | mod |"
+	legacyBody := "User PR Notes\n\n---\n\n" + marker + "\n" + legacyProse
+
+	diagram := "```mermaid\nflowchart LR\n    X --> Y\n```"
+	block := formatDiagramBlock(diagram)
+
+	backfilled := backfillDiagramBlock(legacyBody, block)
+
+	if !strings.HasPrefix(backfilled, "User PR Notes") {
+		t.Fatalf("author notes altered during backfill")
+	}
+	if !strings.Contains(backfilled, legacyProse) {
+		t.Fatalf("legacy prose altered during backfill")
+	}
+	if !strings.Contains(backfilled, diagramStartMarker) || !strings.Contains(backfilled, "flowchart LR") {
+		t.Fatalf("diagram block missing in backfilled body")
+	}
+}
+
+func TestOptIn_ConfigOffProducesZeroDiagram(t *testing.T) {
+	// D-06: default OFF produces zero diagram content when commandOptIn is false
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		content := "## Purpose\nProse.\n\n## Walkthrough\n| a | b |"
+		for _, m := range req.Messages {
+			if strings.Contains(m.Content, "Mermaid") || strings.Contains(m.Content, "flowchart") {
+				content = "```mermaid\nflowchart LR\n    A --> B\n```"
+				break
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{
+				{Message: llm.ChatMessage{Role: "assistant", Content: content}},
+			},
+		})
+	}))
+	defer llmServer.Close()
+
+	cfg := &config.Config{
+		GitHubToken:   "token",
+		LLMAPIKey:     "key",
+		LLMModel:      "model",
+		LLMBaseURL:    llmServer.URL,
+		EnableMermaid: false, // Default OFF
+	}
+	d := NewDescriber(cfg)
+
+	pr := &github.PRDetails{
+		Title:  "Test",
+		Author: "alice",
+		Body:   "notes",
+	}
+
+	diff := "diff --git a/a.go b/a.go\n+func A() {}\n"
+	desc, diagram, _, err := d.GenerateWithDiagram(context.Background(), pr, diff, false)
+	if err != nil {
+		t.Fatalf("GenerateWithDiagram failed: %v", err)
+	}
+
+	if desc == "" {
+		t.Fatalf("expected prose description")
+	}
+	if diagram != "" {
+		t.Fatalf("D-06 violation: config OFF produced diagram: %q", diagram)
+	}
+
+	// Now with commandOptIn = true
+	_, diagramOptIn, _, err := d.GenerateWithDiagram(context.Background(), pr, diff, true)
+	if err != nil {
+		t.Fatalf("GenerateWithDiagram with opt-in failed: %v", err)
+	}
+	if diagramOptIn == "" {
+		t.Fatalf("expected diagram produced when commandOptIn = true")
+	}
+}

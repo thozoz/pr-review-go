@@ -772,7 +772,94 @@ func FormatReportMarkdown(r *ReviewReport) string {
 		sb.WriteString("\n")
 	}
 
-	if len(r.Findings) == 0 {
+	hasClassified := r.Classification != nil || len(r.PersistingFindings) > 0 || len(r.FixedFindings) > 0 || len(r.NewFindings) > 0
+	if hasClassified {
+		var persisting []PersistingFinding
+		var fixed []FixedFinding
+		var newFindings []Finding
+		if r.Classification != nil {
+			persisting = r.Classification.Persisting
+			fixed = r.Classification.Fixed
+			newFindings = r.Classification.New
+		}
+		if len(r.PersistingFindings) > 0 {
+			persisting = r.PersistingFindings
+		}
+		if len(r.FixedFindings) > 0 {
+			fixed = r.FixedFindings
+		}
+		if len(r.NewFindings) > 0 {
+			newFindings = r.NewFindings
+		}
+
+		if len(fixed) > 0 {
+			sb.WriteString("### 🛠️ Resolved Findings\n")
+			for _, fix := range fixed {
+				shaNote := ""
+				if fix.PriorSHA != "" {
+					shaShort := fix.PriorSHA
+					if len(shaShort) > 8 {
+						shaShort = shaShort[:8]
+					}
+					shaNote = fmt.Sprintf(" (addressed since `%s`)", shaShort)
+				}
+				sb.WriteString(fmt.Sprintf("- ✅ **[RESOLVED]** %s (`%s`)%s\n", fix.Title, fix.File, shaNote))
+			}
+			sb.WriteString("\n")
+		}
+
+		if len(persisting) > 0 {
+			sb.WriteString("### 🔄 Persisting Findings\n")
+			for _, p := range persisting {
+				f := p.Finding
+				sevIcon := "⚠️"
+				if f.Severity == "CRITICAL" {
+					sevIcon = "🚨"
+				} else if f.Severity == "NOTE" {
+					sevIcon = "💡"
+				}
+				fp := dedup.ComputeFingerprint(f.File, f.Line, f.Title, f.Severity)
+				sb.WriteString(fmt.Sprintf("#### %s [%s] %s (`%s:%d`)\n", sevIcon, f.Severity, f.Title, f.File, f.Line))
+				sb.WriteString(fmt.Sprintf("<!-- pr-review-go:fingerprint=%s -->\n", fp))
+				priorSHAShort := p.PriorSHA
+				if len(priorSHAShort) > 8 {
+					priorSHAShort = priorSHAShort[:8]
+				}
+				sb.WriteString(fmt.Sprintf("> *Previously reported at `%s:%d` in commit `%s`*\n\n", p.PriorFile, p.PriorLine, priorSHAShort))
+				sb.WriteString(fmt.Sprintf("%s\n\n", f.Description))
+				if f.Suggestion != "" {
+					sb.WriteString(fmt.Sprintf("> **Suggestion:** %s\n\n", f.Suggestion))
+				}
+			}
+		}
+
+		if len(newFindings) > 0 {
+			sb.WriteString("### 🆕 New Findings\n")
+			for _, f := range newFindings {
+				sevIcon := "⚠️"
+				if f.Severity == "CRITICAL" {
+					sevIcon = "🚨"
+				} else if f.Severity == "NOTE" {
+					sevIcon = "💡"
+				}
+				fp := dedup.ComputeFingerprint(f.File, f.Line, f.Title, f.Severity)
+				sb.WriteString(fmt.Sprintf("#### %s [%s] %s (`%s:%d`)\n", sevIcon, f.Severity, f.Title, f.File, f.Line))
+				sb.WriteString(fmt.Sprintf("<!-- pr-review-go:fingerprint=%s -->\n", fp))
+				sb.WriteString(fmt.Sprintf("%s\n\n", f.Description))
+				if f.Suggestion != "" {
+					sb.WriteString(fmt.Sprintf("> **Suggestion:** %s\n\n", f.Suggestion))
+				}
+			}
+		}
+
+		if len(persisting) == 0 && len(newFindings) == 0 {
+			if len(fixed) > 0 {
+				sb.WriteString("### 🎯 Findings\nAll prior findings were resolved! No new issues detected.\n\n")
+			} else {
+				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected.\n\n")
+			}
+		}
+	} else if len(r.Findings) == 0 {
 		if r.DeduplicatedCount > 0 {
 			if isPartial {
 				sb.WriteString(fmt.Sprintf("### 🎯 Findings\nAll %d detected issues were already reported previously and have been deduplicated.\n\n*Note: Review coverage was partial; unexamined changes have not been verified.*\n\n", r.DeduplicatedCount))

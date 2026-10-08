@@ -11,6 +11,7 @@ import (
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/llm"
+	"github.com/thozoz/pr-review-go/pkg/reviewer"
 	"github.com/thozoz/pr-review-go/pkg/retry"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
@@ -24,6 +25,7 @@ type JobExecutor interface {
 type ServerJobExecutor struct {
 	server *Server
 	store  JobStore
+	ledger *DecisionLedger
 }
 
 func NewServerJobExecutor(s *Server, store JobStore) *ServerJobExecutor {
@@ -40,7 +42,7 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 		timeout = 10 * time.Minute
 	case "labels", "summary", "improve":
 		timeout = 2 * time.Minute
-	case "describe", "changelog", "docs":
+	case "describe", "changelog", "docs", "approve", "request_changes":
 		timeout = 3 * time.Minute
 	case "assistant":
 		timeout = 5 * time.Minute
@@ -86,6 +88,10 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 		return e.executeChangelogJob(jobCtx, job)
 	case "docs":
 		return e.executeDocsJob(jobCtx, job)
+	case "approve":
+		return e.executeApproveJob(jobCtx, job)
+	case "request_changes":
+		return e.executeRequestChangesJob(jobCtx, job)
 	case "assistant":
 		return e.executeAssistantJob(jobCtx, job)
 	default:
@@ -544,6 +550,228 @@ func (e *ServerJobExecutor) executeAssistantJob(ctx context.Context, job *Job) e
 	job.FinishedAt = &now
 	_ = e.store.UpdateJob(ctx, job)
 	return err
+}
+
+func (e *ServerJobExecutor) SetDecisionLedger(l *DecisionLedger) {
+	e.ledger = l
+}
+
+func (e *ServerJobExecutor) getDecisionLedger() *DecisionLedger {
+	if e.ledger != nil {
+		return e.ledger
+	}
+	if e.server != nil {
+		if l := e.server.getDecisionLedger(); l != nil {
+			return l
+		}
+	}
+	if bStore, ok := e.store.(*BoltJobStore); ok && bStore != nil {
+		return NewDecisionLedger(bStore.DB())
+	}
+	return nil
+}
+
+func (e *ServerJobExecutor) executeApproveJob(ctx context.Context, job *Job) error {
+	return e.executeDecisionJob(ctx, job, ghclient.EventApprove)
+}
+
+func (e *ServerJobExecutor) executeRequestChangesJob(ctx context.Context, job *Job) error {
+	return e.executeDecisionJob(ctx, job, ghclient.EventRequestChanges)
+}
+
+func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, event string) error {
+	if e.server == nil || e.server.gh == nil {
+		job.Status = "failed"
+		job.Error = "github client unavailable"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return errors.New("github client unavailable")
+	}
+
+	gh := e.server.gh
+	pub := NewPublication(e.store, gh)
+	ledger := e.getDecisionLedger()
+	if ledger == nil {
+		job.Status = "failed"
+		job.Error = "decision ledger unavailable"
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return errors.New("decision ledger unavailable")
+	}
+
+	// 1. Initial head check before generation
+	livePR, prErr := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
+	if prErr != nil {
+		log.Printf("[jobs] Failed fetching live PR for %s: %v", job.ID, prErr)
+		if wait, ok := budgetWait(prErr); ok {
+			return e.deferForExhaustedBudget(ctx, job, wait, fmt.Sprintf("retry wait exceeds worker budget: %v", prErr))
+		}
+		job.Status = "failed"
+		job.Error = prErr.Error()
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return prErr
+	}
+
+	if err := ghclient.ValidateCommitOID(livePR.HeadSHA); err != nil {
+		job.Status = "failed"
+		job.Error = fmt.Sprintf("invalid live head SHA %s: %v", livePR.HeadSHA, err)
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return fmt.Errorf("invalid live head SHA: %w", err)
+	}
+
+	// 2. Void and notify if job head differs from live head (D-04)
+	if livePR.HeadSHA != job.HeadSHA {
+		log.Printf("[jobs] Decision head mismatch for %s: job was for %s, live is %s; voiding decision", job.ID, job.HeadSHA, livePR.HeadSHA)
+		notice := fmt.Sprintf("⏭️ Decision (%s) for commit %s voided by newer commit %s. A fresh decision command is required.", event, job.HeadSHA, livePR.HeadSHA)
+		if err := e.publishStatus(ctx, pub, job, notice); err != nil {
+			log.Printf("[jobs] Failed publishing void status for %s: %v", job.ID, err)
+		}
+		job.HeadSHA = livePR.HeadSHA
+		job.BaseSHA = livePR.BaseSHA
+		job.Status = "superseded"
+		job.Error = fmt.Sprintf("voided by newer commit %s", livePR.HeadSHA)
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+
+	// 3. Pre-generation duplicate check
+	if existing, _ := ledger.GetDecision(ctx, job.PRKey, job.HeadSHA); existing != nil {
+		log.Printf("[jobs] Duplicate decision command for %s (head %s already recorded by job %s); rejecting with warning", job.ID, job.HeadSHA, existing.JobID)
+		warningMsg := fmt.Sprintf("⚠️ A decision review has already been submitted for commit %s. Duplicate %s command skipped.", job.HeadSHA, event)
+		_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, warningMsg)
+		if job.StatusCommentID > 0 {
+			_ = e.publishStatus(ctx, pub, job, fmt.Sprintf("⚠️ Duplicate %s command for commit %s; skipped.", event, job.HeadSHA[:8]))
+		}
+		job.Status = "failed"
+		job.Error = fmt.Sprintf("decision already recorded for head %s (job %s)", job.HeadSHA, existing.JobID)
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+
+	// 4. Update status comment to running
+	if err := e.publishStatus(ctx, pub, job, fmt.Sprintf("🔄 Decision (%s) running...", event)); err != nil {
+		return err
+	}
+
+	// 5. Generate review report
+	var report *reviewer.ReviewReport
+	if e.server != nil && e.server.engine != nil {
+		var rerr error
+		report, rerr = e.server.engine.ReviewPRAtHead(ctx, job.Owner, job.Repo, job.PRNumber, job.HeadSHA)
+		if rerr != nil {
+			log.Printf("[jobs] Decision review generation failed for %s: %v", job.ID, rerr)
+			if wait, ok := budgetWait(rerr); ok {
+				return e.deferForExhaustedBudget(ctx, job, wait, fmt.Sprintf("retry wait exceeds worker budget: %v", rerr))
+			}
+			if job.StatusCommentID > 0 {
+				_, _ = pub.PublishStatus(ctx, job, fmt.Sprintf("❌ Decision failed: %v", rerr))
+			}
+			job.Status = "failed"
+			job.Error = rerr.Error()
+			now := time.Now().UTC()
+			job.FinishedAt = &now
+			_ = e.store.UpdateJob(ctx, job)
+			return rerr
+		}
+	}
+
+	// 6. Pre-publication live head check (D-04, D-16)
+	livePR2, prErr2 := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
+	if prErr2 == nil && livePR2 != nil && livePR2.HeadSHA != job.HeadSHA {
+		log.Printf("[jobs] Head changed during decision generation for %s (job=%s, live=%s); voiding decision", job.ID, job.HeadSHA, livePR2.HeadSHA)
+		notice := fmt.Sprintf("⏭️ Decision (%s) for commit %s voided by newer commit %s. A fresh decision command is required.", event, job.HeadSHA, livePR2.HeadSHA)
+		_ = e.publishStatus(ctx, pub, job, notice)
+		job.Status = "superseded"
+		job.HeadSHA = livePR2.HeadSHA
+		job.BaseSHA = livePR2.BaseSHA
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return nil
+	}
+
+	// 7. Format body and suggestions
+	body := fmt.Sprintf("## PR Decision: %s\n\nReviewed at commit %s.", event, job.HeadSHA)
+	var suggestions []ghclient.InlineSuggestion
+	if report != nil {
+		prState, _ := e.store.GetPRState(ctx, job.PRKey)
+		var priorFindings []reviewer.PriorFinding
+		if prState != nil && prState.LastReviewedHead != "" && prState.LastReviewedHead != job.HeadSHA {
+			priorFindings = reviewer.GetFindings(job.PRKey.String(), prState.LastReviewedHead)
+		}
+		if len(priorFindings) > 0 {
+			cls := reviewer.ClassifyAgainstPrior(report.Findings, priorFindings[0].HeadSHA, priorFindings)
+			report.Classification = &cls
+			report.PersistingFindings = cls.Persisting
+			report.FixedFindings = cls.Fixed
+			report.NewFindings = cls.New
+			report.RawMarkdown = reviewer.FormatReportMarkdown(report)
+		}
+
+		if report.RawMarkdown != "" {
+			body = report.RawMarkdown
+		} else {
+			body = reviewer.FormatReportMarkdown(report)
+		}
+		suggestions = report.Suggestions
+	}
+
+	// 8. Publish decision (atomic ClaimDecision under per-key mutex, single remote CreateReview, status-intent escalation)
+	res, pubErr := PublishDecision(ctx, ledger, gh, job, event, body, suggestions, e.markNeedsAttention)
+	if pubErr != nil {
+		if res != nil && res.Duplicate {
+			warningMsg := fmt.Sprintf("⚠️ A decision review has already been submitted for commit %s. Duplicate %s command skipped.", job.HeadSHA, event)
+			_ = gh.PostComment(ctx, job.Owner, job.Repo, job.PRNumber, warningMsg)
+			if job.StatusCommentID > 0 {
+				_ = e.publishStatus(ctx, pub, job, fmt.Sprintf("⚠️ Duplicate %s command for commit %s; skipped.", event, job.HeadSHA[:8]))
+			}
+			job.Status = "failed"
+			job.Error = fmt.Sprintf("decision already recorded for head %s", job.HeadSHA)
+			now := time.Now().UTC()
+			job.FinishedAt = &now
+			_ = e.store.UpdateJob(ctx, job)
+			return nil
+		}
+		if ghclient.IsUncertainWriteError(pubErr) {
+			return pubErr
+		}
+		job.Status = "failed"
+		job.Error = pubErr.Error()
+		now := time.Now().UTC()
+		job.FinishedAt = &now
+		_ = e.store.UpdateJob(ctx, job)
+		return pubErr
+	}
+	_ = res
+
+	// Record findings for future re-review classification
+	if report != nil && len(report.Findings) > 0 {
+		reviewer.RecordFindings(job.PRKey.String(), job.HeadSHA, report.Findings)
+	}
+
+	// 9. Update recycled status comment to completed (D-16)
+	shaShort := job.HeadSHA
+	if len(shaShort) > 8 {
+		shaShort = shaShort[:8]
+	}
+	successText := fmt.Sprintf("✅ Decision %s published for commit %s", event, shaShort)
+	_ = e.publishStatus(ctx, pub, job, successText)
+
+	job.Status = "completed"
+	now := time.Now().UTC()
+	job.FinishedAt = &now
+	_ = e.store.UpdateJob(ctx, job)
+	return nil
 }
 
 // Scheduler coordinates FIFO job execution with per-PR serialisation and fixed workers.

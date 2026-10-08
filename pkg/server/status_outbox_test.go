@@ -89,12 +89,20 @@ func TestQueuedStatusOutbox(t *testing.T) {
 
 		// Verify intent is marked completed
 		marker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
-		intent, err := store.GetOutputIntent(ctx, marker)
-		if err != nil {
-			t.Fatal(err)
+		var intent *OutputIntent
+		for i := 0; i < 100; i++ {
+			intent, err = store.GetOutputIntent(ctx, marker)
+			if err == nil && intent != nil && intent.Status == "completed" {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		if intent.Status != "completed" {
-			t.Fatalf("expected intent status completed, got %s", intent.Status)
+		if intent == nil || intent.Status != "completed" {
+			status := ""
+			if intent != nil {
+				status = intent.Status
+			}
+			t.Fatalf("expected intent status completed, got %s", status)
 		}
 	})
 

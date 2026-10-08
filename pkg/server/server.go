@@ -41,10 +41,11 @@ type Server struct {
 	gh           *ghclient.Client
 	dispatchHook func(action, owner, repo string, prNum int)
 
-	store        JobStore
-	scheduler    *Scheduler
-	statusOutbox *StatusOutbox
-	runtimeReady bool
+	store          JobStore
+	scheduler      *Scheduler
+	statusOutbox   *StatusOutbox
+	decisionLedger *DecisionLedger
+	runtimeReady   bool
 	shuttingDown bool
 	runtimeErr   error
 	mu           sync.RWMutex
@@ -645,7 +646,7 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 		Payload:   payloadText,
 	}
 
-	if kind == "review" {
+	if kind == "review" || kind == "approve" || kind == "request_changes" {
 		pr, prErr := s.gh.GetPR(ctx, owner, repo, prNum)
 		if prErr == nil && pr != nil {
 			job.BaseSHA = pr.BaseSHA
@@ -705,8 +706,25 @@ func isValidDeliveryID(s string) bool {
 	return true
 }
 
+func matchWordPrefix(body, prefix string) bool {
+	if body == prefix {
+		return true
+	}
+	if strings.HasPrefix(body, prefix) {
+		rest := body[len(prefix):]
+		if len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n' || rest[0] == '\r') {
+			return true
+		}
+	}
+	return false
+}
+
 func parseCommentCommand(body string) (kind string, payload string) {
 	switch {
+	case matchWordPrefix(body, "/request_changes"):
+		return "request_changes", ""
+	case matchWordPrefix(body, "/approve"):
+		return "approve", ""
 	case strings.HasPrefix(body, "/review"):
 		return "review", ""
 	case strings.HasPrefix(body, "/improve"):
@@ -732,6 +750,9 @@ func parseCommentCommand(body string) (kind string, payload string) {
 }
 
 func isCommentCommand(body string) bool {
+	if matchWordPrefix(body, "/request_changes") || matchWordPrefix(body, "/approve") {
+		return true
+	}
 	for _, prefix := range []string{
 		"/review", "/improve", "/describe", "/update_changelog", "/generate_labels", "/labels",
 		"/summarize", "/summary", "/add_docs", "/docs", "@bot", "@pr-review", "/ask",
@@ -787,6 +808,28 @@ func (s *Server) dispatchAddDocs(ctx context.Context, owner, repo string, prNum 
 		return
 	}
 	log.Printf("[docgen] Successfully posted documentation report to %s/%s #%d", owner, repo, prNum)
+}
+
+func (s *Server) getDecisionLedger() *DecisionLedger {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	ledger := s.decisionLedger
+	s.mu.RUnlock()
+	if ledger != nil {
+		return ledger
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.decisionLedger != nil {
+		return s.decisionLedger
+	}
+	if bStore, ok := s.store.(*BoltJobStore); ok && bStore != nil {
+		s.decisionLedger = NewDecisionLedger(bStore.DB())
+	}
+	return s.decisionLedger
 }
 
 func (s *Server) ListenAndServe() error {

@@ -46,6 +46,7 @@ var (
 	bucketIntents    = []byte("intents")
 	bucketCounters   = []byte("counters")
 	bucketComments   = []byte("comments")
+	bucketDecisions  = []byte("decisions")
 
 	keySchemaVersion = []byte("schema_version")
 )
@@ -323,6 +324,9 @@ func (s *BoltJobStore) initSchema() error {
 			if _, err := tx.CreateBucketIfNotExists(bucketComments); err != nil {
 				return err
 			}
+			if _, err := tx.CreateBucketIfNotExists(bucketDecisions); err != nil {
+				return err
+			}
 			return nil
 		}
 
@@ -339,7 +343,7 @@ func (s *BoltJobStore) initSchema() error {
 		}
 
 		// Ensure all buckets exist
-		for _, bName := range [][]byte{bucketDeliveries, bucketJobs, bucketPRs, bucketIntents, bucketCounters, bucketComments} {
+		for _, bName := range [][]byte{bucketDeliveries, bucketJobs, bucketPRs, bucketIntents, bucketCounters, bucketComments, bucketDecisions} {
 			if _, err := tx.CreateBucketIfNotExists(bName); err != nil {
 				return err
 			}
@@ -355,7 +359,7 @@ func (s *BoltJobStore) initSchema() error {
 				if err := json.Unmarshal(v, &j); err != nil {
 					continue
 				}
-				if j.Status == "queued" && j.Kind == "review" {
+				if j.Status == "queued" && (j.Kind == "review" || j.Kind == "approve" || j.Kind == "request_changes") {
 					marker := fmt.Sprintf("<!-- pr-review-status:%s -->", j.ID)
 					if intentsB.Get([]byte(marker)) == nil {
 						bodyWithMarker := fmt.Sprintf("⏳ Review queued; waiting for capacity\n\n%s", marker)
@@ -384,6 +388,13 @@ func (s *BoltJobStore) initSchema() error {
 		}
 		return nil
 	})
+}
+
+// DB returns the underlying bbolt.DB instance.
+func (s *BoltJobStore) DB() *bbolt.DB {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.db
 }
 
 func (s *BoltJobStore) Close() error {
@@ -672,7 +683,7 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 				return err
 			}
 
-			if job.Kind == "review" {
+			if job.Kind == "review" || job.Kind == "approve" || job.Kind == "request_changes" {
 				marker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
 				bodyWithMarker := fmt.Sprintf("⏳ Review queued; waiting for capacity\n\n%s", marker)
 				h := sha256.Sum256([]byte(bodyWithMarker))

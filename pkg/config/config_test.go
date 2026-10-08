@@ -527,3 +527,50 @@ func TestLoadAgentEnvRejectsZeroAndNegative(t *testing.T) {
 	}
 }
 
+func TestMermaidConfig(t *testing.T) {
+	baseCfg := func() *Config {
+		return &Config{
+			GitHubToken: "token",
+			LLMAPIKey:   "key",
+			LLMModel:    "model",
+			LLMBaseURL:  "https://example.com",
+		}
+	}
+
+	// 1. Defaults populated
+	cfg := baseCfg()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default mermaid config should be valid: %v", err)
+	}
+	if cfg.EnableMermaid != DefaultEnableMermaid {
+		t.Errorf("expected default EnableMermaid false, got %v", cfg.EnableMermaid)
+	}
+	if cfg.MermaidDirectionThreshold != DefaultMermaidDirectionThreshold {
+		t.Errorf("expected default direction threshold %d, got %d", DefaultMermaidDirectionThreshold, cfg.MermaidDirectionThreshold)
+	}
+	if cfg.MermaidMaxNodes != DefaultMermaidMaxNodes {
+		t.Errorf("expected default max nodes %d, got %d", DefaultMermaidMaxNodes, cfg.MermaidMaxNodes)
+	}
+
+	// 2. Reject out of range direction threshold
+	cfg = baseCfg()
+	cfg.MermaidDirectionThreshold = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for negative MermaidDirectionThreshold")
+	}
+
+	// 3. Reject out of range nodes
+	cfg = baseCfg()
+	cfg.MermaidMaxNodes = 1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for MermaidMaxNodes < MinMermaidMaxNodes")
+	}
+
+	// 4. Reject out of range bytes
+	cfg = baseCfg()
+	cfg.MermaidMaxBytes = 100
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected error for MermaidMaxBytes < MinMermaidMaxBytes")
+	}
+}
+
