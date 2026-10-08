@@ -704,6 +704,20 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 	body := fmt.Sprintf("## PR Decision: %s\n\nReviewed at commit %s.", event, job.HeadSHA)
 	var suggestions []ghclient.InlineSuggestion
 	if report != nil {
+		prState, _ := e.store.GetPRState(ctx, job.PRKey)
+		var priorFindings []reviewer.PriorFinding
+		if prState != nil && prState.LastReviewedHead != "" && prState.LastReviewedHead != job.HeadSHA {
+			priorFindings = reviewer.GetFindings(job.PRKey.String(), prState.LastReviewedHead)
+		}
+		if len(priorFindings) > 0 {
+			cls := reviewer.ClassifyAgainstPrior(report.Findings, priorFindings[0].HeadSHA, priorFindings)
+			report.Classification = &cls
+			report.PersistingFindings = cls.Persisting
+			report.FixedFindings = cls.Fixed
+			report.NewFindings = cls.New
+			report.RawMarkdown = reviewer.FormatReportMarkdown(report)
+		}
+
 		if report.RawMarkdown != "" {
 			body = report.RawMarkdown
 		} else {
@@ -739,6 +753,11 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		return pubErr
 	}
 	_ = res
+
+	// Record findings for future re-review classification
+	if report != nil && len(report.Findings) > 0 {
+		reviewer.RecordFindings(job.PRKey.String(), job.HeadSHA, report.Findings)
+	}
 
 	// 9. Update recycled status comment to completed (D-16)
 	shaShort := job.HeadSHA
