@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"go.etcd.io/bbolt"
 )
 
@@ -165,6 +166,28 @@ type PRState struct {
 	LatestHeadSHA        string `json:"latest_head_sha,omitempty"`
 	HasBlockedAction     bool   `json:"has_blocked_action,omitempty"`
 	BlockedReason        string `json:"blocked_reason,omitempty"`
+	// LastBotCommitSHA records the commit OID created by the most recent
+	// successful edit push on this PR, so the next edit job can surface the
+	// prior bot diff as sticky context. Empty when no bot edit landed yet.
+	LastBotCommitSHA string `json:"last_bot_commit_sha,omitempty"`
+	// LastBotBaseSHA records the PR head the last bot edit applied to.
+	LastBotBaseSHA string `json:"last_bot_base_sha,omitempty"`
+	// EditHistory carries the most recent user edit instructions (oldest
+	// first), capped at MaxEditHistoryEntries with oldest dropped on
+	// overflow. Additive omitempty evolution; schema version stays 1.
+	EditHistory []string `json:"edit_history,omitempty"`
+}
+
+// MaxEditHistoryEntries caps PRState.EditHistory; overflow drops oldest.
+const MaxEditHistoryEntries = 5
+
+// appendEditHistory appends instruction and drops oldest entries beyond the cap.
+func appendEditHistory(history []string, instruction string) []string {
+	history = append(history, instruction)
+	if len(history) > MaxEditHistoryEntries {
+		history = history[len(history)-MaxEditHistoryEntries:]
+	}
+	return history
 }
 
 type HealthCounts struct {
@@ -425,6 +448,18 @@ func (s *BoltJobStore) Admit(ctx context.Context, delivery Delivery, jobs []Job)
 		}
 		if len(raw) > MaxJobBytes {
 			return AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("job payload size %d exceeds 32 KiB bound", len(raw))}, nil
+		}
+		// Edit jobs carry the CAS base for the gated push path (D-31): both
+		// SHAs must be present and well-formed at admission, failing closed
+		// before any queue state is touched. Other kinds keep their existing
+		// admission contract unchanged.
+		if j.Kind == "edit" {
+			if err := ghclient.ValidateCommitOID(j.HeadSHA); err != nil {
+				return AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("edit job requires valid head SHA: %v", err)}, nil
+			}
+			if err := ghclient.ValidateCommitOID(j.BaseSHA); err != nil {
+				return AdmitResult{Status: AdmitCapacityFull, Reason: fmt.Sprintf("edit job requires valid base SHA: %v", err)}, nil
+			}
 		}
 	}
 
@@ -1019,7 +1054,7 @@ func (s *BoltJobStore) ListPendingStatusIntents(ctx context.Context, limit int) 
 // - Interrupted review generation: requeued for generation.
 // - Idempotent actions (labels): requeued for idempotent set-add.
 // - Static actions (improve): requeued with owned intent.
-// - Non-idempotent actions (describe, summary, docs, changelog, assistant): marked needs_attention if unproven.
+// - Non-idempotent actions (describe, summary, docs, changelog, assistant, edit): marked needs_attention if unproven.
 // - Uncertain and needs_attention jobs release worker slots while blocking subsequent PR actions.
 func (s *BoltJobStore) RecoverJobs(ctx context.Context) ([]*Job, error) {
 	s.mu.RLock()
@@ -1069,8 +1104,12 @@ func (s *BoltJobStore) RecoverJobs(ctx context.Context) ([]*Job, error) {
 					j.Status = "queued"
 					j.RecoveryPhase = "requeued_static"
 
-				default:
-					// Non-idempotent action
+				case "describe", "summary", "docs", "changelog", "assistant", "edit":
+					// Non-idempotent action, routed explicitly per kind (no silent
+					// default swallow for edit). Edit jobs perform remote writes
+					// (status comments plus the gated push), so an interrupted edit
+					// can never prove its external outcome and parks as
+					// needs_attention for operator resolution via --queue-resolve.
 					outputProven := false
 					marker := fmt.Sprintf("<!-- pr-%s-output:%s -->", j.Kind, j.ID)
 					if itBytes := intentsBucket.Get([]byte(marker)); itBytes != nil {
@@ -1081,6 +1120,26 @@ func (s *BoltJobStore) RecoverJobs(ctx context.Context) ([]*Job, error) {
 					}
 
 					if outputProven {
+						j.Status = "completed"
+					} else {
+						j.Status = "needs_attention"
+						j.RecoveryPhase = "interrupted_unproven"
+						j.Error = "interrupted action cannot prove external outcome; requires operator resolution"
+					}
+
+				default:
+					// Unknown future kinds fail closed: only a proven completed
+					// output intent may complete them, otherwise operator
+					// resolution via --queue-resolve.
+					unknownProven := false
+					unknownMarker := fmt.Sprintf("<!-- pr-%s-output:%s -->", j.Kind, j.ID)
+					if itBytes := intentsBucket.Get([]byte(unknownMarker)); itBytes != nil {
+						var it OutputIntent
+						if err := json.Unmarshal(itBytes, &it); err == nil && it.Status == "completed" {
+							unknownProven = true
+						}
+					}
+					if unknownProven {
 						j.Status = "completed"
 					} else {
 						j.Status = "needs_attention"
