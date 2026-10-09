@@ -1477,7 +1477,7 @@ func TestCommandScheduling(t *testing.T) {
 			{"/add_docs", "docs", ""},
 			{"/docs", "docs", ""},
 			{"@bot explain how this works", "assistant", "explain how this works"},
-			{"@pr-review explain this", "assistant", "explain this"},
+			{"@pr-review explain this", "edit", "explain this"},
 			{"/ask what is this function", "assistant", "what is this function"},
 			{"/improve", "improve", ""},
 		}
