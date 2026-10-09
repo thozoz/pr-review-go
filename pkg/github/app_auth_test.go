@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1309,5 +1312,356 @@ func TestClient_DeniesBroadPATSubstitution(t *testing.T) {
 	}
 	if cred != nil {
 		t.Errorf("expected cred to be nil, got: %+v", cred)
+	}
+}
+
+// TestCreatePushCredential_NarrowWriteScopeExactHeadRepo tests that CreatePushCredential
+// sends an uncached POST with exactly one head repository ID and permissions
+// {"contents": "write"}, verifies the strict scope, and revokes with exactly one
+// DELETE plus in-memory zeroize (D-29).
+func TestCreatePushCredential_NarrowWriteScopeExactHeadRepo(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+
+	var (
+		tokenRequestReceived atomic.Bool
+		deleteCount          atomic.Int32
+		receivedRepoIDs      []int64
+		receivedPermissions  map[string]string
+		revokeAuthHeader     string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/repos/head-org/head-repo/installation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 5001})
+			return
+
+		case "/app/installations/5001/access_tokens":
+			tokenRequestReceived.Store(true)
+
+			var body struct {
+				RepositoryIDs []int64           `json:"repository_ids"`
+				Permissions   map[string]string `json:"permissions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, fmt.Sprintf("invalid json body: %v", err), http.StatusBadRequest)
+				return
+			}
+			receivedRepoIDs = body.RepositoryIDs
+			receivedPermissions = body.Permissions
+
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token":                "ghs_narrow_push_token_xyz999",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "write"},
+				"repository_selection": "selected",
+				"repositories": []map[string]any{
+					{"id": 887766, "name": "head-repo"},
+				},
+			})
+			return
+
+		case "/installation/token":
+			if r.Method == http.MethodDelete {
+				deleteCount.Add(1)
+				revokeAuthHeader = r.Header.Get("Authorization")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewTestAppClient(server.URL, 12345, key)
+	if err != nil {
+		t.Fatalf("failed to create app client: %v", err)
+	}
+
+	ctx := context.Background()
+	cred, err := client.CreatePushCredential(ctx, "head-org", "head-repo", 887766)
+	if err != nil {
+		t.Fatalf("CreatePushCredential failed: %v", err)
+	}
+
+	if !tokenRequestReceived.Load() {
+		t.Fatalf("access token request was not received by mock server")
+	}
+	if len(receivedRepoIDs) != 1 || receivedRepoIDs[0] != 887766 {
+		t.Errorf("expected repository_ids to be [887766], got: %v", receivedRepoIDs)
+	}
+	if len(receivedPermissions) != 1 || receivedPermissions["contents"] != "write" {
+		t.Errorf("expected permissions to be {contents: write}, got: %v", receivedPermissions)
+	}
+	if cred.Token != "ghs_narrow_push_token_xyz999" {
+		t.Errorf("unexpected token in cred: %q", cred.Token)
+	}
+	if cred.RepositoryID != 887766 {
+		t.Errorf("unexpected RepositoryID: %d", cred.RepositoryID)
+	}
+	if cred.IsRevoked() {
+		t.Errorf("credential should not be revoked yet")
+	}
+
+	if err := client.RevokePushCredential(ctx, cred); err != nil {
+		t.Fatalf("RevokePushCredential failed: %v", err)
+	}
+	if got := deleteCount.Load(); got != 1 {
+		t.Errorf("expected exactly 1 revoke DELETE, got %d", got)
+	}
+	if revokeAuthHeader != "Bearer ghs_narrow_push_token_xyz999" {
+		t.Errorf("expected revoke authorization header to use token, got: %q", revokeAuthHeader)
+	}
+	if cred.Token != "" {
+		t.Errorf("expected token to be zeroized after revocation, got: %q", cred.Token)
+	}
+	if !cred.IsRevoked() {
+		t.Errorf("credential should report IsRevoked() == true")
+	}
+}
+
+// TestCreatePushCredential_RejectsBroadScope verifies that overbroad, mismatching,
+// or malformed push credentials are strictly rejected (D-29).
+func TestCreatePushCredential_RejectsBroadScope(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+
+	cases := []struct {
+		name         string
+		repoID       int64
+		responseJSON map[string]any
+		wantErrSub   string
+	}{
+		{
+			name:   "Extra permission key returned (too broad)",
+			repoID: 100,
+			responseJSON: map[string]any{
+				"token":       "tok-extra",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "write", "issues": "read"},
+			},
+			wantErrSub: "too broad",
+		},
+		{
+			name:   "Contents read instead of write",
+			repoID: 100,
+			responseJSON: map[string]any{
+				"token":       "tok-read",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "read"},
+			},
+			wantErrSub: "only write permitted",
+		},
+		{
+			name:   "Repository selection is all (unscoped)",
+			repoID: 100,
+			responseJSON: map[string]any{
+				"token":                "tok-all",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "write"},
+				"repository_selection": "all",
+			},
+			wantErrSub: "unsupported repository_selection",
+		},
+		{
+			name:   "Granted multiple repositories (too broad)",
+			repoID: 100,
+			responseJSON: map[string]any{
+				"token":                "tok-multi",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "write"},
+				"repository_selection": "selected",
+				"repositories": []map[string]any{
+					{"id": 100, "name": "repo"},
+					{"id": 200, "name": "other-repo"},
+				},
+			},
+			wantErrSub: "granted access to 2 repositories",
+		},
+		{
+			name:   "Repository ID mismatch in response",
+			repoID: 100,
+			responseJSON: map[string]any{
+				"token":                "tok-mismatch",
+				"expires_at":           time.Now().Add(1 * time.Hour),
+				"permissions":          map[string]string{"contents": "write"},
+				"repository_selection": "selected",
+				"repositories": []map[string]any{
+					{"id": 999, "name": "wrong-repo"},
+				},
+			},
+			wantErrSub: "mismatch expected 100",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/repos/org/repo/installation":
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 7001})
+					return
+				case "/app/installations/7001/access_tokens":
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(tc.responseJSON)
+					return
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client, err := NewTestAppClient(server.URL, 12345, key)
+			if err != nil {
+				t.Fatalf("failed to create app client: %v", err)
+			}
+
+			cred, err := client.CreatePushCredential(context.Background(), "org", "repo", tc.repoID)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got success with cred: %+v", tc.wantErrSub, cred)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Errorf("expected error containing %q, got: %v", tc.wantErrSub, err)
+			}
+			if !errors.Is(err, ErrScopeTooBroad) {
+				t.Errorf("expected ErrScopeTooBroad, got: %v", err)
+			}
+		})
+	}
+
+	t.Run("Invalid repoID rejected without mint", func(t *testing.T) {
+		client, err := NewTestAppClient("http://127.0.0.1:1", 12345, key)
+		if err != nil {
+			t.Fatalf("failed to create app client: %v", err)
+		}
+		_, err = client.CreatePushCredential(context.Background(), "org", "repo", 0)
+		if !errors.Is(err, ErrInvalidRepoID) {
+			t.Errorf("expected ErrInvalidRepoID, got: %v", err)
+		}
+	})
+}
+
+// TestClient_DeniesBroadPATForPush asserts that a PAT-configured client refuses to
+// mint a push credential: no broad-token substitution (D-29).
+func TestClient_DeniesBroadPATForPush(t *testing.T) {
+	client := NewClient("ghp_super_secret_pat_token_for_push_12345")
+
+	cred, err := client.CreatePushCredential(context.Background(), "test-org", "test-repo", 12345)
+	if err == nil {
+		t.Fatalf("expected ErrPushAuthUnavailable for PAT client, got credential: %+v", cred)
+	}
+	if !errors.Is(err, ErrPushAuthUnavailable) {
+		t.Errorf("expected ErrPushAuthUnavailable, got: %v", err)
+	}
+	if cred != nil {
+		t.Errorf("expected cred to be nil, got: %+v", cred)
+	}
+}
+
+// TestRevokePushCredential_ZeroizesOnFailure asserts the token is wiped from memory
+// even when the revoke call itself fails (D-29 mint-and-burn discipline).
+func TestRevokePushCredential_ZeroizesOnFailure(t *testing.T) {
+	key, _ := generateTestRSAKey(t)
+	var deleteCount atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/org/repo/installation":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7001})
+			return
+		case "/app/installations/7001/access_tokens":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"token":       "ghs_push_token_burn_test",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "write"},
+			})
+			return
+		case "/installation/token":
+			deleteCount.Add(1)
+			http.Error(w, "revocation failed", http.StatusInternalServerError)
+			return
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewTestAppClient(server.URL, 12345, key)
+	if err != nil {
+		t.Fatalf("failed to create app client: %v", err)
+	}
+
+	ctx := context.Background()
+	cred, err := client.CreatePushCredential(ctx, "org", "repo", 4242)
+	if err != nil {
+		t.Fatalf("CreatePushCredential failed: %v", err)
+	}
+	if err := client.RevokePushCredential(ctx, cred); err == nil {
+		t.Fatalf("expected revoke error on 500, got nil")
+	}
+	if got := deleteCount.Load(); got != 1 {
+		t.Errorf("expected exactly 1 revoke DELETE attempt, got %d", got)
+	}
+	if cred.Token != "" {
+		t.Errorf("token must be zeroized even on revoke failure, got: %q", cred.Token)
+	}
+	if !cred.IsRevoked() {
+		t.Errorf("credential should report IsRevoked() == true after failed revoke")
+	}
+}
+
+// TestPushCredentialNeverReachesContainerOrLLM enforces T-05-02 structurally: the
+// scoped write credential lives only in the pkg/github host gateway and must
+// never be referenced from container-side or LLM-side code.
+func TestPushCredentialNeverReachesContainerOrLLM(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	pkgRoot := filepath.Dir(filepath.Dir(thisFile)) // pkg/
+	for _, dir := range []string{"assistant", "sandbox", "reviewer"} {
+		root := filepath.Join(pkgRoot, dir)
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Skipf("package dir %s not present: %v", dir, err)
+		}
+		var files []string
+		var walk func(d string)
+		walk = func(d string) {
+			es, err := os.ReadDir(d)
+			if err != nil {
+				return
+			}
+			for _, e := range es {
+				p := filepath.Join(d, e.Name())
+				if e.IsDir() {
+					walk(p)
+					continue
+				}
+				if strings.HasSuffix(e.Name(), ".go") {
+					files = append(files, p)
+				}
+			}
+		}
+		_ = entries
+		walk(root)
+		for _, f := range files {
+			src, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatalf("read %s: %v", f, err)
+			}
+			if strings.Contains(string(src), "PushCredential") {
+				t.Errorf("T-05-02 violation: %s references PushCredential (token must never enter container/LLM code)", f)
+			}
+		}
 	}
 }
