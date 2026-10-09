@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/google/go-github/v68/github"
 	"github.com/thozoz/pr-review-go/pkg/retry"
@@ -972,13 +974,34 @@ func (c *Client) CommitFileAtExpectedHead(ctx context.Context, owner, repo, bran
 		return "", fmt.Errorf("invalid expectedHeadOID: %w", err)
 	}
 
+	branchName := strings.TrimPrefix(branch, "refs/heads/")
+	cleanPath := strings.TrimPrefix(path, "/")
+
+	additions := []map[string]any{
+		{
+			"path":     cleanPath,
+			"contents": base64.StdEncoding.EncodeToString([]byte(content)),
+		},
+	}
+	return c.doCreateCommitOnBranch(ctx, owner, repo, branchName, expectedHeadOID, message, additions, nil)
+}
+
+// doCreateCommitOnBranch executes a single GraphQL createCommitOnBranch mutation
+// conditional on expectedHeadOID (CAS). It performs exactly one HTTP request:
+// no REST fallback, no retry on head-moved. Head-moved conflicts map to
+// *HeadMovedError carrying the parsed actual head OID when present.
+func (c *Client) doCreateCommitOnBranch(ctx context.Context, owner, repo, branchName, expectedHeadOID, headline string, additions []map[string]any, deletions []map[string]any) (string, error) {
 	ghClient, err := c.ghForRepo(ctx, owner, repo)
 	if err != nil {
 		return "", err
 	}
 
-	branchName := strings.TrimPrefix(branch, "refs/heads/")
-	cleanPath := strings.TrimPrefix(path, "/")
+	fileChanges := map[string]any{
+		"additions": additions,
+	}
+	if len(deletions) > 0 {
+		fileChanges["deletions"] = deletions
+	}
 
 	reqPayload := graphQLRequest{
 		Query: `mutation CreateCommitOnBranch($input: CreateCommitOnBranchInput!) {
@@ -1003,16 +1026,9 @@ func (c *Client) CommitFileAtExpectedHead(ctx context.Context, owner, repo, bran
 				},
 				"expectedHeadOid": expectedHeadOID,
 				"message": map[string]any{
-					"headline": message,
+					"headline": headline,
 				},
-				"fileChanges": map[string]any{
-					"additions": []map[string]any{
-						{
-							"path":     cleanPath,
-							"contents": base64.StdEncoding.EncodeToString([]byte(content)),
-						},
-					},
-				},
+				"fileChanges": fileChanges,
 			},
 		},
 	}
@@ -1099,4 +1115,148 @@ func (c *Client) CommitFileAtExpectedHead(ctx context.Context, owner, repo, bran
 	}
 
 	return mutationData.Commit.OID, nil
+}
+
+// CommitFilesAtExpectedHead creates a single atomic commit on the caller-supplied
+// PR head branch containing every entry of files plus every path in deletions,
+// conditional on the branch head matching expectedHeadOID exactly, using one
+// GitHub GraphQL createCommitOnBranch mutation (D-22, D-24, D-31).
+//
+// The branch is used exactly as passed (modulo a refs/heads/ prefix strip); this
+// function never substitutes main or any other branch, and fork refusal plus
+// branch selection stay executor-side. Exactly one HTTP mutation runs per call:
+// no REST fallback, no retry on head-moved. Head-moved conflicts map to
+// *HeadMovedError; 403/permission rejections surface as explanatory errors for
+// the executor to relay as comments (D-25), never bypasses.
+func (c *Client) CommitFilesAtExpectedHead(ctx context.Context, owner, repo, branchName, expectedHeadOID, messageHeadline string, files map[string]string, deletions []string) (string, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	branchName = strings.TrimSpace(branchName)
+	messageHeadline = strings.TrimSpace(messageHeadline)
+
+	if owner == "" || repo == "" {
+		return "", fmt.Errorf("owner and repo must not be empty")
+	}
+	if branchName == "" {
+		return "", fmt.Errorf("branch must not be empty: caller must pass the PR head ref")
+	}
+	if messageHeadline == "" {
+		return "", fmt.Errorf("commit message headline must not be empty")
+	}
+	if err := ValidateCommitOID(expectedHeadOID); err != nil {
+		return "", fmt.Errorf("invalid expectedHeadOID: %w", err)
+	}
+	if len(files) == 0 && len(deletions) == 0 {
+		return "", fmt.Errorf("at least one file addition or deletion is required")
+	}
+
+	branchName = strings.TrimPrefix(branchName, "refs/heads/")
+
+	keys := make([]string, 0, len(files))
+	for p := range files {
+		clean := strings.TrimPrefix(strings.TrimSpace(p), "/")
+		if clean == "" {
+			return "", fmt.Errorf("file path must not be empty")
+		}
+		keys = append(keys, p)
+	}
+	sort.Strings(keys)
+
+	additions := make([]map[string]any, 0, len(keys))
+	for _, p := range keys {
+		clean := strings.TrimPrefix(strings.TrimSpace(p), "/")
+		additions = append(additions, map[string]any{
+			"path":     clean,
+			"contents": base64.StdEncoding.EncodeToString([]byte(files[p])),
+		})
+	}
+
+	var dels []map[string]any
+	for _, p := range deletions {
+		clean := strings.TrimPrefix(strings.TrimSpace(p), "/")
+		if clean == "" {
+			return "", fmt.Errorf("deletion path must not be empty")
+		}
+		dels = append(dels, map[string]any{"path": clean})
+	}
+
+	return c.doCreateCommitOnBranch(ctx, owner, repo, branchName, expectedHeadOID, messageHeadline, additions, dels)
+}
+
+const (
+	// maxCommitHeadlineLen caps bot-authored push headlines (D-32/D-35).
+	maxCommitHeadlineLen = 140
+	// maxQuotedOriginalLen caps the quoted original instruction inside the headline.
+	maxQuotedOriginalLen = 60
+	// invalidShortSHAPlaceholder is used when shortSHA fails 7-hex validation so the
+	// headline always carries a well-formed 7-char SHA slot.
+	invalidShortSHAPlaceholder = "0000000"
+)
+
+var shortSHAPattern = regexp.MustCompile(`^[0-9a-fA-F]{7}$`)
+
+// collapseCommitText replaces control characters with spaces and collapses all
+// whitespace runs to single spaces.
+func collapseCommitText(s string) string {
+	mapped := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+	return strings.Join(strings.Fields(mapped), " ")
+}
+
+// truncateAtWordBoundary cuts s to at most maxLen runes, ending at the last
+// space within the budget so words are never split. Falls back to a hard cut
+// when the first word alone exceeds the budget.
+func truncateAtWordBoundary(s string, maxLen int) string {
+	if len([]rune(s)) <= maxLen {
+		return s
+	}
+	cut := string([]rune(s)[:maxLen])
+	if idx := strings.LastIndex(cut, " "); idx > 0 {
+		cut = cut[:idx] // idx is a byte offset; safe: ASCII space boundary
+	}
+	return strings.TrimRight(cut, " ")
+}
+
+// SanitizeCommitHeadline builds the single bot-authored commit headline
+// `pr-review: <english-summary> "<original>" (<short-sha>)`, capped at 140
+// chars on one line (D-32, D-35).
+//
+// englishSummary is the caller-supplied English verdict summary (derived
+// executor-side from the ClassifyEditIntent LLM session; this function never
+// calls the LLM). originalInstruction is always quoted verbatim (TR preserved).
+// When the summary is empty after whitespace-collapse, and only then, the
+// TR-quote-only fallback `pr-review: "<original>" (<sha>)` is used.
+// shortSHA must be 7 hex chars; anything else yields the 0000000 placeholder.
+func SanitizeCommitHeadline(englishSummary, originalInstruction, shortSHA string) string {
+	sha := strings.ToLower(strings.TrimSpace(shortSHA))
+	if !shortSHAPattern.MatchString(sha) {
+		sha = invalidShortSHAPlaceholder
+	}
+	original := truncateAtWordBoundary(collapseCommitText(originalInstruction), maxQuotedOriginalLen)
+	summary := collapseCommitText(englishSummary)
+
+	quoteOnly := fmt.Sprintf("pr-review: %q (%s)", original, sha)
+	if summary == "" {
+		return truncateAtWordBoundary(quoteOnly, maxCommitHeadlineLen)
+	}
+	headline := fmt.Sprintf("pr-review: %s %q (%s)", summary, original, sha)
+	if len([]rune(headline)) <= maxCommitHeadlineLen {
+		return headline
+	}
+	// Shrink the expendable English summary to fit, keeping the quoted
+	// original and SHA suffix intact.
+	suffix := fmt.Sprintf(" %q (%s)", original, sha)
+	budget := maxCommitHeadlineLen - len([]rune("pr-review: ")) - len([]rune(suffix))
+	if budget < 1 {
+		return truncateAtWordBoundary(quoteOnly, maxCommitHeadlineLen)
+	}
+	summary = truncateAtWordBoundary(summary, budget)
+	if summary == "" {
+		return truncateAtWordBoundary(quoteOnly, maxCommitHeadlineLen)
+	}
+	return fmt.Sprintf("pr-review: %s%s", summary, suffix)
 }
