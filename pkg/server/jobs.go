@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/thozoz/pr-review-go/pkg/assistant"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/llm"
@@ -26,6 +30,16 @@ type ServerJobExecutor struct {
 	server *Server
 	store  JobStore
 	ledger *DecisionLedger
+
+	// Edit-pipeline seams. Nil means production behavior; tests inject fakes.
+	// They live on the executor (not Server) so parallel executors stay isolated.
+	editGH       editGitHub
+	editLLM      LLMCaller
+	editClassify func(ctx context.Context, llm LLMCaller, body string) (IntentVerdict, error)
+	editPrepare  func(ctx context.Context, cloneURL, headRef, headSHA string) (*sandbox.Snapshot, func(), error)
+	editLoop     func(ctx context.Context, workDir, instruction, stickyContext string) (assistant.EditResult, error)
+	editVerify   func(ctx context.Context, snap *sandbox.Snapshot) (*sandbox.VerificationReport, error)
+	editPublish  func(ctx context.Context, job *Job, text string) error
 }
 
 func NewServerJobExecutor(s *Server, store JobStore) *ServerJobExecutor {
@@ -39,6 +53,10 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 	var timeout time.Duration
 	switch job.Kind {
 	case "review":
+		timeout = 10 * time.Minute
+	case "edit":
+		// Edit jobs hold the per-PR slot for the whole gated pipeline
+		// (snapshot, LLM edit loop, verify, push); 10 minutes matches review.
 		timeout = 10 * time.Minute
 	case "labels", "summary", "improve":
 		timeout = 2 * time.Minute
@@ -94,6 +112,11 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 		return e.executeRequestChangesJob(jobCtx, job)
 	case "assistant":
 		return e.executeAssistantJob(jobCtx, job)
+	case "edit":
+		// Edit jobs hold the per-PR slot for the whole gated pipeline while
+		// other PRs proceed; concurrent edits on one PR serialize through
+		// ClaimNextJob. Slot-hold lifecycle is documented in plan 05-05 docs.
+		return e.executeEditJob(jobCtx, job)
 	default:
 		job.Status = "failed"
 		job.Error = fmt.Sprintf("unknown job kind: %s", job.Kind)
@@ -772,6 +795,512 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 	job.FinishedAt = &now
 	_ = e.store.UpdateJob(ctx, job)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Edit executor (plan 05-04): gated same-PR edit pipeline.
+//
+// The nine steps inside executeEditJob run in locked order with no step
+// reordered:
+//  1. ClassifyEditIntent first (englishSummary captured from the verdict
+//     Summary field); question/unclear/low-confidence resolves to a
+//     multilingual confirm comment with zero snapshot work.
+//  2. Live-head GetPR with the shared budgetWait/defer path; a malformed
+//     live head fails closed.
+//  3. Fork refusal (IsFork, fail-closed on missing metadata) with zero work.
+//  4. Status transition to editing via the recycled owned comment.
+//  5. Sealed PrepareSnapshot at exactly job.HeadSHA (honest-degradation
+//     unavailable notice on ErrSourceProviderUnavailable), sticky context
+//     (EditHistory plus prior bot diff capped at 60k) injected into
+//     RunGatedEditLoop under DefaultEditCaps.
+//  6. Status verifying; Runner.RunSnapshot on the edited tree; only
+//     StatusPassed proceeds. Green-time bytes are snapshotted into an
+//     in-memory map; the work copy is never re-walked afterward.
+//  7. Push-time CanWriteRepository re-verification (fresh 5s timeout,
+//     fail-closed) immediately before minting the token.
+//  8. Second live-head GetPR (stale aborts superseded with zero push),
+//     single CreatePushCredential plus exactly one CommitFilesAtExpectedHead
+//     CAS call (revoked in defer); HeadMovedError, 403/422 refusals, and
+//     uncertain outcomes map per D-31, D-25, D-34 with zero retries.
+//  9. Sticky persistence (LastBotCommitSHA/BaseSHA plus capped history) and
+//     the final summary comment (files, verification result, commit SHA).
+//
+// Token containment (T-05-02): the push credential token is passed only to
+// NewScopedClient inside liveEditGitHub.CommitPush and never reaches the edit
+// loop or prompts. Transport (T-05-04): only CAS GraphQL, no force parameter.
+// ---------------------------------------------------------------------------
+
+const (
+	// editPriorDiffMaxBytes caps sticky prior-diff injection into the edit loop.
+	editPriorDiffMaxBytes = 60000
+	// editPriorDiffTruncatedMarker marks a capped prior diff.
+	editPriorDiffTruncatedMarker = "\n...[truncated: prior diff exceeds 60000 bytes]..."
+)
+
+// editGitHub is the narrow GitHub surface the edit executor needs. The live
+// adapter routes the single push through a single-use scoped client; tests
+// inject a counting fake.
+type editGitHub interface {
+	GetPR(ctx context.Context, owner, repo string, number int) (*ghclient.PRDetails, error)
+	CanWriteRepository(ctx context.Context, owner, repo, username string) (bool, error)
+	GetDiffAtCommits(ctx context.Context, owner, repo, baseOID, headOID string) (string, error)
+	PostComment(ctx context.Context, owner, repo string, number int, body string) error
+	CreatePushCredential(ctx context.Context, owner, repo string, repoID int64) (*ghclient.PushCredential, error)
+	RevokePushCredential(ctx context.Context, cred *ghclient.PushCredential) error
+	CommitPush(ctx context.Context, cred *ghclient.PushCredential, owner, repo, branchName, expectedHeadOID, headline string, files map[string]string, deletions []string) (string, error)
+}
+
+// liveEditGitHub adapts *ghclient.Client to editGitHub.
+type liveEditGitHub struct {
+	c *ghclient.Client
+}
+
+func (l *liveEditGitHub) GetPR(ctx context.Context, owner, repo string, number int) (*ghclient.PRDetails, error) {
+	return l.c.GetPR(ctx, owner, repo, number)
+}
+
+func (l *liveEditGitHub) CanWriteRepository(ctx context.Context, owner, repo, username string) (bool, error) {
+	return l.c.CanWriteRepository(ctx, owner, repo, username)
+}
+
+func (l *liveEditGitHub) GetDiffAtCommits(ctx context.Context, owner, repo, baseOID, headOID string) (string, error) {
+	return l.c.GetDiffAtCommits(ctx, owner, repo, baseOID, headOID)
+}
+
+func (l *liveEditGitHub) PostComment(ctx context.Context, owner, repo string, number int, body string) error {
+	return l.c.PostComment(ctx, owner, repo, number, body)
+}
+
+func (l *liveEditGitHub) CreatePushCredential(ctx context.Context, owner, repo string, repoID int64) (*ghclient.PushCredential, error) {
+	return l.c.CreatePushCredential(ctx, owner, repo, repoID)
+}
+
+func (l *liveEditGitHub) RevokePushCredential(ctx context.Context, cred *ghclient.PushCredential) error {
+	return l.c.RevokePushCredential(ctx, cred)
+}
+
+// CommitPush performs exactly one CAS commit through a single-use scoped
+// client minted from the credential token. The token never reaches the edit
+// loop or prompts (T-05-02).
+func (l *liveEditGitHub) CommitPush(ctx context.Context, cred *ghclient.PushCredential, owner, repo, branchName, expectedHeadOID, headline string, files map[string]string, deletions []string) (string, error) {
+	if cred == nil || cred.Token == "" {
+		return "", errors.New("push credential unavailable")
+	}
+	scoped := l.c.NewScopedClient(cred.Token)
+	return scoped.CommitFilesAtExpectedHead(ctx, owner, repo, branchName, expectedHeadOID, headline, files, deletions)
+}
+
+// buildEditStickyContext assembles the instruction history plus the prior bot
+// diff for the gated edit loop. Empty on a first edit.
+func buildEditStickyContext(history []string, priorDiff string) string {
+	var sb strings.Builder
+	if len(history) > 0 {
+		sb.WriteString("Previous edit instructions on this PR (oldest first):\n")
+		for i, h := range history {
+			fmt.Fprintf(&sb, "%d. %s\n", i+1, h)
+		}
+		sb.WriteString("\n")
+	}
+	if priorDiff != "" {
+		sb.WriteString("Diff of the previous bot edit (context only; do not revert unless asked):\n")
+		sb.WriteString(priorDiff)
+		if !strings.HasSuffix(priorDiff, "\n") {
+			sb.WriteString("\n")
+		}
+	}
+	return sb.String()
+}
+
+// shortCommitSHA returns the first 7 hex chars for display; the input is
+// already OID-validated at every call site.
+func shortCommitSHA(sha string) string {
+	if len(sha) >= 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+// short8 returns the first 8 chars for stale-abort comments (decision-job convention).
+func short8(sha string) string {
+	if len(sha) >= 8 {
+		return sha[:8]
+	}
+	return sha
+}
+
+// isPushRefusedError reports permanent push rejections (auth/permission) that
+// must surface as refuse-with-reason comments, never bypasses (D-25).
+func isPushRefusedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var hme *ghclient.HeadMovedError
+	if errors.As(err, &hme) {
+		return false
+	}
+	if ghclient.IsUncertainWriteError(err) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "403") || strings.Contains(msg, "422") ||
+		strings.Contains(msg, "forbidden") || strings.Contains(msg, "permission")
+}
+
+func (e *ServerJobExecutor) failEditJob(ctx context.Context, job *Job, msg string) error {
+	job.Status = "failed"
+	job.Error = msg
+	now := time.Now().UTC()
+	job.FinishedAt = &now
+	if e.store == nil {
+		return errors.New(msg)
+	}
+	if uerr := e.store.UpdateJob(ctx, job); uerr != nil {
+		log.Printf("[jobs] Failed persisting failed edit job %s: %v", job.ID, uerr)
+	}
+	if msg == "" {
+		return errors.New("edit job failed")
+	}
+	return errors.New(msg)
+}
+
+func (e *ServerJobExecutor) completeEditJob(ctx context.Context, job *Job) error {
+	job.Status = "completed"
+	job.Error = ""
+	now := time.Now().UTC()
+	job.FinishedAt = &now
+	if e.store == nil {
+		return errors.New("job store unavailable")
+	}
+	if uerr := e.store.UpdateJob(ctx, job); uerr != nil {
+		log.Printf("[jobs] Failed persisting completed edit job %s: %v", job.ID, uerr)
+		return uerr
+	}
+	return nil
+}
+
+func (e *ServerJobExecutor) supersedeEditJob(ctx context.Context, job *Job, reason string) error {
+	job.Status = "superseded"
+	job.Error = reason
+	now := time.Now().UTC()
+	job.FinishedAt = &now
+	if e.store == nil {
+		return errors.New("job store unavailable")
+	}
+	if uerr := e.store.UpdateJob(ctx, job); uerr != nil {
+		log.Printf("[jobs] Failed persisting superseded edit job %s: %v", job.ID, uerr)
+		return uerr
+	}
+	return nil
+}
+
+func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error {
+	if e.server == nil {
+		return e.failEditJob(ctx, job, "server unavailable")
+	}
+	if e.store == nil {
+		return errors.New("job store unavailable")
+	}
+
+	// Resolve the GitHub surface: injected fake in tests, live adapter in prod.
+	gh := e.editGH
+	var live *ghclient.Client
+	if gh == nil {
+		live = e.server.gh
+		if live == nil {
+			return e.failEditJob(ctx, job, "github client unavailable")
+		}
+		gh = &liveEditGitHub{c: live}
+	}
+
+	llmClient := e.editLLM
+	if llmClient == nil && e.server.cfg != nil {
+		llmClient = llm.NewClient(e.server.cfg.LLMBaseURL, e.server.cfg.LLMAPIKey, e.server.cfg.LLMModel)
+	}
+	classify := e.editClassify
+	if classify == nil {
+		classify = ClassifyEditIntent
+	}
+	publish := e.editPublish
+	if publish == nil {
+		if live != nil {
+			pub := NewPublication(e.store, live)
+			publish = func(pctx context.Context, pjob *Job, text string) error {
+				return e.publishStatus(pctx, pub, pjob, text)
+			}
+		} else {
+			// Fake GitHub without an injected publisher: direct comments.
+			publish = func(pctx context.Context, pjob *Job, text string) error {
+				return gh.PostComment(pctx, pjob.Owner, pjob.Repo, pjob.PRNumber, text)
+			}
+		}
+	}
+	// say posts user-facing text best-effort: the durable terminal state is
+	// authoritative, so a cosmetic comment failure never flips the outcome.
+	say := func(text string) {
+		if err := publish(ctx, job, text); err != nil {
+			log.Printf("[jobs] Edit comment for %s failed (continuing): %v", job.ID, err)
+		}
+	}
+
+	prepare := e.editPrepare
+	verify := e.editVerify
+	if prepare == nil || verify == nil {
+		platformRunner := sandbox.NewPlatformRunner(e.server.cfg, live, nil, nil)
+		if prepare == nil {
+			prepare = platformRunner.PrepareSnapshot
+		}
+		if verify == nil {
+			verify = platformRunner.RunSnapshot
+		}
+	}
+	loop := e.editLoop
+	if loop == nil {
+		loop = func(lctx context.Context, workDir, instruction, sticky string) (assistant.EditResult, error) {
+			return assistant.RunGatedEditLoop(lctx, llmClient, workDir, instruction, sticky, assistant.DefaultEditCaps())
+		}
+	}
+
+	// 1) Intent first: the instruction is data, never policy (T-05-01, D-21).
+	// The inherited executor reauth at job start already covers admission.
+	verdict, cerr := classify(ctx, llmClient, job.Payload)
+	englishSummary := ""
+	proceed := false
+	if cerr == nil {
+		englishSummary = strings.TrimSpace(verdict.Summary)
+		proceed = verdict.Intent == "commit" && verdict.Confidence >= IntentCommitThreshold
+	} else {
+		log.Printf("[jobs] Edit intent classification failed for %s: %v", job.ID, cerr)
+	}
+	if !proceed {
+		say("🤔 Bu isteği net anlayamadım — hangi dosyada ne değişmesini istediğinizi daha açık yazar mısınız?\n\nI couldn't confidently determine the requested change — please rephrase with the file and the desired change, then re-request with `/improve --commit` or `@pr-review`.")
+		return e.completeEditJob(ctx, job)
+	}
+
+	// 2) Live head before any expensive work.
+	livePR, prErr := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
+	if prErr != nil {
+		log.Printf("[jobs] Edit live-PR fetch failed for %s: %v", job.ID, prErr)
+		if wait, ok := budgetWait(prErr); ok {
+			return e.deferForExhaustedBudget(ctx, job, wait, fmt.Sprintf("retry wait exceeds worker budget: %v", prErr))
+		}
+		return e.failEditJob(ctx, job, prErr.Error())
+	}
+	if err := ghclient.ValidateCommitOID(livePR.HeadSHA); err != nil {
+		return e.failEditJob(ctx, job, fmt.Sprintf("invalid live head SHA %s: %v", livePR.HeadSHA, err))
+	}
+
+	// 3) Fork refusal before any snapshot work (D-24; nil metadata fails
+	// closed because IsFork returns true when head repo metadata is missing).
+	if livePR.IsFork() {
+		say("🍴 Fork PR'lara otomatik push yapılmaz — değişikliği aynı depodaki bir dala uygulayın.\n\nAutomated pushes to fork PRs are refused; no changes were made. Please apply the change on a branch in this repository.")
+		return e.completeEditJob(ctx, job)
+	}
+
+	// 4) Status transition to editing via the recycled owned comment.
+	say("✏️ Düzenleme çalışıyor... / Editing...")
+
+	if err := ghclient.ValidateCommitOID(job.HeadSHA); err != nil {
+		return e.failEditJob(ctx, job, fmt.Sprintf("invalid job head SHA: %v", err))
+	}
+
+	// 5) Sealed snapshot at exactly the admitted head; host fallback is
+	// structurally absent (D-27).
+	snap, cleanup, serr := prepare(ctx, livePR.CloneURL, livePR.HeadRef, job.HeadSHA)
+	if serr != nil {
+		log.Printf("[jobs] Edit snapshot failed for %s: %v", job.ID, serr)
+		if wait, ok := budgetWait(serr); ok {
+			return e.deferForExhaustedBudget(ctx, job, wait, fmt.Sprintf("retry wait exceeds worker budget: %v", serr))
+		}
+		if errors.Is(serr, sandbox.ErrSourceProviderUnavailable) {
+			say("🚧 İzole çalışma ortamı şu anda kullanılamıyor — hiçbir değişiklik yapılmadı, daha sonra tekrar deneyin.\n\nIsolated execution is currently unavailable; no changes were made. Please retry later.")
+			return e.completeEditJob(ctx, job)
+		}
+		say(fmt.Sprintf("🚧 Snapshot hazırlanamadı — hiçbir değişiklik yapılmadı: %v\n\nCould not prepare the isolated snapshot; no changes were made: %v", serr, serr))
+		return e.failEditJob(ctx, job, serr.Error())
+	}
+	defer cleanup()
+
+	// Sticky context: instruction history plus the prior bot diff (D-38).
+	var history []string
+	priorBase := job.BaseSHA
+	var priorHead string
+	if st, gerr := e.store.GetPRState(ctx, job.PRKey); gerr == nil && st != nil {
+		history = append([]string(nil), st.EditHistory...)
+		if st.LastBotBaseSHA != "" {
+			priorBase = st.LastBotBaseSHA
+		}
+		priorHead = st.LastBotCommitSHA
+	}
+	var priorDiff string
+	if priorHead != "" && priorHead != priorBase &&
+		ghclient.ValidateCommitOID(priorBase) == nil && ghclient.ValidateCommitOID(priorHead) == nil {
+		if d, derr := gh.GetDiffAtCommits(ctx, job.Owner, job.Repo, priorBase, priorHead); derr != nil {
+			log.Printf("[jobs] Edit prior-diff fetch for %s failed (continuing without): %v", job.ID, derr)
+		} else if d != "" {
+			priorDiff = d
+			if len(priorDiff) > editPriorDiffMaxBytes {
+				priorDiff = priorDiff[:editPriorDiffMaxBytes] + editPriorDiffTruncatedMarker
+			}
+		}
+	}
+	stickyContext := buildEditStickyContext(history, priorDiff)
+
+	editResult, lerr := loop(ctx, snap.SourceDir, job.Payload, stickyContext)
+	if lerr != nil {
+		log.Printf("[jobs] Edit loop failed for %s: %v", job.ID, lerr)
+		say(fmt.Sprintf("❌ Düzenleme uygulanamadı — push yapılmadı.\n\nThe isolated edit could not be applied; nothing was pushed: %v", lerr))
+		return e.failEditJob(ctx, job, lerr.Error())
+	}
+
+	// 6) Verify the edited tree; only a green tree may proceed to push (D-28).
+	// There is no push-directly-for-CI escape: any non-passed status stops here.
+	say("🔄 Doğrulama çalışıyor... / Verifying...")
+	report, verr := verify(ctx, snap)
+	if verr != nil {
+		log.Printf("[jobs] Edit verification error for %s: %v", job.ID, verr)
+		say(fmt.Sprintf("❌ Doğrulama çalıştırılamadı — push yapılmadı.\n\nVerification could not run; nothing was pushed: %v", verr))
+		return e.failEditJob(ctx, job, verr.Error())
+	}
+	if report == nil {
+		return e.failEditJob(ctx, job, "verification returned no report")
+	}
+	if report.Status == sandbox.StatusUnavailable {
+		say("🚧 İzole doğrulama şu anda kullanılamıyor — hiçbir değişiklik push edilmedi, daha sonra tekrar deneyin.\n\nIsolated verification is currently unavailable; nothing was pushed. Please retry later.")
+		return e.completeEditJob(ctx, job)
+	}
+	if report.Status != sandbox.StatusPassed {
+		say(fmt.Sprintf("❌ Doğrulama geçilemedi (%s) — push yapılmadı.\n\nVerification did not pass (%s); nothing was pushed.", report.Status, report.Status))
+		return e.failEditJob(ctx, job, fmt.Sprintf("verification status %s: %s", report.Status, report.Reason))
+	}
+	// Green-time byte snapshot: read each changed file exactly once into
+	// memory; the work copy is never re-walked after this point (T-05-03).
+	files := make(map[string]string, len(editResult.FilesChanged))
+	for _, p := range editResult.FilesChanged {
+		rel := filepath.Clean(filepath.FromSlash(p))
+		if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return e.failEditJob(ctx, job, fmt.Sprintf("refusing to push out-of-jail path %q", p))
+		}
+		b, rerr := os.ReadFile(filepath.Join(snap.SourceDir, rel))
+		if rerr != nil {
+			log.Printf("[jobs] Edit green-snapshot read failed for %s path %s: %v", job.ID, p, rerr)
+			say("❌ Doğrulanmış dosyalar okunamadı — push yapılmadı.\n\nVerified files could not be read; nothing was pushed.")
+			return e.failEditJob(ctx, job, rerr.Error())
+		}
+		files[p] = string(b)
+	}
+	if len(files) == 0 {
+		say("ℹ️ Düzenleme dosya değişikliği üretmedi — push yapılmadı.\n\nThe edit produced no file changes; nothing was pushed.")
+		return e.completeEditJob(ctx, job)
+	}
+
+	// 7) Push-time re-verification with a fresh short timeout, fail-closed
+	// immediately before minting (D-26). The job-start reauth inherited from
+	// ExecuteJob cannot close the snapshot/verify time window.
+	if strings.TrimSpace(job.Author) == "" {
+		say("🔒 Push öncesi yetki doğrulanamadı — push yapılmadı.\n\nPush-time authorization could not be verified; nothing was pushed.")
+		return e.failEditJob(ctx, job, "push-time reauthorization denied: empty author")
+	}
+	authCtx, authCancel := context.WithTimeout(ctx, 5*time.Second)
+	allowed, aerr := gh.CanWriteRepository(authCtx, job.Owner, job.Repo, job.Author)
+	authCancel()
+	if aerr != nil || !allowed {
+		log.Printf("[jobs] Edit push-time reauth denied for %s by %q: allowed=%v err=%v", job.ID, job.Author, allowed, aerr)
+		say("🔒 Push öncesi yetki doğrulanamadı — push yapılmadı, lütfen yeniden isteyin.\n\nPush-time authorization could not be verified; nothing was pushed. Please re-request.")
+		return e.failEditJob(ctx, job, "push-time reauthorization denied")
+	}
+
+	// 8) Close the verify→push race: re-read the live head, then CAS (D-31).
+	livePR2, prErr2 := gh.GetPR(ctx, job.Owner, job.Repo, job.PRNumber)
+	if prErr2 != nil {
+		log.Printf("[jobs] Edit pre-push head fetch failed for %s: %v", job.ID, prErr2)
+		say(fmt.Sprintf("❌ Push öncesi head doğrulanamadı — push yapılmadı: %v\n\nPre-push head verification failed; nothing was pushed: %v", prErr2, prErr2))
+		return e.failEditJob(ctx, job, prErr2.Error())
+	}
+	if err := ghclient.ValidateCommitOID(livePR2.HeadSHA); err != nil {
+		return e.failEditJob(ctx, job, fmt.Sprintf("invalid pre-push head SHA %s: %v", livePR2.HeadSHA, err))
+	}
+	if livePR2.HeadSHA != job.HeadSHA {
+		say(fmt.Sprintf("⏭️ %s commit'i geride kaldı (canlı: %s) — push yapılmadı, lütfen yeniden isteyin.\n\nHead moved during the edit (job head %s, live %s); nothing was pushed. Please re-request with a fresh `/improve --commit` or `@pr-review`.", short8(job.HeadSHA), short8(livePR2.HeadSHA), job.HeadSHA, livePR2.HeadSHA))
+		return e.supersedeEditJob(ctx, job, fmt.Sprintf("stale head: job %s, live %s", job.HeadSHA, livePR2.HeadSHA))
+	}
+	if strings.TrimSpace(livePR2.HeadRef) == "" {
+		return e.failEditJob(ctx, job, "live PR head ref is empty")
+	}
+	if livePR2.HeadRepoID <= 0 {
+		say("🔒 Head depo kimliği doğrulanamadı — push yapılmadı.\n\nHead repository identity could not be verified; nothing was pushed.")
+		return e.failEditJob(ctx, job, "head repository ID unavailable")
+	}
+	cred, cerr := gh.CreatePushCredential(ctx, job.Owner, job.Repo, livePR2.HeadRepoID)
+	if cerr != nil {
+		log.Printf("[jobs] Edit push credential mint failed for %s: %v", job.ID, cerr)
+		say(fmt.Sprintf("🔒 Push kimlik bilgisi alınamadı — push yapılmadı: %v\n\nCould not mint the push credential; nothing was pushed: %v", cerr, cerr))
+		return e.failEditJob(ctx, job, cerr.Error())
+	}
+	defer func() {
+		if rerr := gh.RevokePushCredential(ctx, cred); rerr != nil {
+			log.Printf("[jobs] Edit push credential revoke for %s failed: %v", job.ID, rerr)
+		}
+	}()
+	headline := ghclient.SanitizeCommitHeadline(englishSummary, job.Payload, shortCommitSHA(job.HeadSHA))
+	newSHA, perr := gh.CommitPush(ctx, cred, job.Owner, job.Repo, livePR2.HeadRef, job.HeadSHA, headline, files, nil)
+	if perr != nil {
+		var hme *ghclient.HeadMovedError
+		switch {
+		case errors.As(perr, &hme):
+			actual := hme.ActualHeadOID
+			if actual == "" {
+				actual = "unknown"
+			}
+			say(fmt.Sprintf("⏭️ %s commit'i push sırasında geride kaldı (canlı: %s) — push yapılmadı, lütfen yeniden isteyin.\n\nHead moved during push (expected %s, live %s); nothing was pushed. Please re-request with a fresh `/improve --commit` or `@pr-review`.", short8(job.HeadSHA), short8(actual), job.HeadSHA, actual))
+			return e.supersedeEditJob(ctx, job, perr.Error())
+		case ghclient.IsUncertainWriteError(perr):
+			e.markNeedsAttention(ctx, job, fmt.Sprintf("uncertain push outcome; requires operator resolution: %v", perr))
+			return perr
+		case isPushRefusedError(perr):
+			say(fmt.Sprintf("🔒 Push reddedildi — push yapılmadı: %v\n\nPush refused; nothing was pushed: %v", perr, perr))
+			return e.failEditJob(ctx, job, perr.Error())
+		default:
+			say(fmt.Sprintf("❌ Push başarısız — push yapılmadı: %v\n\nPush failed; nothing was pushed: %v", perr, perr))
+			return e.failEditJob(ctx, job, perr.Error())
+		}
+	}
+
+	// 9) Sticky persistence plus the final summary. The push already landed,
+	// so a persistence failure is logged but never flips the outcome.
+	if st, gerr := e.store.GetPRState(ctx, job.PRKey); gerr == nil && st != nil {
+		st.LastBotCommitSHA = newSHA
+		st.LastBotBaseSHA = job.HeadSHA
+		st.EditHistory = appendEditHistory(st.EditHistory, job.Payload)
+		if uerr := e.store.UpdatePRState(ctx, st); uerr != nil {
+			log.Printf("[jobs] Edit sticky persist for %s failed: %v", job.ID, uerr)
+		}
+	} else if errors.Is(gerr, ErrPRNotFound) {
+		fresh := &PRState{
+			PRKey:            job.PRKey,
+			Owner:            job.Owner,
+			Repo:             job.Repo,
+			Number:           job.PRNumber,
+			LastBotCommitSHA: newSHA,
+			LastBotBaseSHA:   job.HeadSHA,
+			EditHistory:      []string{job.Payload},
+		}
+		if uerr := e.store.UpdatePRState(ctx, fresh); uerr != nil {
+			log.Printf("[jobs] Edit sticky persist for %s failed: %v", job.ID, uerr)
+		}
+	} else {
+		log.Printf("[jobs] Edit sticky read for %s failed: %v", job.ID, gerr)
+	}
+	quoted := make([]string, 0, len(editResult.FilesChanged))
+	for _, p := range editResult.FilesChanged {
+		quoted = append(quoted, "`"+p+"`")
+	}
+	summary := fmt.Sprintf("✅ Düzenleme push edildi: %s\n\nFiles changed (%d): %s\nVerification: passed\nCommit: %s",
+		newSHA, len(editResult.FilesChanged), strings.Join(quoted, ", "), newSHA)
+	if editResult.Truncated && editResult.OmissionNotice != "" {
+		summary += fmt.Sprintf("\n\nPartial: %s", editResult.OmissionNotice)
+	}
+	say(summary)
+	return e.completeEditJob(ctx, job)
 }
 
 // Scheduler coordinates FIFO job execution with per-PR serialisation and fixed workers.
