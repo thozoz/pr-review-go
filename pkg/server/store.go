@@ -100,7 +100,7 @@ func (d *Delivery) Key() string {
 type Job struct {
 	ID              string     `json:"id"`
 	Sequence        uint64     `json:"sequence"`
-	Kind            string     `json:"kind"`    // "review", "labels", "describe", "summary", "docs", "changelog", "improve", "assistant"
+	Kind            string     `json:"kind"`    // "review", "labels", "describe", "summary", "docs", "changelog", "improve", "assistant", "edit"
 	Trigger         string     `json:"trigger"` // "automatic", "explicit"
 	Author          string     `json:"author"`
 	CommentID       int64      `json:"comment_id,omitempty"`

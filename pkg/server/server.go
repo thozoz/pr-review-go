@@ -646,7 +646,7 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 		Payload:   payloadText,
 	}
 
-	if kind == "review" || kind == "approve" || kind == "request_changes" {
+	if kind == "review" || kind == "approve" || kind == "request_changes" || kind == "edit" {
 		pr, prErr := s.gh.GetPR(ctx, owner, repo, prNum)
 		if prErr == nil && pr != nil {
 			job.BaseSHA = pr.BaseSHA
@@ -719,6 +719,32 @@ func matchWordPrefix(body, prefix string) bool {
 	return false
 }
 
+// hasStandaloneCommitFlag reports whether rest contains a standalone --commit
+// token: a whitespace-delimited field exactly equal to --commit. Embedded
+// forms (--commitment, --commit-message, x--commit) do not match, so prose
+// mentioning commit-ish words never triggers the push-capable edit path.
+func hasStandaloneCommitFlag(rest string) bool {
+	for _, field := range strings.Fields(rest) {
+		if field == "--commit" {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutCommitFlag returns the instruction text with standalone --commit
+// tokens removed.
+func withoutCommitFlag(rest string) string {
+	kept := make([]string, 0, 8)
+	for _, field := range strings.Fields(rest) {
+		if field == "--commit" {
+			continue
+		}
+		kept = append(kept, field)
+	}
+	return strings.Join(kept, " ")
+}
+
 func parseCommentCommand(body string) (kind string, payload string) {
 	switch {
 	case matchWordPrefix(body, "/request_changes"):
@@ -728,6 +754,10 @@ func parseCommentCommand(body string) (kind string, payload string) {
 	case strings.HasPrefix(body, "/review"):
 		return "review", ""
 	case strings.HasPrefix(body, "/improve"):
+		rest := strings.TrimSpace(strings.TrimPrefix(body, "/improve"))
+		if hasStandaloneCommitFlag(rest) {
+			return "edit", withoutCommitFlag(rest)
+		}
 		return "improve", ""
 	case strings.HasPrefix(body, "/describe"):
 		return "describe", ""
@@ -739,9 +769,11 @@ func parseCommentCommand(body string) (kind string, payload string) {
 		return "summary", ""
 	case strings.HasPrefix(body, "/add_docs") || strings.HasPrefix(body, "/docs"):
 		return "docs", ""
-	case strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "@pr-review") || strings.HasPrefix(body, "/ask"):
+	case strings.HasPrefix(body, "@pr-review"):
+		instruction := strings.TrimSpace(strings.TrimPrefix(body, "@pr-review"))
+		return "edit", instruction
+	case strings.HasPrefix(body, "@bot") || strings.HasPrefix(body, "/ask"):
 		question := strings.TrimSpace(strings.TrimPrefix(body, "@bot"))
-		question = strings.TrimSpace(strings.TrimPrefix(question, "@pr-review"))
 		question = strings.TrimSpace(strings.TrimPrefix(question, "/ask"))
 		return "assistant", question
 	default:

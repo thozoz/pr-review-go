@@ -333,31 +333,46 @@ func TestCommentCommands_UnauthorizedCommandsDenied(t *testing.T) {
 
 func TestParseCommentCommand(t *testing.T) {
 	cases := []struct {
-		body     string
-		wantKind string
-		wantCmd  bool
+		body        string
+		wantKind    string
+		wantCmd     bool
+		wantPayload string
 	}{
-		{"/approve", "approve", true},
-		{"/approve please merge", "approve", true},
-		{"/approve\nlooks good", "approve", true},
-		{"/request_changes", "request_changes", true},
-		{"/request_changes fix formatting", "request_changes", true},
-		{"/review", "review", true},
-		{"/review all", "review", true},
+		{"/approve", "approve", true, ""},
+		{"/approve please merge", "approve", true, ""},
+		{"/approve\nlooks good", "approve", true, ""},
+		{"/request_changes", "request_changes", true, ""},
+		{"/request_changes fix formatting", "request_changes", true, ""},
+		{"/review", "review", true, ""},
+		{"/review all", "review", true, ""},
+		{"/improve", "improve", true, ""},
+		{"/improve suggest better names", "improve", true, ""},
+		{"/improve --commit fix the race", "edit", true, "fix the race"},
+		{"/improve fix the race --commit", "edit", true, "fix the race"},
+		{"/improve --commit", "edit", true, ""},
+		{"/improve explain the --commitment flow", "improve", true, ""},
+		{"/improve document --commit-message format", "improve", true, ""},
+		{"@pr-review rate limiter ekle", "edit", true, "rate limiter ekle"},
+		{"@pr-review", "edit", true, ""},
+		{"@bot explain this", "assistant", true, "explain this"},
+		{"/ask what is this function", "assistant", true, "what is this function"},
 		// Near-miss prefixes staying unrecognized
-		{"/approving", "", false},
-		{"/appr", "", false},
-		{"/requested_changes", "", false},
-		{"/request_change", "", false},
-		{"/reviewer", "review", true},
-		{"hello world", "", false},
+		{"/approving", "", false, ""},
+		{"/appr", "", false, ""},
+		{"/requested_changes", "", false, ""},
+		{"/request_change", "", false, ""},
+		{"/reviewer", "review", true, ""},
+		{"hello world", "", false, ""},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.body, func(t *testing.T) {
-			kind, _ := parseCommentCommand(tc.body)
+			kind, payload := parseCommentCommand(tc.body)
 			if kind != tc.wantKind {
 				t.Errorf("parseCommentCommand(%q) kind = %q, want %q", tc.body, kind, tc.wantKind)
+			}
+			if payload != tc.wantPayload {
+				t.Errorf("parseCommentCommand(%q) payload = %q, want %q", tc.body, payload, tc.wantPayload)
 			}
 			isCmd := isCommentCommand(tc.body)
 			if isCmd != tc.wantCmd {
