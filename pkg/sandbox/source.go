@@ -411,11 +411,16 @@ func (s *PublicGitSource) PrepareSource(ctx context.Context, cloneURL, headRef, 
 
 	// 4. Start restricted Git data gateway on a dedicated Unix socket (D-05, D-09)
 	gwSockPath := filepath.Join(lease.ControlDir, fmt.Sprintf("gw-%s.sock", jobID))
+	retrievalToken := ""
+	if s.Config != nil && s.Config.GitHubToken != "" {
+		retrievalToken = s.Config.GitHubToken
+	}
 	gw, err := StartGitGateway(GitGatewayConfig{
 		SocketPath:      gwSockPath,
 		RepoOwner:       owner,
 		RepoName:        repo,
 		UpstreamBaseURL: s.GatewayBaseURL,
+		RetrievalToken:  retrievalToken,
 	})
 	if err != nil {
 		cleanup()
@@ -434,10 +439,11 @@ func (s *PublicGitSource) PrepareSource(ctx context.Context, cloneURL, headRef, 
 	// 6. Execute isolated source retrieval container with --network=none
 	// Scratch directory inside the leased slot for bare git repository
 	gitScratchDir := filepath.Join(lease.SlotDir, "git")
-	if err := os.MkdirAll(gitScratchDir, 0755); err != nil {
+	if err := os.MkdirAll(gitScratchDir, 0777); err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("failed to create git scratch dir: %w", err)
 	}
+	_ = os.Chmod(gitScratchDir, 0777)
 
 	retrievalArgs := []string{
 		"pr-review-sandbox-helper", "retrieve",
@@ -462,7 +468,11 @@ func (s *PublicGitSource) PrepareSource(ctx context.Context, cloneURL, headRef, 
 		"--pid=private",
 		"--ipc=none",
 		"--cgroupns=private",
-		"--userns=keep-id",
+	}
+	if s.Backend == nil || !s.Backend.cfg.AllowRootfulSandbox {
+		podmanArgs = append(podmanArgs, "--userns=keep-id")
+	}
+	podmanArgs = append(podmanArgs,
 		"--read-only",
 		"--read-only-tmpfs=false",
 		"--log-driver=none",
@@ -484,7 +494,7 @@ func (s *PublicGitSource) PrepareSource(ctx context.Context, cloneURL, headRef, 
 		"-e", "HOME=/tmp",
 		"-e", "TMPDIR=/tmp",
 		s.Backend.cfg.ImageDigest,
-	}
+	)
 	podmanArgs = append(podmanArgs, retrievalArgs...)
 
 	retrievalTimeout := 2 * time.Minute
@@ -675,10 +685,11 @@ func (s *PrivateGitSource) PrepareSource(ctx context.Context, cloneURL, headRef,
 
 	// 8. Execute isolated source retrieval container with --network=none
 	gitScratchDir := filepath.Join(lease.SlotDir, "git")
-	if err := os.MkdirAll(gitScratchDir, 0755); err != nil {
+	if err := os.MkdirAll(gitScratchDir, 0777); err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("failed to create git scratch dir: %w", err)
 	}
+	_ = os.Chmod(gitScratchDir, 0777)
 
 	retrievalArgs := []string{
 		"pr-review-sandbox-helper", "retrieve",
@@ -702,7 +713,11 @@ func (s *PrivateGitSource) PrepareSource(ctx context.Context, cloneURL, headRef,
 		"--pid=private",
 		"--ipc=none",
 		"--cgroupns=private",
-		"--userns=keep-id",
+	}
+	if s.Backend == nil || !s.Backend.cfg.AllowRootfulSandbox {
+		podmanArgs = append(podmanArgs, "--userns=keep-id")
+	}
+	podmanArgs = append(podmanArgs,
 		"--read-only",
 		"--read-only-tmpfs=false",
 		"--log-driver=none",
@@ -724,7 +739,7 @@ func (s *PrivateGitSource) PrepareSource(ctx context.Context, cloneURL, headRef,
 		"-e", "HOME=/tmp",
 		"-e", "TMPDIR=/tmp",
 		s.Backend.cfg.ImageDigest,
-	}
+	)
 	podmanArgs = append(podmanArgs, retrievalArgs...)
 
 	retrievalTimeout := 2 * time.Minute
