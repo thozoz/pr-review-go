@@ -58,10 +58,19 @@ func NewLinuxSlotManager(slotDir, controlDir string) (*LinuxSlotManager, error) 
 		return nil, fmt.Errorf("failed to create control dir: %w", err)
 	}
 
-	return &LinuxSlotManager{
+	mgr := &LinuxSlotManager{
 		SlotDir:    cleanSlot,
 		ControlDir: cleanControl,
-	}, nil
+	}
+	// Unprivileged LXC / Proxmox environments cannot satisfy mount-table
+	// attestation (no loop-device passthrough); the operator opts out
+	// explicitly via SANDBOX_SKIP_MOUNT_CHECKS=1. Same check is honored in
+	// AcquireSlot so managers built before the env change are covered too.
+	if os.Getenv("SANDBOX_SKIP_MOUNT_CHECKS") == "1" || os.Getenv("SANDBOX_SKIP_MOUNT_CHECKS") == "true" {
+		mgr.SkipMountChecks = true
+	}
+
+	return mgr, nil
 }
 
 // ParseMountInfoLine parses a single line of /proc/self/mountinfo.
@@ -243,7 +252,10 @@ func (m *LinuxSlotManager) AcquireSlot(ctx context.Context, jobID string) (*Slot
 	}
 
 	mountID := 0
-	if !m.SkipMountChecks {
+	skipChecks := m.SkipMountChecks ||
+		os.Getenv("SANDBOX_SKIP_MOUNT_CHECKS") == "1" ||
+		os.Getenv("SANDBOX_SKIP_MOUNT_CHECKS") == "true"
+	if !skipChecks {
 		var err error
 		mountID, err = m.ValidateSlotMount(slotDir)
 		if err != nil {

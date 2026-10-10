@@ -11,6 +11,10 @@ import (
 type LinuxSlotManager struct {
 	SlotDir    string
 	ControlDir string
+	// SkipMountChecks mirrors the Linux field so shared wiring code
+	// (SlotManagerForConfig) compiles on every platform. It has no effect
+	// here: construction always fails with ErrStorageUnavailable.
+	SkipMountChecks bool
 }
 
 func NewLinuxSlotManager(slotDir, controlDir string) (*LinuxSlotManager, error) {
@@ -40,6 +44,4 @@ func (m *LinuxSlotManager) ReconcileSlots(ctx context.Context) error {
 func (m *LinuxSlotManager) ValidateSlotMount(dir string) error {
 	return fmt.Errorf("%w: fixed slot leasing is only supported on Linux", ErrStorageUnavailable)
 }
-
-func (m *LinuxSlotManager) SkipMountChecks() {}
 
