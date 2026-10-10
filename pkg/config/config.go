@@ -21,6 +21,10 @@ type Config struct {
 	LLMAPIKey     string
 	LLMModel      string
 	EnableSandbox bool
+	// SandboxMode selects the verification backend: "podman" (default,
+	// rootless containers) or "direct" (containerless host execution for
+	// pre-isolated environments). Env SANDBOX_MODE.
+	SandboxMode string `json:"sandbox_mode"`
 	// AllowRootfulSandbox permits rootful Podman in pre-isolated
 	// environments (unprivileged LXC, CI runners). Env ALLOW_ROOTFUL_SANDBOX.
 	AllowRootfulSandbox bool
@@ -92,6 +96,12 @@ type Config struct {
 	MermaidMaxEdges           int   `json:"mermaid_max_edges"`
 	MermaidMaxBytes           int64 `json:"mermaid_max_bytes"`
 }
+
+// SandboxMode selects the verification backend.
+const (
+	SandboxModePodman = "podman"
+	SandboxModeDirect = "direct"
+)
 
 const (
 	DefaultLLMConcurrency       = 2
@@ -214,6 +224,13 @@ func (c *Config) Validate() error {
 	}
 	if c.EffortLevel != "lite" && c.EffortLevel != "balanced" {
 		return fmt.Errorf("invalid EffortLevel: %s (must be 'lite' or 'balanced')", c.EffortLevel)
+	}
+	// Set default SandboxMode if empty
+	if c.SandboxMode == "" {
+		c.SandboxMode = SandboxModePodman
+	}
+	if c.SandboxMode != SandboxModePodman && c.SandboxMode != SandboxModeDirect {
+		return fmt.Errorf("invalid SandboxMode: %s (must be 'podman' or 'direct')", c.SandboxMode)
 	}
 	if c.AutoActions == nil {
 		c.AutoActions = []string{"review", "labels"}
@@ -669,6 +686,10 @@ func Load() *Config {
 	if effort == "lite" {
 		enableSandbox = false
 	}
+	sandboxMode := strings.ToLower(strings.TrimSpace(os.Getenv("SANDBOX_MODE")))
+	if sandboxMode == "" {
+		sandboxMode = SandboxModePodman
+	}
 	allowRootfulSandbox := false
 	if raw := os.Getenv("ALLOW_ROOTFUL_SANDBOX"); raw != "" {
 		allowRootfulSandbox = strings.EqualFold(raw, "true") || raw == "1"
@@ -1056,6 +1077,7 @@ func Load() *Config {
 		LLMModel:                llmModel,
 		EffortLevel:             effort,
 		EnableSandbox:           enableSandbox,
+		SandboxMode:             sandboxMode,
 		AllowRootfulSandbox:     allowRootfulSandbox,
 		AutoActions:             autoActions,
 		GitHubAppSetupToken:     setupToken,
