@@ -66,7 +66,8 @@ func runSetupSandbox(cfg *config.Config, image, slotDir, slotSize string, buildF
 	fmt.Printf("[1/5] podman: %s (%s)\n", strings.TrimSpace(string(out)), podmanBin)
 	if out, err := exec.Command(podmanBin, "info", "--format", "json").CombinedOutput(); err != nil {
 		fmt.Printf("      WARN: podman info failed — rootless/cgroup-v2 attestation unavailable: %v\n", err)
-		fmt.Printf("      Hint: run 'podman info' as the service user; rootful podman is denied by the backend.\n")
+		fmt.Printf("      Hint: run 'podman info' as the service user; rootful podman is denied by the backend\n")
+		fmt.Printf("      unless ALLOW_ROOTFUL_SANDBOX=1 is set for a pre-isolated environment (LXC/CI).")
 		_ = out
 	} else {
 		fmt.Println("      podman info: OK")

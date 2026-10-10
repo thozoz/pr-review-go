@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -25,6 +26,11 @@ type PodmanConfig struct {
 	PidsLimit    int64
 	TimeoutStage time.Duration
 	TimeoutClean time.Duration
+	// AllowRootfulSandbox opts out of the mandatory rootless check in
+	// Attest. Only set in pre-isolated environments (unprivileged LXC,
+	// CI runners, Kubernetes pods) where nested user namespaces are
+	// unavailable — never on a shared bare-metal host.
+	AllowRootfulSandbox bool
 }
 
 type PodmanBackend struct {
@@ -104,9 +110,13 @@ func (p *PodmanBackend) Attest(ctx context.Context) error {
 		return fmt.Errorf("%w: failed to parse podman info: %v", ErrPodmanAttestationFailed, err)
 	}
 
-	// 2. Deny rootful Podman (D-01, SAFE-01)
+	// 2. Deny rootful Podman (D-01, SAFE-01), unless the operator
+	// explicitly opted out for a pre-isolated environment.
+	if !info.Host.Rootless && !p.cfg.AllowRootfulSandbox {
+		return fmt.Errorf("%w: rootful podman is denied; only local rootless execution is permitted (override with ALLOW_ROOTFUL_SANDBOX=1 in pre-isolated environments)", ErrPodmanAttestationFailed)
+	}
 	if !info.Host.Rootless {
-		return fmt.Errorf("%w: rootful podman is denied; only local rootless execution is permitted", ErrPodmanAttestationFailed)
+		log.Println("[sandbox] WARNING: Running with rootful Podman sandbox (ALLOW_ROOTFUL_SANDBOX=1 enabled). Ensure host environment is already container-isolated.")
 	}
 
 	// 3. Verify cgroup-v2
