@@ -197,7 +197,11 @@ func (p *PodmanBackend) RunStage(ctx context.Context, jobID, stageName string, l
 		"--pid=private",
 		"--ipc=none",
 		"--cgroupns=private",
-		"--userns=keep-id",
+	}
+	if !p.cfg.AllowRootfulSandbox {
+		podmanArgs = append(podmanArgs, "--userns=keep-id")
+	}
+	podmanArgs = append(podmanArgs,
 		"--read-only",
 		"--read-only-tmpfs=false",
 		"--log-driver=none",
@@ -224,7 +228,7 @@ func (p *PodmanBackend) RunStage(ctx context.Context, jobID, stageName string, l
 		"-e", "HOME=/tmp",
 		"-e", "PATH=/usr/local/go/bin:/usr/bin:/bin",
 		p.cfg.ImageDigest,
-	}
+	)
 	podmanArgs = append(podmanArgs, args...)
 
 	cmd := exec.CommandContext(ctx, p.cfg.BinaryPath, podmanArgs...)

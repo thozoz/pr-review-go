@@ -203,7 +203,11 @@ func (p *PodmanDependencyPreparer) PrepareDependencies(ctx context.Context, jobI
 		"--pid=private",
 		"--ipc=none",
 		"--cgroupns=private",
-		"--userns=keep-id",
+	}
+	if p.Backend == nil || !p.Backend.cfg.AllowRootfulSandbox {
+		podmanArgs = append(podmanArgs, "--userns=keep-id")
+	}
+	podmanArgs = append(podmanArgs,
 		"--read-only",
 		"--read-only-tmpfs=false",
 		"--log-driver=none",
@@ -224,7 +228,7 @@ func (p *PodmanDependencyPreparer) PrepareDependencies(ctx context.Context, jobI
 		"pr-review-sandbox-helper", "prepare",
 		"-socket", "/run/sandbox/gateway.sock",
 		"-work", "/work",
-	}
+	)
 
 	prepTimeout := 3 * time.Minute
 	if p.Config != nil && p.Config.SandboxTimeoutPrep > 0 {
