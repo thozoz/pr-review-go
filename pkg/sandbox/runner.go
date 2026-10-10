@@ -160,6 +160,9 @@ type Runner struct {
 	SlotManager    SlotManager
 	SourceProvider SourceProvider
 	DepPreparer    DependencyPreparer
+	// Direct executes verification without containers when
+	// Config.SandboxMode == "direct". Nil in podman mode.
+	Direct *DirectRunner
 }
 
 func NewRunner(timeout time.Duration) *Runner {
@@ -185,6 +188,9 @@ func NewRunnerWithConfig(cfg *config.Config, backend *PodmanBackend, sm SlotMana
 	if backend != nil && sm != nil {
 		r.SourceProvider = NewPublicGitSource(backend, sm, cfg)
 		r.DepPreparer = NewDependencyPreparer(backend, cfg)
+	}
+	if cfg != nil && cfg.SandboxMode == config.SandboxModeDirect {
+		r.Direct = DirectRunnerForConfig(cfg)
 	}
 	return r
 }
@@ -300,20 +306,33 @@ func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationRe
 
 	r.extractCustomRules(dir, report)
 
+	// Direct mode verifies every project type in place on the trusted host
+	// without containers, slots, or attestation.
+	if r.Direct != nil {
+		snapshot := &Snapshot{
+			CommitSHA: computeDirSHA(dir),
+			SourceDir: dir,
+		}
+		return r.RunSnapshot(ctx, snapshot)
+	}
+
 	// 1. Detect project environment
 	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
 		report.DetectedType = "go"
 
-		// When dependency preparer is unconfigured, unvendored external dependencies yield incomplete
-		if hasUnvendoredDependencies(dir) && r.DepPreparer == nil {
+		// Direct mode tries the build honestly against the local module
+		// cache (GOPROXY=off) instead of failing closed here.
+		if r.Direct == nil && hasUnvendoredDependencies(dir) && r.DepPreparer == nil {
 			report.Status = StatusIncomplete
 			report.Reason = "external dependencies require network gateway (Plan 04)"
 			report.Summary = "INCOMPLETE: External dependencies require network gateway."
 			return report, nil
 		}
 
-		// On non-Linux platforms (macOS/Windows), build/test isolation is unavailable (D-02)
-		if runtime.GOOS != "linux" {
+		// On non-Linux platforms (macOS/Windows), container build/test
+		// isolation is unavailable (D-02). Direct mode is exempt: it needs
+		// only a Go toolchain, and the host is trusted by configuration.
+		if r.Direct == nil && runtime.GOOS != "linux" {
 			report.Status = StatusUnavailable
 			report.Reason = fmt.Sprintf("isolated build/test verification is unavailable on %s; Linux rootless container isolation required (D-02)", runtime.GOOS)
 			report.Summary = fmt.Sprintf("UNAVAILABLE: Verification is unavailable on %s (Linux container isolation required).", runtime.GOOS)
@@ -321,7 +340,7 @@ func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationRe
 		}
 
 		// Container isolation is required for Go PR execution (D-01)
-		if r.Backend == nil || r.SlotManager == nil {
+		if r.Direct == nil && (r.Backend == nil || r.SlotManager == nil) {
 			report.Status = StatusUnavailable
 			report.Reason = "container isolation backend or storage slot not configured"
 			report.Summary = "SKIPPED: Verification skipped due to missing container isolation."
@@ -399,6 +418,12 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 		report.Reason = err.Error()
 		report.Summary = fmt.Sprintf("UNAVAILABLE: %v", err)
 		return report, nil
+	}
+
+	// Direct mode skips slot leasing, attestation, and containers: the
+	// snapshot source directory is verified in place on the trusted host.
+	if r.Direct != nil {
+		return r.runDirectSnapshot(ctx, snapshot)
 	}
 
 	// On non-Linux platforms (macOS/Windows), build/test isolation is unavailable (D-02)

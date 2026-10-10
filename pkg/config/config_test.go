@@ -609,3 +609,46 @@ func TestLoadAllowRootfulSandboxEnv(t *testing.T) {
 	}
 }
 
+func TestLoadSandboxModeEnv(t *testing.T) {
+	os.Setenv("GITHUB_TOKEN", "token")
+	os.Setenv("LLM_API_KEY", "key")
+	os.Setenv("LLM_MODEL", "model")
+	os.Setenv("LLM_BASE_URL", "https://example.com")
+	defer func() {
+		os.Unsetenv("GITHUB_TOKEN")
+		os.Unsetenv("LLM_API_KEY")
+		os.Unsetenv("LLM_MODEL")
+		os.Unsetenv("LLM_BASE_URL")
+		os.Unsetenv("SANDBOX_MODE")
+	}()
+
+	// 1. Default is podman
+	cfg := Load()
+	if cfg.SandboxMode != SandboxModePodman {
+		t.Errorf("expected default SandboxMode podman, got %q", cfg.SandboxMode)
+	}
+
+	// 2. direct is accepted (case-insensitive, trimmed)
+	os.Setenv("SANDBOX_MODE", "direct")
+	if cfg = Load(); cfg.SandboxMode != SandboxModeDirect {
+		t.Errorf("expected SandboxMode direct, got %q", cfg.SandboxMode)
+	}
+	os.Setenv("SANDBOX_MODE", " Direct ")
+	if cfg = Load(); cfg.SandboxMode != SandboxModeDirect {
+		t.Errorf("expected normalized SandboxMode direct, got %q", cfg.SandboxMode)
+	}
+
+	// 3. Invalid values fail validation
+	os.Setenv("SANDBOX_MODE", "docker")
+	if cfg = Load(); cfg.Validate() == nil {
+		t.Errorf("expected validation error for SandboxMode %q", "docker")
+	}
+}
+
+func TestValidateSandboxModeRejectsUnknown(t *testing.T) {
+	cfg := &Config{GitHubToken: "t", LLMAPIKey: "k", LLMModel: "m", LLMBaseURL: "u", SandboxMode: "lxc"}
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected validation error for unknown SandboxMode")
+	}
+}
+

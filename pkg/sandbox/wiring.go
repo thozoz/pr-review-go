@@ -39,6 +39,10 @@ func PodmanBackendForConfig(cfg *config.Config) *PodmanBackend {
 	if cfg == nil || !cfg.EnableSandbox {
 		return nil
 	}
+	// Direct mode verifies on the host; no container backend is built.
+	if cfg.SandboxMode == config.SandboxModeDirect {
+		return nil
+	}
 	if cfg.SandboxImage == "" || cfg.SandboxSlotDir == "" {
 		return nil
 	}
@@ -53,6 +57,19 @@ func PodmanBackendForConfig(cfg *config.Config) *PodmanBackend {
 	})
 }
 
+// DirectRunnerForConfig builds the containerless runner for pre-isolated
+// environments. Unlike the Podman path it needs no image, slot, or Linux
+// gate — only an enabled sandbox in direct mode.
+func DirectRunnerForConfig(cfg *config.Config) *DirectRunner {
+	if cfg == nil || !cfg.EnableSandbox {
+		return nil
+	}
+	if cfg.SandboxMode != config.SandboxModeDirect {
+		return nil
+	}
+	return NewDirectRunner(cfg.SandboxTimeoutExecution)
+}
+
 // SlotManagerForConfig returns a Linux slot manager, or nil when isolated
 // execution is unavailable or the manager cannot be constructed.
 func SlotManagerForConfig(cfg *config.Config) SlotManager {
@@ -60,6 +77,10 @@ func SlotManagerForConfig(cfg *config.Config) SlotManager {
 		return nil
 	}
 	if cfg == nil || !cfg.EnableSandbox {
+		return nil
+	}
+	// Direct mode verifies in place; no slot leasing is used.
+	if cfg.SandboxMode == config.SandboxModeDirect {
 		return nil
 	}
 	if cfg.SandboxImage == "" || cfg.SandboxSlotDir == "" {
