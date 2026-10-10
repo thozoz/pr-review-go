@@ -307,12 +307,13 @@ func (m *LinuxSlotManager) AcquireSlot(ctx context.Context, jobID string) (*Slot
 
 	for _, d := range []string{workDir, tmpDir, cacheDir, snapshotDir} {
 		_ = os.RemoveAll(d)
-		if err := os.MkdirAll(d, 0755); err != nil {
+		if err := os.MkdirAll(d, 0777); err != nil {
 			_ = m.QuarantineSlot(slotDir, fmt.Sprintf("failed to initialize directory %q: %v", d, err))
 			_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 			_ = lockFile.Close()
 			return nil, fmt.Errorf("failed to create directory %q: %w", d, err)
 		}
+		_ = os.Chmod(d, 0777)
 	}
 
 	return &SlotLease{

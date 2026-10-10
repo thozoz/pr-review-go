@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -112,10 +113,7 @@ func StartGitGateway(cfg GitGatewayConfig) (*GitGateway, error) {
 		cfg.RequestTimeout = 2 * time.Minute
 	}
 
-	upstreamURL, err := url.Parse(cfg.UpstreamBaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid upstream base URL: %w", err)
-	}
+
 
 	// Remove any existing socket at the path
 	_ = os.Remove(cfg.SocketPath)
@@ -169,20 +167,10 @@ func StartGitGateway(cfg GitGatewayConfig) (*GitGateway, error) {
 				return nil, err
 			}
 
-			// Wrap in TLS if connecting to HTTPS upstream
-			if upstreamURL.Scheme == "https" {
-				tlsConn := tls.Client(conn, &tls.Config{
-					ServerName: host,
-					MinVersion: tls.VersionTLS12,
-				})
-				if err := tlsConn.HandshakeContext(ctx); err != nil {
-					conn.Close()
-					return nil, fmt.Errorf("TLS handshake failed for %s: %w", host, err)
-				}
-				return tlsConn, nil
-			}
-
 			return conn, nil
+		},
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
 		},
 		ResponseHeaderTimeout: 60 * time.Second,
 		IdleConnTimeout:       30 * time.Second,
@@ -321,7 +309,12 @@ func (g *GitGateway) handleRequest(w http.ResponseWriter, r *http.Request) {
 	token := g.retrievalToken
 	g.mu.Unlock()
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		if strings.Contains(req.URL.Host, "github.com") {
+			basic := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+			req.Header.Set("Authorization", "Basic "+basic)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 	}
 
 	// 6. Forward to upstream
