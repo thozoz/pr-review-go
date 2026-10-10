@@ -72,5 +72,8 @@ func SlotManagerForConfig(cfg *config.Config) SlotManager {
 	if err != nil {
 		return nil
 	}
+	if os.Getenv("SANDBOX_SKIP_MOUNT_CHECKS") == "1" || os.Getenv("SANDBOX_SKIP_MOUNT_CHECKS") == "true" {
+		sm.SkipMountChecks = true
+	}
 	return sm
 }
