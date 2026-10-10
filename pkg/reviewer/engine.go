@@ -27,10 +27,11 @@ func NewEngine(cfg *config.Config) *Engine {
 		panic(fmt.Sprintf("invalid config: %v", err))
 	}
 	gh := github.NewClientFromConfig(cfg)
+	engineBackend, engineSlots := sandbox.PlatformComponents(cfg)
 	return &Engine{
 		cfg:     cfg,
 		gh:      gh,
-		sandbox: sandbox.NewPlatformRunner(cfg, gh, nil, nil),
+		sandbox: sandbox.NewPlatformRunner(cfg, gh, engineBackend, engineSlots),
 		llm:     llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel),
 	}
 }

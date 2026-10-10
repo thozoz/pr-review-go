@@ -26,7 +26,8 @@ type Assistant struct {
 
 func NewAssistant(cfg *config.Config) *Assistant {
 	gh := github.NewClientFromConfig(cfg)
-	runner := sandbox.NewPlatformRunner(cfg, gh, nil, nil)
+	asstBackend, asstSlots := sandbox.PlatformComponents(cfg)
+	runner := sandbox.NewPlatformRunner(cfg, gh, asstBackend, asstSlots)
 	return &Assistant{
 		cfg:     cfg,
 		gh:      gh,
