@@ -43,12 +43,13 @@ func PodmanBackendForConfig(cfg *config.Config) *PodmanBackend {
 		return nil
 	}
 	return NewPodmanBackend(PodmanConfig{
-		ImageDigest:  cfg.SandboxImage,
-		CPUs:         cfg.SandboxCPUs,
-		MemoryBytes:  cfg.SandboxMemoryBytes,
-		PidsLimit:    cfg.SandboxPidsLimit,
-		TimeoutStage: cfg.SandboxTimeoutExecution,
-		TimeoutClean: cfg.SandboxTimeoutCleanup,
+		ImageDigest:         cfg.SandboxImage,
+		CPUs:                cfg.SandboxCPUs,
+		MemoryBytes:         cfg.SandboxMemoryBytes,
+		PidsLimit:           cfg.SandboxPidsLimit,
+		TimeoutStage:        cfg.SandboxTimeoutExecution,
+		TimeoutClean:        cfg.SandboxTimeoutCleanup,
+		AllowRootfulSandbox: cfg.AllowRootfulSandbox,
 	})
 }
 

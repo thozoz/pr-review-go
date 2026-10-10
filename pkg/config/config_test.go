@@ -574,3 +574,38 @@ func TestMermaidConfig(t *testing.T) {
 	}
 }
 
+func TestLoadAllowRootfulSandboxEnv(t *testing.T) {
+	os.Setenv("GITHUB_TOKEN", "token")
+	os.Setenv("LLM_API_KEY", "key")
+	os.Setenv("LLM_MODEL", "model")
+	os.Setenv("LLM_BASE_URL", "https://example.com")
+	defer func() {
+		os.Unsetenv("GITHUB_TOKEN")
+		os.Unsetenv("LLM_API_KEY")
+		os.Unsetenv("LLM_MODEL")
+		os.Unsetenv("LLM_BASE_URL")
+		os.Unsetenv("ALLOW_ROOTFUL_SANDBOX")
+	}()
+
+	// 1. Default is opt-in off
+	cfg := Load()
+	if cfg.AllowRootfulSandbox {
+		t.Errorf("expected AllowRootfulSandbox default false")
+	}
+
+	// 2. "1" and "true" enable it
+	for _, raw := range []string{"1", "true", "TRUE"} {
+		os.Setenv("ALLOW_ROOTFUL_SANDBOX", raw)
+		cfg = Load()
+		if !cfg.AllowRootfulSandbox {
+			t.Errorf("expected AllowRootfulSandbox true for %q", raw)
+		}
+	}
+
+	// 3. Other values stay off
+	os.Setenv("ALLOW_ROOTFUL_SANDBOX", "0")
+	if cfg = Load(); cfg.AllowRootfulSandbox {
+		t.Errorf("expected AllowRootfulSandbox false for %q", "0")
+	}
+}
+

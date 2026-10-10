@@ -21,6 +21,9 @@ type Config struct {
 	LLMAPIKey     string
 	LLMModel      string
 	EnableSandbox bool
+	// AllowRootfulSandbox permits rootful Podman in pre-isolated
+	// environments (unprivileged LXC, CI runners). Env ALLOW_ROOTFUL_SANDBOX.
+	AllowRootfulSandbox bool
 	// AutoActions run when a PR opens. Nil uses the backward-compatible default:
 	// review,labels. An empty slice disables all automatic actions.
 	AutoActions             []string
@@ -666,6 +669,10 @@ func Load() *Config {
 	if effort == "lite" {
 		enableSandbox = false
 	}
+	allowRootfulSandbox := false
+	if raw := os.Getenv("ALLOW_ROOTFUL_SANDBOX"); raw != "" {
+		allowRootfulSandbox = strings.EqualFold(raw, "true") || raw == "1"
+	}
 
 	var autoActions []string
 	if raw, set := os.LookupEnv("AUTO_ACTIONS"); set {
@@ -1049,6 +1056,7 @@ func Load() *Config {
 		LLMModel:                llmModel,
 		EffortLevel:             effort,
 		EnableSandbox:           enableSandbox,
+		AllowRootfulSandbox:     allowRootfulSandbox,
 		AutoActions:             autoActions,
 		GitHubAppSetupToken:     setupToken,
 		PublicURL:               publicURL,
