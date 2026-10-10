@@ -149,6 +149,8 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@thozoz'
       - name: Verify OIDC-capable npm
         run: |
           node -e 'const [a,b,c]=require("child_process").execFileSync("npm",["--version"],{encoding:"utf8"}).trim().split(".").map(Number); if(a<11 || (a===11 && (b<5 || (b===5 && c<1)))) process.exit(1)'
