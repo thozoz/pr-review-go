@@ -39,37 +39,96 @@ func NewDirectRunner(timeout time.Duration) *DirectRunner {
 
 // directProject describes the verified commands for one project type.
 type directProject struct {
-	lang      string
-	tool      string
-	buildArgs []string // nil when the type has no separate build step
-	testArgs  []string
-	offline   []string // extra hermetic env overrides
+	lang string
+	// installArgs warms the dependency cache before build/test.
+	// Install failure yields StatusIncomplete (could not prepare).
+	installArgs []string
+	buildArgs   []string // nil when the type has no separate build step
+	// testOptions lists candidate test commands; the first whose binary
+	// exists on PATH wins.
+	testOptions [][]string
+	offline     []string // extra hermetic env overrides
 }
 
 // directProjectTable maps marker files to their verification commands.
+// Lockfiles take precedence over manifests so the project's own package
+// manager (poetry, pnpm, yarn) is used when pinned.
 func detectDirectProject(dir string) *directProject {
 	if fileExists(filepath.Join(dir, "go.mod")) {
+		proj := &directProject{
+			lang:        "go",
+			buildArgs:   []string{"go", "build", "./..."},
+			testOptions: [][]string{{"go", "test", "-race", "./..."}},
+			offline:     []string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off"},
+		}
+		if hasUnvendoredDependencies(dir) {
+			proj.installArgs = []string{"go", "mod", "download"}
+		}
+		return proj
+	}
+	if fileExists(filepath.Join(dir, "poetry.lock")) {
 		return &directProject{
-			lang:      "go",
-			tool:      "go",
-			buildArgs: []string{"go", "build", "./..."},
-			testArgs:  []string{"go", "test", "-race", "./..."},
-			offline:   []string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off"},
+			lang:        "python",
+			installArgs: []string{"poetry", "install"},
+			testOptions: [][]string{{"poetry", "run", "pytest"}, {"pytest"}, {"python3", "-m", "pytest"}, {"python", "-m", "pytest"}, {"python3", "-m", "unittest"}, {"python", "-m", "unittest"}},
+		}
+	}
+	if fileExists(filepath.Join(dir, "requirements.txt")) {
+		return &directProject{
+			lang:        "python",
+			installArgs: []string{"pip", "install", "-r", "requirements.txt"},
+			testOptions: [][]string{{"pytest"}, {"python3", "-m", "pytest"}, {"python", "-m", "pytest"}, {"python3", "-m", "unittest"}, {"python", "-m", "unittest"}},
+		}
+	}
+	if fileExists(filepath.Join(dir, "pyproject.toml")) {
+		return &directProject{
+			lang:        "python",
+			installArgs: []string{"pip", "install", "-e", "."},
+			testOptions: [][]string{{"pytest"}, {"python3", "-m", "pytest"}, {"python", "-m", "pytest"}, {"python3", "-m", "unittest"}, {"python", "-m", "unittest"}},
+		}
+	}
+	if fileExists(filepath.Join(dir, "pnpm-lock.yaml")) {
+		return &directProject{
+			lang:        "node",
+			installArgs: []string{"pnpm", "install"},
+			testOptions: [][]string{{"pnpm", "test"}},
+		}
+	}
+	if fileExists(filepath.Join(dir, "yarn.lock")) {
+		return &directProject{
+			lang:        "node",
+			installArgs: []string{"yarn", "install", "--frozen-lockfile"},
+			testOptions: [][]string{{"yarn", "test"}},
 		}
 	}
 	if fileExists(filepath.Join(dir, "package.json")) {
-		return &directProject{lang: "node", tool: "npm", testArgs: []string{"npm", "test"}}
+		proj := &directProject{
+			lang:        "node",
+			installArgs: []string{"npm", "install"},
+			testOptions: [][]string{{"npm", "test"}},
+		}
+		if fileExists(filepath.Join(dir, "package-lock.json")) {
+			proj.installArgs = []string{"npm", "ci"}
+		}
+		return proj
 	}
 	if fileExists(filepath.Join(dir, "Cargo.toml")) {
 		return &directProject{
-			lang:     "rust",
-			tool:     "cargo",
-			testArgs: []string{"cargo", "test"},
-			offline:  []string{"CARGO_NET_OFFLINE=true"},
+			lang:        "rust",
+			installArgs: []string{"cargo", "fetch"},
+			testOptions: [][]string{{"cargo", "test"}},
+			offline:     []string{"CARGO_NET_OFFLINE=true"},
 		}
 	}
-	if fileExists(filepath.Join(dir, "pyproject.toml")) || fileExists(filepath.Join(dir, "requirements.txt")) {
-		return &directProject{lang: "python", tool: "pytest", testArgs: []string{"pytest"}}
+	if fileExists(filepath.Join(dir, "pom.xml")) {
+		return &directProject{lang: "java", testOptions: [][]string{{"mvn", "-q", "test"}}}
+	}
+	if fileExists(filepath.Join(dir, "build.gradle")) || fileExists(filepath.Join(dir, "build.gradle.kts")) {
+		return &directProject{lang: "java", testOptions: [][]string{{"gradle", "test"}}}
+	}
+	if fileExists(filepath.Join(dir, "Makefile")) || fileExists(filepath.Join(dir, "GNUmakefile")) ||
+		fileExists(filepath.Join(dir, "makefile")) {
+		return &directProject{lang: "make", testOptions: [][]string{{"make", "test"}}}
 	}
 	return nil
 }
@@ -112,9 +171,24 @@ func (d *DirectRunner) VerifyDir(ctx context.Context, dir, commitSHA string) (*V
 	}
 	report.DetectedType = proj.lang
 
-	if _, err := exec.LookPath(proj.tool); err != nil {
+	// Resolve the test command: first candidate whose binary exists.
+	var testArgs []string
+	for _, candidate := range proj.testOptions {
+		if len(candidate) == 0 {
+			continue
+		}
+		if _, err := exec.LookPath(candidate[0]); err == nil {
+			testArgs = candidate
+			break
+		}
+	}
+	if len(testArgs) == 0 {
+		want := ""
+		if len(proj.testOptions) > 0 && len(proj.testOptions[0]) > 0 {
+			want = proj.testOptions[0][0]
+		}
 		report.Status = StatusUnavailable
-		report.Reason = fmt.Sprintf("%s toolchain not installed on host (direct mode requires it)", proj.tool)
+		report.Reason = fmt.Sprintf("%s toolchain not installed on host (direct mode requires it)", want)
 		report.Summary = fmt.Sprintf("UNAVAILABLE: %s", report.Reason)
 		return report, nil
 	}
@@ -148,6 +222,30 @@ func (d *DirectRunner) VerifyDir(ctx context.Context, dir, commitSHA string) (*V
 
 	env := append(os.Environ(), proj.offline...)
 
+	// Stage 0: Dependency installation (warms the cache the hermetic
+	// build/test stages rely on). Failure is Incomplete, not a code verdict.
+	if len(proj.installArgs) > 0 {
+		if _, err := exec.LookPath(proj.installArgs[0]); err != nil {
+			report.Status = StatusIncomplete
+			report.Reason = fmt.Sprintf("package manager %q not installed on host", proj.installArgs[0])
+			report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
+			return report, nil
+		}
+		installRes := runDirectStage(ctx, d.stageTimeout(), workDir, "install", proj.installArgs, env)
+		report.Results = append(report.Results, directExecutionResult(installRes))
+		if installRes.Truncated {
+			report.Truncated = true
+			report.DroppedBytes += installRes.DroppedBytes
+		}
+		if !installRes.Passed {
+			report.FailedStage = "install"
+			report.Status = StatusIncomplete
+			report.Reason = fmt.Sprintf("dependency installation failed: %s", strings.Join(proj.installArgs, " "))
+			report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
+			return report, nil
+		}
+	}
+
 	if len(proj.buildArgs) > 0 {
 		buildRes := runDirectStage(ctx, d.stageTimeout(), workDir, "build", proj.buildArgs, env)
 		report.Results = append(report.Results, directExecutionResult(buildRes))
@@ -170,7 +268,7 @@ func (d *DirectRunner) VerifyDir(ctx context.Context, dir, commitSHA string) (*V
 		}
 	}
 
-	testRes := runDirectStage(ctx, d.stageTimeout(), workDir, "test", proj.testArgs, env)
+	testRes := runDirectStage(ctx, d.stageTimeout(), workDir, "test", testArgs, env)
 	report.Results = append(report.Results, directExecutionResult(testRes))
 	if testRes.Truncated {
 		report.Truncated = true
@@ -185,8 +283,8 @@ func (d *DirectRunner) VerifyDir(ctx context.Context, dir, commitSHA string) (*V
 			"DISK_EXHAUSTED: test failed with ENOSPC.",
 			"memory limit exceeded during test",
 			"RESOURCE_EXHAUSTED: test exceeded memory limits.",
-			fmt.Sprintf("%s reported failures", strings.Join(proj.testArgs, " ")),
-			fmt.Sprintf("FAILED: %s reported failures.", strings.Join(proj.testArgs, " ")))
+			fmt.Sprintf("%s reported failures", strings.Join(testArgs, " ")),
+			fmt.Sprintf("FAILED: %s reported failures.", strings.Join(testArgs, " ")))
 		return report, nil
 	}
 
