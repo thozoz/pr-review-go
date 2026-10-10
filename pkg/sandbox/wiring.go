@@ -21,7 +21,12 @@ import (
 // the sandbox fields of cfg; NewPodmanBackend applies its own safe defaults
 // for non-positive values.
 func PlatformComponents(cfg *config.Config) (*PodmanBackend, SlotManager) {
-	return PodmanBackendForConfig(cfg), SlotManagerForConfig(cfg)
+	backend := PodmanBackendForConfig(cfg)
+	sm := SlotManagerForConfig(cfg)
+	if backend == nil || sm == nil {
+		return nil, nil
+	}
+	return backend, sm
 }
 
 // PodmanBackendForConfig returns a configured backend, or nil when isolated
@@ -56,7 +61,7 @@ func SlotManagerForConfig(cfg *config.Config) SlotManager {
 	if cfg == nil || !cfg.EnableSandbox {
 		return nil
 	}
-	if cfg.SandboxSlotDir == "" {
+	if cfg.SandboxImage == "" || cfg.SandboxSlotDir == "" {
 		return nil
 	}
 	controlDir := cfg.SandboxControlDir
