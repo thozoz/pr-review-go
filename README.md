@@ -1,18 +1,19 @@
 # pr-review-go
 
-AI PR Reviewer and read-only Interactive Assistant written in Go. Project build/test verification runs inside rootless Podman containers on Linux with dedicated 3 GiB storage slots and cgroups v2 boundaries; on non-Linux platforms (macOS/Windows) or unprovisioned systems, verification is safely reported as unavailable. Assistant mutations and one-click code suggestions remain permanently disabled.
+Multi-language AI PR Reviewer and Autonomous Assistant written in Go. Designed to inspect, test, and edit pull requests across any programming language (Go, Python, Node.js/TypeScript, Rust, Java/Maven/Gradle, Make, and more). Supports direct execution (`SANDBOX_MODE=direct`) for pre-isolated environments (Proxmox LXC, Docker, Kubernetes, CI runners) as well as rootless Podman container isolation on Linux.
 
 Inspired by GitHub Copilot's agentic architecture and PR-Agent:
-1. **Isolated Verification & Truthful Results**: On Linux with operator-configured Podman, PR builds and tests execute inside disposable rootless containers (`network=none`, 2 GiB RAM, 3 GiB fixed ext4 slot leases). On macOS, Windows, or systems without operator sandboxing, verification truthfully reports `unavailable` with 0 commands executed on the host.
-2. **Review Discussion & Thread Awareness**: Gathers existing PR comments and inline review discussions. Tracks whether previous review feedback was addressed in new commits and prevents repeating resolved debates.
-3. **Discussion Summarizer (`/summarize`)**: Instantly compiles all PR comments, debates, and reviewer feedback into an executive summary table (zero sandbox overhead).
-4. **Read-only PR Assistant (`@bot` / `/ask`)**: Allows repository writers to ask about PR files, using `read_file` and `list_files` within an `os.OpenRoot` confined snapshot. File writes, command execution, and pushes are permanently disabled.
-5. **SHA-256 Yorum Deduplication (`pkg/dedup`)**: Prevents duplicate spam findings across multiple `/review` runs on the same PR using deterministic SHA-256 fingerprinting.
-6. **Documentation Report (`/add_docs`, `pkg/docgen`)**: Scans PR code for undocumented functions/types and reports missing comments without modifying files.
-7. **Effort Levels (`lite` vs `balanced`)**: Choose between fast diff-only inspection (`-effort lite`) and workspace-assisted review (`-effort balanced`).
-8. **Auto-Labeler (`/labels`)**: Context-aware categorization using PR title, description, and diff.
-9. **Atomic Changelog Updates (`/update-changelog`)**: Compares immutable commit SHAs and commits via GitHub GraphQL CAS (`createCommitOnBranch` with `expectedHeadOid`). Aborts cleanly if branch moves.
-10. **Daemonless & Lightweight**: Consumes only ~10-15 MB RAM as a daemon.
+1. **Multi-Language Verification**: Detects project ecosystem (`go.mod`, `package.json`, `pyproject.toml`/`requirements.txt`, `Cargo.toml`, `pom.xml`, `build.gradle`, `Makefile`) and runs appropriate build and test verification suites.
+2. **Flexible Sandbox Modes**: Choose between disposable rootless Podman container isolation (`SANDBOX_MODE=podman`) or containerless direct execution (`SANDBOX_MODE=direct`) in pre-isolated environments like Proxmox LXC.
+3. **Review Discussion & Thread Awareness**: Gathers existing PR comments and inline review discussions. Tracks whether previous review feedback was addressed in new commits and prevents repeating resolved debates.
+4. **Discussion Summarizer (`/summarize`)**: Instantly compiles all PR comments, debates, and reviewer feedback into an executive summary table (zero sandbox overhead).
+5. **Interactive PR Assistant & Gated Editing**: Responds to questions about PR code and securely applies requested modifications with automated verification before non-force commits.
+6. **SHA-256 Yorum Deduplication (`pkg/dedup`)**: Prevents duplicate spam findings across multiple `/review` runs on the same PR using deterministic SHA-256 fingerprinting.
+7. **Documentation Report (`/add_docs`, `pkg/docgen`)**: Scans PR code for undocumented functions/types and reports missing comments without modifying files.
+8. **Effort Levels (`lite` vs `balanced`)**: Choose between fast diff-only inspection (`-effort lite`) and workspace-assisted review (`-effort balanced`).
+9. **Auto-Labeler (`/labels`)**: Context-aware categorization using PR title, description, and diff.
+10. **Atomic Changelog Updates (`/update-changelog`)**: Compares immutable commit SHAs and commits via GitHub GraphQL CAS (`createCommitOnBranch` with `expectedHeadOid`). Aborts cleanly if branch moves.
+11. **Daemonless & Lightweight**: Consumes only ~10-15 MB RAM as a daemon.
 
 ## Architecture
 
