@@ -835,7 +835,49 @@ const (
 	editPriorDiffMaxBytes = 60000
 	// editPriorDiffTruncatedMarker marks a capped prior diff.
 	editPriorDiffTruncatedMarker = "\n...[truncated: prior diff exceeds 60000 bytes]..."
+	// editVerifyMaxAttempts bounds the ReAct verify-failure retry loop
+	// (initial attempt plus self-corrections).
+	editVerifyMaxAttempts = 3
+	// editVerifyFeedbackMaxBytes caps failure output fed back to the model.
+	editVerifyFeedbackMaxBytes = 6000
 )
+
+// isRetryableVerifyStatus reports whether a failed verification is worth a
+// model self-correction attempt: actionable build/test/timeout output.
+// Unavailable, unsupported, and incomplete outcomes never improve on retry.
+func isRetryableVerifyStatus(status sandbox.VerificationStatus) bool {
+	switch status {
+	case sandbox.StatusBuildFailed, sandbox.StatusTestFailed, sandbox.StatusTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// editVerifyFeedback renders the failing verification as capped model input:
+// status, reason, and the stderr of each failed stage.
+func editVerifyFeedback(report *sandbox.VerificationReport) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "verification status: %s\nreason: %s", report.Status, report.Reason)
+	for _, res := range report.Results {
+		if res.Passed {
+			continue
+		}
+		stderr := res.Stderr
+		if len(stderr) > editVerifyFeedbackMaxBytes {
+			stderr = stderr[:editVerifyFeedbackMaxBytes] + "\n...[truncated: failure output exceeds 6000 bytes]..."
+		}
+		fmt.Fprintf(&sb, "\n\nfailed stage %q (exit %d):\n%s", res.Command, res.ExitCode, stderr)
+		if sb.Len() > editVerifyFeedbackMaxBytes*2 {
+			break
+		}
+	}
+	out := sb.String()
+	if len(out) > editVerifyFeedbackMaxBytes*2 {
+		out = out[:editVerifyFeedbackMaxBytes*2] + "\n...[truncated]"
+	}
+	return out
+}
 
 // editGitHub is the narrow GitHub surface the edit executor needs. The live
 // adapter routes the single push through a single-use scoped client; tests
@@ -1146,32 +1188,54 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 	}
 	stickyContext := buildEditStickyContext(history, priorDiff)
 
-	editResult, lerr := loop(ctx, snap.SourceDir, job.Payload, stickyContext)
-	if lerr != nil {
-		log.Printf("[jobs] Edit loop failed for %s: %v", job.ID, lerr)
-		say(fmt.Sprintf("❌ Düzenleme uygulanamadı — push yapılmadı.\n\nThe isolated edit could not be applied; nothing was pushed: %v", lerr))
-		return e.failEditJob(ctx, job, lerr.Error())
-	}
+	// 5-6) ReAct loop: edit, verify, and on actionable verification failure
+	// feed the capped failure output back into the next edit attempt.
+	// Bounded to editVerifyMaxAttempts total attempts; only build, test, and
+	// timeout failures are retried. The same gate holds: nothing is pushed
+	// unless a verification reports StatusPassed.
+	var editResult assistant.EditResult
+	var report *sandbox.VerificationReport
+	attemptFeedback := ""
+	attempts := 0
+	for {
+		attempts++
+		sticky := stickyContext
+		if attemptFeedback != "" {
+			sticky += "\n\nPrevious verification FAILED — fix these errors and nothing else:\n" + attemptFeedback
+		}
+		var lerr error
+		editResult, lerr = loop(ctx, snap.SourceDir, job.Payload, sticky)
+		if lerr != nil {
+			log.Printf("[jobs] Edit loop failed for %s: %v", job.ID, lerr)
+			say(fmt.Sprintf("❌ Düzenleme uygulanamadı — push yapılmadı.\n\nThe isolated edit could not be applied; nothing was pushed: %v", lerr))
+			return e.failEditJob(ctx, job, lerr.Error())
+		}
 
-	// 6) Verify the edited tree; only a green tree may proceed to push (D-28).
-	// There is no push-directly-for-CI escape: any non-passed status stops here.
-	say("🔄 Doğrulama çalışıyor... / Verifying...")
-	report, verr := verify(ctx, snap)
-	if verr != nil {
-		log.Printf("[jobs] Edit verification error for %s: %v", job.ID, verr)
-		say(fmt.Sprintf("❌ Doğrulama çalıştırılamadı — push yapılmadı.\n\nVerification could not run; nothing was pushed: %v", verr))
-		return e.failEditJob(ctx, job, verr.Error())
-	}
-	if report == nil {
-		return e.failEditJob(ctx, job, "verification returned no report")
-	}
-	if report.Status == sandbox.StatusUnavailable {
-		say("🚧 İzole doğrulama şu anda kullanılamıyor — hiçbir değişiklik push edilmedi, daha sonra tekrar deneyin.\n\nIsolated verification is currently unavailable; nothing was pushed. Please retry later.")
-		return e.completeEditJob(ctx, job)
-	}
-	if report.Status != sandbox.StatusPassed {
-		say(fmt.Sprintf("❌ Doğrulama geçilemedi (%s) — push yapılmadı.\n\nVerification did not pass (%s); nothing was pushed.", report.Status, report.Status))
-		return e.failEditJob(ctx, job, fmt.Sprintf("verification status %s: %s", report.Status, report.Reason))
+		say("🔄 Doğrulama çalışıyor... / Verifying...")
+		var verr error
+		report, verr = verify(ctx, snap)
+		if verr != nil {
+			log.Printf("[jobs] Edit verification error for %s: %v", job.ID, verr)
+			say(fmt.Sprintf("❌ Doğrulama çalıştırılamadı — push yapılmadı.\n\nVerification could not run; nothing was pushed: %v", verr))
+			return e.failEditJob(ctx, job, verr.Error())
+		}
+		if report == nil {
+			return e.failEditJob(ctx, job, "verification returned no report")
+		}
+		if report.Status == sandbox.StatusUnavailable {
+			say("🚧 İzole doğrulama şu anda kullanılamıyor — hiçbir değişiklik push edilmedi, daha sonra tekrar deneyin.\n\nIsolated verification is currently unavailable; nothing was pushed. Please retry later.")
+			return e.completeEditJob(ctx, job)
+		}
+		if report.Status == sandbox.StatusPassed {
+			break
+		}
+		if !isRetryableVerifyStatus(report.Status) || attempts >= editVerifyMaxAttempts {
+			say(fmt.Sprintf("❌ Doğrulama geçilemedi (%s) — push yapılmadı.\n\nVerification did not pass (%s); nothing was pushed.", report.Status, report.Status))
+			return e.failEditJob(ctx, job, fmt.Sprintf("verification status %s: %s", report.Status, report.Reason))
+		}
+		attemptFeedback = editVerifyFeedback(report)
+		log.Printf("[jobs] Verification failed for %s (%s); retrying edit %d/%d", job.ID, report.Status, attempts+1, editVerifyMaxAttempts)
+		say(fmt.Sprintf("🔁 Doğrulama geçilemedi (%s) — hata çıktısı modele geri verildi, düzeltiliyor (deneme %d/%d)...\n\nVerification failed (%s); feeding output back for a fix (attempt %d/%d)...", report.Status, attempts+1, editVerifyMaxAttempts, report.Status, attempts+1, editVerifyMaxAttempts))
 	}
 	// Green-time byte snapshot: read each changed file exactly once into
 	// memory; the work copy is never re-walked after this point (T-05-03).

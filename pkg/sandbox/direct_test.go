@@ -107,6 +107,27 @@ func TestDirectRunner_TestFailure(t *testing.T) {
 	}
 }
 
+func TestDirectRunner_NodePass(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("npm not installed")
+	}
+	dir := writeDirectModule(t, map[string]string{
+		"package.json": `{"name":"directnodepass","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\""}}`,
+	})
+
+	d := NewDirectRunner(2 * time.Minute)
+	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
+	if err != nil {
+		t.Fatalf("VerifyDir error: %v", err)
+	}
+	if report.Status != StatusPassed {
+		t.Fatalf("expected StatusPassed, got %q (%s)", report.Status, report.Reason)
+	}
+	if report.DetectedType != "node" {
+		t.Errorf("expected DetectedType node, got %q", report.DetectedType)
+	}
+}
+
 func TestDirectRunner_UnknownDirPassesWithNotice(t *testing.T) {
 	d := NewDirectRunner(time.Minute)
 	report, err := d.VerifyDir(context.Background(), t.TempDir(), directTestSHA)
@@ -126,7 +147,7 @@ func TestDetectDirectProject(t *testing.T) {
 		name     string
 		marker   string
 		lang     string
-		tool     string
+		wantTest string
 		hasBuild bool
 	}{
 		{"go", "go.mod", "go", "go", true},
@@ -134,6 +155,10 @@ func TestDetectDirectProject(t *testing.T) {
 		{"rust", "Cargo.toml", "rust", "cargo", false},
 		{"python-pyproject", "pyproject.toml", "python", "pytest", false},
 		{"python-requirements", "requirements.txt", "python", "pytest", false},
+		{"python-poetry", "poetry.lock", "python", "poetry", false},
+		{"java-maven", "pom.xml", "java", "mvn", false},
+		{"java-gradle", "build.gradle", "java", "gradle", false},
+		{"make", "Makefile", "make", "make", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -142,14 +167,14 @@ func TestDetectDirectProject(t *testing.T) {
 			if proj == nil {
 				t.Fatalf("expected project detected for %s", tc.marker)
 			}
-			if proj.lang != tc.lang || proj.tool != tc.tool {
-				t.Errorf("got lang=%q tool=%q, want %q %q", proj.lang, proj.tool, tc.lang, tc.tool)
+			if proj.lang != tc.lang {
+				t.Errorf("got lang=%q, want %q", proj.lang, tc.lang)
+			}
+			if len(proj.testOptions) == 0 || proj.testOptions[0][0] != tc.wantTest {
+				t.Errorf("got first test tool=%v, want %q", proj.testOptions, tc.wantTest)
 			}
 			if (len(proj.buildArgs) > 0) != tc.hasBuild {
 				t.Errorf("build step presence mismatch for %s", tc.lang)
-			}
-			if len(proj.testArgs) == 0 {
-				t.Errorf("expected test args for %s", tc.lang)
 			}
 		})
 	}

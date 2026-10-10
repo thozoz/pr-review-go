@@ -172,6 +172,7 @@ type editHarness struct {
 	editResult  assistant.EditResult
 	editErr     error
 	reportState sandbox.VerificationStatus
+	reportStates []sandbox.VerificationStatus
 	reportErr   error
 	reportNote  string
 
@@ -246,7 +247,15 @@ func newEditHarness(t *testing.T) *editHarness {
 		if h.reportErr != nil {
 			return nil, h.reportErr
 		}
-		rep := &sandbox.VerificationReport{Status: h.reportState}
+		state := h.reportState
+		if len(h.reportStates) > 0 {
+			i := h.verifyCalls - 1
+			if i >= len(h.reportStates) {
+				i = len(h.reportStates) - 1
+			}
+			state = h.reportStates[i]
+		}
+		rep := &sandbox.VerificationReport{Status: state}
 		if snap != nil {
 			rep.WorkspaceDir = snap.SourceDir
 		}
@@ -475,6 +484,48 @@ func TestEditJobNonGreenVerification(t *testing.T) {
 				t.Fatalf("commits=%d minted=%d, want 0/0", h.gh.commitCalls, h.gh.minted)
 			}
 		})
+	}
+}
+
+func TestEditJobVerifyRetryThenGreen(t *testing.T) {
+	h := newEditHarness(t)
+	h.reportStates = []sandbox.VerificationStatus{sandbox.StatusTestFailed, sandbox.StatusPassed}
+	h.reportNote = "assertion failed: want 99"
+	job := h.admitEdit(t, 7, editTestHead, editTestBase, "alice", "fix it", 701)
+	after, _ := h.run(t, job)
+	if after.Status != "completed" {
+		t.Fatalf("status = %q, want completed", after.Status)
+	}
+	if h.verifyCalls != 2 {
+		t.Fatalf("verifyCalls = %d, want 2", h.verifyCalls)
+	}
+	if len(h.stickySeen) != 2 {
+		t.Fatalf("edit loop calls = %d, want 2", len(h.stickySeen))
+	}
+	if !strings.Contains(h.stickySeen[1], "FAILED") || !strings.Contains(h.stickySeen[1], "assertion failed") {
+		t.Fatalf("retry sticky missing failure feedback, got: %q", h.stickySeen[1])
+	}
+	if h.gh.commitCalls != 1 {
+		t.Fatalf("commits=%d, want 1", h.gh.commitCalls)
+	}
+}
+
+func TestEditJobVerifyRetryExhausted(t *testing.T) {
+	h := newEditHarness(t)
+	h.reportStates = []sandbox.VerificationStatus{
+		sandbox.StatusTestFailed, sandbox.StatusTestFailed,
+		sandbox.StatusTestFailed, sandbox.StatusTestFailed,
+	}
+	job := h.admitEdit(t, 7, editTestHead, editTestBase, "alice", "fix it", 702)
+	after, _ := h.run(t, job)
+	if after.Status != "failed" {
+		t.Fatalf("status = %q, want failed", after.Status)
+	}
+	if h.verifyCalls != editVerifyMaxAttempts {
+		t.Fatalf("verifyCalls = %d, want %d", h.verifyCalls, editVerifyMaxAttempts)
+	}
+	if h.gh.commitCalls != 0 || h.gh.minted != 0 {
+		t.Fatalf("commits=%d minted=%d, want 0/0", h.gh.commitCalls, h.gh.minted)
 	}
 }
 
