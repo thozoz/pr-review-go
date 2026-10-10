@@ -71,7 +71,7 @@ AVAILABLE ACTIONS:
 
 GENERAL AGENT RULES:
 - Inspect relevant files to answer questions, diagnose issues, or suggest fixes.
-- Direct command execution, file modifications, and automated git push are disabled because the assistant is strictly read-only in Phase 1.
+- Direct command execution, file modifications, and automated git push are disabled because the interactive assistant is strictly read-only.
 - You can make up to 6 iterative tool steps before providing your final answer.
 - Output MUST be a single strict JSON object matching: {"action": "...", ...}
 - Never include markdown codeblocks surrounding your JSON tool calls.`
