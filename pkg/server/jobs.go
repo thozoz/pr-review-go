@@ -1045,7 +1045,8 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 	prepare := e.editPrepare
 	verify := e.editVerify
 	if prepare == nil || verify == nil {
-		platformRunner := sandbox.NewPlatformRunner(e.server.cfg, live, nil, nil)
+		editBackend, editSlots := sandbox.PlatformComponents(e.server.cfg)
+		platformRunner := sandbox.NewPlatformRunner(e.server.cfg, live, editBackend, editSlots)
 		if prepare == nil {
 			prepare = platformRunner.PrepareSnapshot
 		}

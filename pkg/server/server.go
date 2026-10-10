@@ -76,9 +76,10 @@ func NewServerWithClients(cfg *config.Config, gh *ghclient.Client, llmClient *ll
 			gh:  gh,
 		}
 	}
+	sandboxBackend, sandboxSlots := sandbox.PlatformComponents(cfg)
 	return &Server{
 		cfg:        cfg,
-		engine:     reviewer.NewEngineWithClients(cfg, gh, llmClient, nil),
+		engine:     reviewer.NewEngineWithClients(cfg, gh, llmClient, sandbox.NewPlatformRunner(cfg, gh, sandboxBackend, sandboxSlots)),
 		labeler:    labeler.NewLabeler(cfg),
 		summarizer: summarizer.NewSummarizerWithClients(cfg, gh, llmClient),
 		assistant:  assistant.NewAssistant(cfg),
@@ -808,7 +809,8 @@ func (s *Server) dispatchAddDocs(ctx context.Context, owner, repo string, prNum 
 		return
 	}
 
-	runner := sandbox.NewPlatformRunner(s.cfg, s.gh, nil, nil)
+	docBackend, docSlots := sandbox.PlatformComponents(s.cfg)
+	runner := sandbox.NewPlatformRunner(s.cfg, s.gh, docBackend, docSlots)
 	snap, cleanup, err := runner.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 	if err != nil {
 		log.Printf("[docgen] Failed to prepare snapshot for %s/%s #%d: %v", owner, repo, prNum, err)

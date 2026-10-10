@@ -25,6 +25,11 @@ func main() {
 	queueResolve := flag.String("queue-resolve", "", "Job ID to resolve")
 	queueResolution := flag.String("queue-resolution", "", "Resolution disposition: confirmed, rerun, or cancel")
 	ackDuplicateRisk := flag.Bool("acknowledge-duplicate-risk", false, "Acknowledge duplicate execution risk when rerunning a job")
+	setupSandbox := flag.Bool("setup-sandbox", false, "Provision sandbox prerequisites (podman, 3 GiB slot, image) and exit")
+	setupImage := flag.String("sandbox-image", "", "Sandbox image to pull/build (default SANDBOX_IMAGE or GHCR latest)")
+	setupSlotDir := flag.String("sandbox-slot-dir", "", "Slot mount directory (default SANDBOX_SLOT_DIR or /var/lib/pr-review/slots/slot-01)")
+	setupSlotSize := flag.String("sandbox-slot-size", "3G", "Backing file size for a new slot (e.g. 3G)")
+	setupBuild := flag.Bool("build-from-source", false, "Build the image locally with --network=host instead of pulling")
 	flag.Parse()
 
 	if *showVersion {
@@ -33,6 +38,12 @@ func main() {
 	}
 
 	cfg := config.Load()
+
+	// Sandbox provisioning helper: checks podman, prepares the 3 GiB loop
+	// ext4 slot, and pulls (or locally builds) the trusted image, then exits.
+	if *setupSandbox {
+		os.Exit(runSetupSandbox(cfg, *setupImage, *setupSlotDir, *setupSlotSize, *setupBuild))
+	}
 
 	// Offline queue inspection and resolution tools require stopping the service
 	// because bbolt holds an exclusive file lock.

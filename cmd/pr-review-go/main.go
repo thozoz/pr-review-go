@@ -189,7 +189,8 @@ func main() {
 			os.Exit(1)
 		}
 
-		runner := sandbox.NewPlatformRunner(cfg, ghClient, nil, nil)
+		docBackend, docSlots := sandbox.PlatformComponents(cfg)
+		runner := sandbox.NewPlatformRunner(cfg, ghClient, docBackend, docSlots)
 		snap, cleanup, err := runner.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ Failed to prepare snapshot: %v\n", err)
