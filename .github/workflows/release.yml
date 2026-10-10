@@ -155,4 +155,6 @@ jobs:
         run: |
           node -e 'const [a,b,c]=require("child_process").execFileSync("npm",["--version"],{encoding:"utf8"}).trim().split(".").map(Number); if(a<11 || (a===11 && (b<5 || (b===5 && c<1)))) process.exit(1)'
       - name: Publish platform packages, then CLI
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: node npm/scripts/publish.js
