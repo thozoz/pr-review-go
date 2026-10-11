@@ -323,7 +323,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	}
 
 	// 3. Head-bound review execution
-	report, err := engine.ReviewPRAtHead(ctx, job.Owner, job.Repo, job.PRNumber, job.HeadSHA)
+	report, err := engine.ReviewPRAtHeadWithNetwork(ctx, job.Owner, job.Repo, job.PRNumber, job.HeadSHA, job.NetworkFetch, true)
 	if err != nil {
 		log.Printf("[jobs] Review failed for %s: %v", job.ID, err)
 		if wait, ok := budgetWait(err); ok {
@@ -748,7 +748,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 	var report *reviewer.ReviewReport
 	if e.server != nil && e.server.engine != nil {
 		var rerr error
-		report, rerr = e.server.engine.ReviewPRAtHead(ctx, job.Owner, job.Repo, job.PRNumber, job.HeadSHA)
+		report, rerr = e.server.engine.ReviewPRAtHeadWithNetwork(ctx, job.Owner, job.Repo, job.PRNumber, job.HeadSHA, job.NetworkFetch, true)
 		if rerr != nil {
 			log.Printf("[jobs] Decision review generation failed for %s: %v", job.ID, rerr)
 			if wait, ok := budgetWait(rerr); ok {
@@ -1152,7 +1152,9 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 			prepare = platformRunner.PrepareSnapshot
 		}
 		if verify == nil {
-			verify = platformRunner.RunSnapshot
+			verify = func(vctx context.Context, vsnap *sandbox.Snapshot) (*sandbox.VerificationReport, error) {
+				return platformRunner.RunSnapshotWithNetwork(vctx, vsnap, job.NetworkFetch, true)
+			}
 		}
 	}
 	loop := e.editLoop

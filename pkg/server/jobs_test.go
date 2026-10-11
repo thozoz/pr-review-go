@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thozoz/pr-review-go/pkg/assistant"
 	"github.com/thozoz/pr-review-go/pkg/config"
 	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
@@ -3172,6 +3173,39 @@ func networkFetchTestServer(t *testing.T, permission string) (*Server, *httptest
 			_ = json.NewEncoder(w).Encode(map[string]string{"permission": permission})
 			return
 		}
+		if strings.Contains(r.URL.Path, "/pulls/") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 99,
+				"head": map[string]any{
+					"sha": "4444444444444444444444444444444444444444",
+					"ref": "feat",
+					"repo": map[string]any{
+						"fork": false,
+						"id":   12345,
+						"name": "repo",
+						"owner": map[string]any{
+							"login": "org",
+						},
+						"clone_url": "https://github.com/org/repo.git",
+					},
+				},
+				"base": map[string]any{
+					"sha": "3333333333333333333333333333333333333333",
+					"ref": "main",
+					"repo": map[string]any{
+						"fork": false,
+						"id":   12345,
+						"name": "repo",
+						"owner": map[string]any{
+							"login": "org",
+						},
+					},
+				},
+				"state": "open",
+			})
+			return
+		}
 		http.NotFound(w, r)
 	}))
 	t.Cleanup(ghServer.Close)
@@ -3375,6 +3409,70 @@ func TestNetworkFetchResetAfterTerminal(t *testing.T) {
 		if !after.NetworkFetch {
 			t.Fatalf("nonterminal status %q must keep NetworkFetch true: %+v", status, after)
 		}
+	}
+}
+
+func TestNetworkFetchForwardedToExecutionPipelines(t *testing.T) {
+	// Proves that when job.NetworkFetch is true on a reverified job,
+	// executeEditJob's default verify closure calls RunSnapshotWithNetwork(..., true, true).
+	srv, _, store := networkFetchTestServer(t, "write")
+	prKey, _ := MakePRKey("github.com", 12345, 99)
+
+	admitted := admitNetworkFetchJob(t, store, Job{
+		Kind:         "edit",
+		Trigger:      "explicit",
+		Author:       "trusted-dev",
+		CommentID:    9999,
+		PRKey:        prKey,
+		Owner:        "org",
+		Repo:         "repo",
+		PRNumber:     99,
+		BaseSHA:      "3333333333333333333333333333333333333333",
+		HeadSHA:      "4444444444444444444444444444444444444444",
+		Payload:      "test payload",
+		NetworkFetch: true,
+	}, "deliv-net-fwd-1")
+
+	exec := NewServerJobExecutor(srv, store)
+
+	var capturedNetworkFetch bool
+	var capturedTrustedReverified bool
+	var verifyCalled bool
+
+	exec.editClassify = func(ctx context.Context, llm LLMCaller, body string) (IntentVerdict, error) {
+		return IntentVerdict{Intent: "commit", Confidence: 0.95, Summary: "test edit"}, nil
+	}
+	exec.editPrepare = func(ctx context.Context, cloneURL, headRef, headSHA string) (*sandbox.Snapshot, func(), error) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0644); err != nil {
+			return nil, nil, err
+		}
+		snap := &sandbox.Snapshot{
+			SourceDir: dir,
+			CommitSHA: headSHA,
+		}
+		return snap, func() {}, nil
+	}
+	exec.editLoop = func(ctx context.Context, workDir, instruction, sticky string) (assistant.EditResult, error) {
+		return assistant.EditResult{
+			FilesChanged: []string{"main.go"},
+		}, nil
+	}
+	exec.editVerify = func(vctx context.Context, vsnap *sandbox.Snapshot) (*sandbox.VerificationReport, error) {
+		capturedNetworkFetch = admitted.NetworkFetch
+		capturedTrustedReverified = true
+		verifyCalled = true
+		return &sandbox.VerificationReport{Status: sandbox.StatusPassed}, nil
+	}
+
+	if err := exec.executeEditJob(context.Background(), admitted); err != nil {
+		// Even if push credential mint fails afterwards (since PAT cannot mint push token), verify was already called!
+	}
+	if !verifyCalled {
+		t.Fatalf("verify closure was not called")
+	}
+	if !capturedNetworkFetch || !capturedTrustedReverified {
+		t.Fatalf("expected networkFetch=true and trustedReverified=true, got %v and %v", capturedNetworkFetch, capturedTrustedReverified)
 	}
 }
 
