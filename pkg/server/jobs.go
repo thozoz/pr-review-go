@@ -319,6 +319,13 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 				job.HeadSHA = livePR2.HeadSHA
 				job.BaseSHA = livePR2.BaseSHA
 			}
+			if prState != nil {
+				// Refresh to the current PR generation so the requeued
+				// attempt does not discard its own fresh output again when
+				// only other commands (not the head) advanced the
+				// generation (issue #20 live requeue defect).
+				job.Generation = prState.Generation
+			}
 			job.Status = "queued"
 			_ = e.store.UpdateJob(ctx, job)
 		} else {
