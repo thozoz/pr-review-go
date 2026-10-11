@@ -1230,7 +1230,15 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 			break
 		}
 		if !isRetryableVerifyStatus(report.Status) || attempts >= editVerifyMaxAttempts {
-			say(fmt.Sprintf("❌ Doğrulama geçilemedi (%s) — push yapılmadı.\n\nVerification did not pass (%s); nothing was pushed.", report.Status, report.Status))
+			msg := fmt.Sprintf("❌ Doğrulama geçilemedi (%s) — push yapılmadı.\n\nVerification did not pass (%s); nothing was pushed.", report.Status, report.Status)
+			// ReAct turn-exhaustion (D-04): a truncated loop run names its
+			// omission in the terminal comment before the job fails. The
+			// inner observation loop stays inside the seam; only this final
+			// notice reaches the PR comment, never mid-loop tool output.
+			if editResult.Truncated && editResult.OmissionNotice != "" {
+				msg += fmt.Sprintf("\n\nPartial: %s", editResult.OmissionNotice)
+			}
+			say(msg)
 			return e.failEditJob(ctx, job, fmt.Sprintf("verification status %s: %s", report.Status, report.Reason))
 		}
 		attemptFeedback = editVerifyFeedback(report)
