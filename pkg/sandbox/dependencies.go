@@ -72,10 +72,33 @@ func ValidateGoMod(workDir string) error {
 	return scanner.Err()
 }
 
+// isRemoteModulePath reports whether a path looks like a remote module path (e.g., has a dotted first path element like example.com/pkg).
+func isRemoteModulePath(p string) bool {
+	if strings.HasPrefix(p, "./") || strings.HasPrefix(p, "../") || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
+		return false
+	}
+	parts := strings.Split(p, "/")
+	if len(parts) == 0 {
+		return false
+	}
+	return strings.Contains(parts[0], ".")
+}
+
 func checkReplaceClause(workDir, clause string) error {
 	parts := strings.Split(clause, "=>")
 	if len(parts) != 2 {
 		return nil
+	}
+
+	// Source module path is the first field of the left-hand side
+	// (e.g. "example.com/old" in "replace example.com/old v1.0.0 => ...").
+	source := strings.TrimSpace(parts[0])
+	if idx := strings.Index(source, "//"); idx != -1 {
+		source = strings.TrimSpace(source[:idx])
+	}
+	sourceMod := ""
+	if sourceFields := strings.Fields(source); len(sourceFields) > 0 {
+		sourceMod = sourceFields[0]
 	}
 
 	target := strings.TrimSpace(parts[1])
@@ -89,14 +112,25 @@ func checkReplaceClause(workDir, clause string) error {
 		return nil
 	}
 
-	// In Go modules, if the target has two fields (e.g. "example.com/mod v1.2.3"),
-	// it is a module@version replacement, not a local filesystem replacement.
-	// A local filesystem replacement has exactly one field (a path).
+	// In Go modules, a two-field target (e.g. "example.com/mod v1.2.3") is a
+	// module@version replacement. Pinning the SAME module to a version stays
+	// inside the go.sum-verified fetch set; swapping to a DIFFERENT remote
+	// module dodges go.sum, so it is refused in-root-escape style (D-05).
 	if len(fields) > 1 {
+		if sourceMod != "" && fields[0] != sourceMod {
+			return fmt.Errorf("%w: remote module swap %q => %q dodges checksum verification", ErrEscapingReplacement, sourceMod, fields[0])
+		}
 		return nil
 	}
 
 	targetPath := fields[0]
+	// A single-field target reading as a remote module path (dotted first
+	// segment, e.g. "example.com/other") is the versionless form of the same
+	// swap — refuse unless it names the source module itself. Genuine local
+	// paths (./sub, sub/pkg, /abs) never match this shape.
+	if targetPath != sourceMod && isRemoteModulePath(targetPath) {
+		return fmt.Errorf("%w: remote module replacement target %q", ErrEscapingReplacement, targetPath)
+	}
 	// If it starts with "." or "/" or "\" or contains path separators without being a module domain
 	if strings.HasPrefix(targetPath, ".") || strings.HasPrefix(targetPath, "/") || strings.HasPrefix(targetPath, "\\") || strings.Contains(targetPath, "/") || strings.Contains(targetPath, "\\") {
 		// Absolute path is rejected
