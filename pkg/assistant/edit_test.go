@@ -28,6 +28,296 @@ func gatedWriteJSON(path, content string) string {
 
 const gatedAnswerJSON = `{"action":"answer","final_text":"done"}`
 
+func gatedStrReplaceJSON(path, oldStr, newStr string) string {
+	return fmt.Sprintf(`{"action":"str_replace","path":%q,"old_str":%q,"new_str":%q}`, path, oldStr, newStr)
+}
+
+func gatedRunCommandJSON(argv ...string) string {
+	quoted := make([]string, 0, len(argv))
+	for _, a := range argv {
+		quoted = append(quoted, fmt.Sprintf("%q", a))
+	}
+	return fmt.Sprintf(`{"action":"run_command","command":[%s]}`, strings.Join(quoted, ","))
+}
+
+func gatedGrepJSON(pattern, path string) string {
+	return fmt.Sprintf(`{"action":"grep","pattern":%q,"path":%q}`, pattern, path)
+}
+
+func gatedGlobJSON(pattern, path string) string {
+	return fmt.Sprintf(`{"action":"glob","pattern":%q,"path":%q}`, pattern, path)
+}
+
+func TestStrReplace_HappyPathAppliesPatch(t *testing.T) {
+	workDir := t.TempDir()
+	before := "alpha=1\nbeta=2\ngamma=3\n"
+	if err := os.WriteFile(filepath.Join(workDir, "cfg.txt"), []byte(before), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call == 1 {
+			return gatedStrReplaceJSON("cfg.txt", "beta=2", "beta=20")
+		}
+		return gatedAnswerJSON
+	}}
+
+	result, err := RunGatedEditLoop(context.Background(), fake, workDir, "bump beta", "", EditCaps{})
+	if err != nil {
+		t.Fatalf("RunGatedEditLoop failed: %v", err)
+	}
+	want := "alpha=1\nbeta=20\ngamma=3\n"
+	data, err := os.ReadFile(filepath.Join(workDir, "cfg.txt"))
+	if err != nil || string(data) != want {
+		t.Fatalf("patch content mismatch: %q, err=%v", data, err)
+	}
+	if len(result.FilesChanged) != 1 || result.FilesChanged[0] != "cfg.txt" {
+		t.Fatalf("unexpected FilesChanged: %v", result.FilesChanged)
+	}
+	if result.TotalBytes != len(want) {
+		t.Fatalf("unexpected TotalBytes: %d, want %d", result.TotalBytes, len(want))
+	}
+	if result.TotalLines != 4 {
+		t.Fatalf("unexpected TotalLines: %d, want 4", result.TotalLines)
+	}
+	if result.Truncated {
+		t.Fatalf("happy patch must not truncate")
+	}
+	if fake.calls != 2 {
+		t.Fatalf("expected 2 LLM calls, got %d", fake.calls)
+	}
+}
+
+func TestStrReplace_ZeroMatchWritesNothing(t *testing.T) {
+	workDir := t.TempDir()
+	before := "hello\n"
+	if err := os.WriteFile(filepath.Join(workDir, "b.txt"), []byte(before), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call == 1 {
+			return gatedStrReplaceJSON("b.txt", "absent-needle", "zzz")
+		}
+		return gatedAnswerJSON
+	}}
+
+	result, err := RunGatedEditLoop(context.Background(), fake, workDir, "patch missing", "", EditCaps{})
+	if err != nil {
+		t.Fatalf("zero-match must continue the loop, got error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(workDir, "b.txt"))
+	if err != nil || string(data) != before {
+		t.Fatalf("zero-match wrote bytes: %q, err=%v", data, err)
+	}
+	if len(result.FilesChanged) != 0 || result.TotalBytes != 0 || result.TotalLines != 0 {
+		t.Fatalf("zero-match must debit nothing: %+v", result)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("zero-match must continue to answer, calls=%d", fake.calls)
+	}
+}
+
+func TestStrReplace_TwoMatchWritesNothing(t *testing.T) {
+	workDir := t.TempDir()
+	before := "dup\nmid\ndup\n"
+	if err := os.WriteFile(filepath.Join(workDir, "c.txt"), []byte(before), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call == 1 {
+			return gatedStrReplaceJSON("c.txt", "dup", "solo")
+		}
+		return gatedAnswerJSON
+	}}
+
+	result, err := RunGatedEditLoop(context.Background(), fake, workDir, "ambiguous patch", "", EditCaps{})
+	if err != nil {
+		t.Fatalf("two-match must continue the loop, got error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(workDir, "c.txt"))
+	if err != nil || string(data) != before {
+		t.Fatalf("two-match must not fuzzy-write: %q, err=%v", data, err)
+	}
+	if len(result.FilesChanged) != 0 {
+		t.Fatalf("two-match must debit nothing: %+v", result)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("two-match must continue to answer, calls=%d", fake.calls)
+	}
+}
+
+func TestRunCommand_AllowlistedPassesThroughStub(t *testing.T) {
+	workDir := t.TempDir()
+	var gotArgv []string
+	var gotDir string
+	called := 0
+	prev := gatedRunCommandBackend
+	gatedRunCommandBackend = func(ctx context.Context, dir string, argv []string) (string, string, int, error) {
+		called++
+		gotArgv = append([]string(nil), argv...)
+		gotDir = dir
+		return "ok 1.000s\n", "", 0, nil
+	}
+	t.Cleanup(func() { gatedRunCommandBackend = prev })
+
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call == 1 {
+			return gatedRunCommandJSON("go", "test", "-race", "./...")
+		}
+		return gatedAnswerJSON
+	}}
+
+	if _, err := RunGatedEditLoop(context.Background(), fake, workDir, "verify", "", EditCaps{}); err != nil {
+		t.Fatalf("allow-listed command must run without violation: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("expected exactly 1 backend call, got %d", called)
+	}
+	if len(gotArgv) != 4 || gotArgv[0] != "go" || gotArgv[1] != "test" || gotArgv[2] != "-race" || gotArgv[3] != "./..." {
+		t.Fatalf("backend argv mismatch: %q", gotArgv)
+	}
+	absWork, _ := filepath.Abs(workDir)
+	if evaled, err := filepath.EvalSymlinks(absWork); err == nil {
+		absWork = evaled
+	}
+	if gotDir != absWork {
+		t.Fatalf("backend cwd must pin to work copy: got %q want %q", gotDir, absWork)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("expected continue to answer, calls=%d", fake.calls)
+	}
+}
+
+func TestRunCommand_ShellStringRejected(t *testing.T) {
+	workDir := t.TempDir()
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call == 1 {
+			return gatedRunCommandJSON("go", "test; rm -rf")
+		}
+		return gatedAnswerJSON
+	}}
+
+	if _, err := RunGatedEditLoop(context.Background(), fake, workDir, "shell attempt", "", EditCaps{}); err != nil {
+		t.Fatalf("single refusal must continue the loop, got error: %v", err)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("refusal must burn one violation and continue, calls=%d", fake.calls)
+	}
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("refused command must not create files: %v", entries)
+	}
+}
+
+func TestRunCommand_NonAllowlistedBinaryRefused(t *testing.T) {
+	workDir := t.TempDir()
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call == 1 {
+			return gatedRunCommandJSON("curl", "https://example.com")
+		}
+		return gatedAnswerJSON
+	}}
+
+	if _, err := RunGatedEditLoop(context.Background(), fake, workDir, "fetch attempt", "", EditCaps{}); err != nil {
+		t.Fatalf("single refusal must continue the loop, got error: %v", err)
+	}
+	if fake.calls != 2 {
+		t.Fatalf("refusal must burn one violation and continue, calls=%d", fake.calls)
+	}
+}
+
+func TestGatedEdit_MixedViolationsAbortAtThree(t *testing.T) {
+	workDir := t.TempDir()
+	scripted := []string{
+		gatedRunCommandJSON("curl", "https://example.com"),
+		gatedRunCommandJSON("go", "test | tee out"),
+		`{"action":"commit_and_push","commit_msg":"exfiltrate"}`,
+	}
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call <= len(scripted) {
+			return scripted[call-1]
+		}
+		return gatedAnswerJSON
+	}}
+
+	_, err := RunGatedEditLoop(context.Background(), fake, workDir, "hostile sequence", "", EditCaps{})
+	if !errors.Is(err, ErrGatedEditViolationsExceeded) {
+		t.Fatalf("expected violation-limit error, got: %v", err)
+	}
+	if fake.calls != 3 {
+		t.Fatalf("expected abort after exactly 3 violations, got %d calls", fake.calls)
+	}
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("violation run must not create files: %v", entries)
+	}
+}
+
+func TestGrepGlob_JailEscapeRejected(t *testing.T) {
+	workDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workDir, "note.txt"), []byte("plain\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	scripted := []string{
+		gatedGrepJSON("plain", "../.."),
+		gatedGrepJSON("plain", ".git"),
+		gatedGlobJSON("*.txt", "../.."),
+	}
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call <= len(scripted) {
+			return scripted[call-1]
+		}
+		return gatedAnswerJSON
+	}}
+
+	if _, err := RunGatedEditLoop(context.Background(), fake, workDir, "escape reads", "", EditCaps{}); err != nil {
+		t.Fatalf("jail-escape reads must be refused as tool errors, got: %v", err)
+	}
+	if fake.calls != len(scripted)+1 {
+		t.Fatalf("each escape must be refused without abort, calls=%d", fake.calls)
+	}
+	data, err := os.ReadFile(filepath.Join(workDir, "note.txt"))
+	if err != nil || string(data) != "plain\n" {
+		t.Fatalf("grep/glob must stay read-only: %q, err=%v", data, err)
+	}
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("grep/glob must write zero files: %v", entries)
+	}
+}
+
+func TestGatedEdit_ToolJSONHasNoCredentialSurface(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate test file")
+	}
+	editSource, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "edit.go"))
+	if err != nil {
+		t.Fatalf("cannot read edit.go: %v", err)
+	}
+	forbidden := []string{
+		"Token",
+		"credential",
+		"Credential",
+		"PAT",
+		"Bearer",
+		"Authorization",
+	}
+	for _, marker := range forbidden {
+		if strings.Contains(string(editSource), marker) {
+			t.Fatalf("edit.go loop/tool surface must not contain %q", marker)
+		}
+	}
+}
+
 func TestGatedEdit_DefaultCaps(t *testing.T) {
 	caps := DefaultEditCaps()
 	if caps.MaxFiles != 10 || caps.MaxTotalLines != 500 || caps.MaxTotalBytes != 1048576 {
