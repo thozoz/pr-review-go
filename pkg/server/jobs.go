@@ -1145,7 +1145,8 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 
 	prepare := e.editPrepare
 	verify := e.editVerify
-	if prepare == nil || verify == nil {
+	var inLoopBackend func(ctx context.Context, workDir string, argv []string) (string, string, int, error)
+	if e.server != nil && e.server.cfg != nil {
 		editBackend, editSlots := sandbox.PlatformComponents(e.server.cfg)
 		platformRunner := sandbox.NewPlatformRunner(e.server.cfg, live, editBackend, editSlots)
 		if prepare == nil {
@@ -1156,11 +1157,16 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 				return platformRunner.RunSnapshotWithNetwork(vctx, vsnap, job.NetworkFetch, true)
 			}
 		}
+		inLoopBackend = func(ictx context.Context, workDir string, argv []string) (string, string, int, error) {
+			return sandbox.InLoopCommand(ictx, workDir, argv, 0, 0)
+		}
 	}
 	loop := e.editLoop
 	if loop == nil {
 		loop = func(lctx context.Context, workDir, instruction, sticky string) (assistant.EditResult, error) {
-			return assistant.RunGatedEditLoop(lctx, llmClient, workDir, instruction, sticky, assistant.DefaultEditCaps())
+			caps := assistant.DefaultEditCaps()
+			caps.RunCommandBackend = inLoopBackend
+			return assistant.RunGatedEditLoop(lctx, llmClient, workDir, instruction, sticky, caps)
 		}
 	}
 

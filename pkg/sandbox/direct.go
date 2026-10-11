@@ -231,6 +231,12 @@ func wrapDirectStage2ArgvForOS(goos string, attest func(context.Context) error, 
 // context. Directories without a recognized build configuration pass with an
 // info notice.
 func (d *DirectRunner) VerifyDir(ctx context.Context, dir, commitSHA string) (*VerificationReport, error) {
+	return d.VerifyDirGated(ctx, dir, commitSHA, false)
+}
+
+// VerifyDirGated runs verification with fetchOK controlling whether stage-0
+// dependency installation may access the network.
+func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string, fetchOK bool) (*VerificationReport, error) {
 	report := &VerificationReport{
 		WorkspaceDir: dir,
 		CommitSHA:    commitSHA,
@@ -330,6 +336,11 @@ func (d *DirectRunner) VerifyDir(ctx context.Context, dir, commitSHA string) (*V
 	}
 
 	env := buildDirectStageEnv(proj.offline)
+	installEnv := env
+	if fetchOK && proj.lang == "go" {
+		// When authorized with --with-network, stage-0 dependency fetch runs without GOPROXY=off.
+		installEnv = buildDirectStageEnv([]string{"GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"})
+	}
 
 	// Lock Python scope to Go-first with honest-incomplete (D-03, D-05):
 	// any Python project whose install would need network returns StatusIncomplete.
@@ -350,7 +361,7 @@ func (d *DirectRunner) VerifyDir(ctx context.Context, dir, commitSHA string) (*V
 			report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
 			return report, nil
 		}
-		installRes := runDirectStage(ctx, d.stageTimeout(), workDir, "install", proj.installArgs, env)
+		installRes := runDirectStage(ctx, d.stageTimeout(), workDir, "install", proj.installArgs, installEnv)
 		report.Results = append(report.Results, directExecutionResult(installRes))
 		if installRes.Truncated {
 			report.Truncated = true
@@ -541,12 +552,12 @@ func mapDirectStageFailure(report *VerificationReport, stage string, res *StageR
 // runDirectSnapshot executes a validated snapshot through the direct path.
 // Podman, slot leasing, and attestation are skipped; the snapshot source is
 // copied into an ephemeral workspace and verified there.
-func (r *Runner) runDirectSnapshot(ctx context.Context, snapshot *Snapshot) (*VerificationReport, error) {
+func (r *Runner) runDirectSnapshot(ctx context.Context, snapshot *Snapshot, fetchOK bool) (*VerificationReport, error) {
 	direct := r.Direct
 	if direct == nil {
 		direct = NewDirectRunner(r.executionTimeout())
 	}
-	report, err := direct.VerifyDir(ctx, snapshot.SourceDir, snapshot.CommitSHA)
+	report, err := direct.VerifyDirGated(ctx, snapshot.SourceDir, snapshot.CommitSHA, fetchOK)
 	if err != nil {
 		return report, err
 	}
