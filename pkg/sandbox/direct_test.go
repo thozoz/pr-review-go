@@ -361,3 +361,69 @@ func TestInLoopNoGenerateRow(t *testing.T) {
 		}
 	}
 }
+
+// TestKeylessStage2 asserts the built podman and direct stage envs contain no
+// secret substrings, even with secrets present in the server process env.
+// Manual-only companion proofs (Podman --network=none dial-out on a Linux
+// host, CT userns probe) are operator steps per 07-VALIDATION.md
+// "Manual-Only Verifications" — this test pins the env half automatically.
+func TestKeylessStage2(t *testing.T) {
+	t.Setenv("GH_TOKEN", "secret-gh")
+	t.Setenv("GITHUB_TOKEN", "secret-ghs")
+	t.Setenv("GITHUB_APP_ID", "secret-app")
+	t.Setenv("LLM_API_KEY", "secret-llm")
+	t.Setenv("APP_BOT_TOKEN", "secret-bot")
+	t.Setenv("OPENAI_API_KEY", "secret-openai")
+	t.Setenv("ANTHROPIC_API_KEY", "secret-anthropic")
+
+	checkClean := func(name, joined string) {
+		t.Helper()
+		for _, banned := range []string{"GH_TOKEN", "GITHUB_TOKEN", "GITHUB_", "LLM_", "APP_", "OPENAI_", "ANTHROPIC_"} {
+			if strings.Contains(joined, banned) {
+				t.Errorf("%s stage env must not contain %q (got %q)", name, banned, joined)
+			}
+		}
+		for _, secret := range []string{"secret-gh", "secret-ghs", "secret-app", "secret-llm", "secret-bot", "secret-openai", "secret-anthropic"} {
+			if strings.Contains(joined, secret) {
+				t.Errorf("%s stage env leaked a secret value (got %q)", name, joined)
+			}
+		}
+	}
+
+	checkClean("podman", strings.Join(podmanStageEnv(), " "))
+	checkClean("direct", strings.Join(buildDirectStageEnv([]string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"}), "\n"))
+
+	// The in-loop exec path adds no env of its own: execArgs carry no -e at
+	// all, so the container keeps its --network=none keyless env.
+	r := &Runner{}
+	_, _, _, err := r.InLoopExecCommand(context.Background(), "", []string{"go", "build", "./..."}, time.Minute, 6000)
+	if err == nil || !strings.Contains(err.Error(), "container ID") {
+		t.Fatalf("expected container-ID gate error, got: %v", err)
+	}
+}
+
+// TestTokenContainmentGrep extends the T-05-02 structural grep pattern (server
+// jobs.go) to the sandbox stage-env builders: no -e/--setenv line in
+// podman.go, direct.go, or bwrap.go may name a secret. The intentional
+// blocklist literals in direct.go live on lines without -e/--setenv, so they
+// do not trip this pin.
+func TestTokenContainmentGrep(t *testing.T) {
+	files := []string{"podman.go", "direct.go", "bwrap.go"}
+	secrets := []string{"GH_TOKEN", "GITHUB_TOKEN", "GITHUB_", "LLM_", "APP_", "OPENAI_", "ANTHROPIC_"}
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("cannot read %s: %v", file, err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			if !strings.Contains(line, `"-e"`) && !strings.Contains(line, "--setenv") {
+				continue
+			}
+			for _, secret := range secrets {
+				if strings.Contains(line, secret) {
+					t.Errorf("%s:%d: secret literal %q in stage-env flag line: %q", file, i+1, secret, strings.TrimSpace(line))
+				}
+			}
+		}
+	}
+}
