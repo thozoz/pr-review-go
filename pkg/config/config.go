@@ -21,9 +21,9 @@ type Config struct {
 	LLMAPIKey     string
 	LLMModel      string
 	EnableSandbox bool
-	// SandboxMode selects the verification backend: "podman" (default,
-	// rootless containers) or "direct" (containerless host execution for
-	// pre-isolated environments). Env SANDBOX_MODE.
+	// SandboxMode selects the verification backend: "direct" (default,
+	// containerless host execution for pre-isolated environments) or "podman"
+	// (explicit opt-in to rootless containers). Env SANDBOX_MODE.
 	SandboxMode string `json:"sandbox_mode"`
 	// AllowRootfulSandbox permits rootful Podman in pre-isolated
 	// environments (unprivileged LXC, CI runners). Env ALLOW_ROOTFUL_SANDBOX.
@@ -227,7 +227,7 @@ func (c *Config) Validate() error {
 	}
 	// Set default SandboxMode if empty
 	if c.SandboxMode == "" {
-		c.SandboxMode = SandboxModePodman
+		c.SandboxMode = SandboxModeDirect
 	}
 	if c.SandboxMode != SandboxModePodman && c.SandboxMode != SandboxModeDirect {
 		return fmt.Errorf("invalid SandboxMode: %s (must be 'podman' or 'direct')", c.SandboxMode)
@@ -688,7 +688,7 @@ func Load() *Config {
 	}
 	sandboxMode := strings.ToLower(strings.TrimSpace(os.Getenv("SANDBOX_MODE")))
 	if sandboxMode == "" {
-		sandboxMode = SandboxModePodman
+		sandboxMode = SandboxModeDirect
 	}
 	allowRootfulSandbox := false
 	if raw := os.Getenv("ALLOW_ROOTFUL_SANDBOX"); raw != "" {
