@@ -622,10 +622,23 @@ func TestLoadSandboxModeEnv(t *testing.T) {
 		os.Unsetenv("SANDBOX_MODE")
 	}()
 
-	// 1. Default is podman
+	// 1. Unset and blank values default to direct.
+	t.Setenv("SANDBOX_MODE", "")
 	cfg := Load()
-	if cfg.SandboxMode != SandboxModePodman {
-		t.Errorf("expected default SandboxMode podman, got %q", cfg.SandboxMode)
+	if cfg.SandboxMode != SandboxModeDirect {
+		t.Errorf("expected default SandboxMode direct, got %q", cfg.SandboxMode)
+	}
+	t.Setenv("SANDBOX_MODE", "  ")
+	if cfg = Load(); cfg.SandboxMode != SandboxModeDirect {
+		t.Errorf("expected blank SandboxMode direct, got %q", cfg.SandboxMode)
+	}
+	cfg.SandboxMode = ""
+	if err := cfg.Validate(); err != nil || cfg.SandboxMode != SandboxModeDirect {
+		t.Errorf("expected Validate to default to direct, got %q, err=%v", cfg.SandboxMode, err)
+	}
+	t.Setenv("SANDBOX_MODE", " Podman ")
+	if cfg = Load(); cfg.SandboxMode != SandboxModePodman {
+		t.Errorf("expected explicit Podman opt-in, got %q", cfg.SandboxMode)
 	}
 
 	// 2. direct is accepted (case-insensitive, trimmed)

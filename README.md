@@ -38,6 +38,48 @@ deploy/
   pr-review.service   # Systemd unit template for Proxmox CT / Linux server
 ```
 
+## Execution mode (default: no Podman)
+
+If `SANDBOX_MODE` is unset or blank, verification uses **`direct`**. Podman
+is optional and must be explicitly selected:
+
+```bash
+SANDBOX_MODE=direct  # default: run build/test commands on the execution host
+SANDBOX_MODE=podman  # opt in to Podman isolation; provision it separately
+```
+
+**Security:** direct mode executes repository code and build/test scripts on the
+execution host. It is not a per-job container security boundary. Use a dedicated,
+pre-isolated worker without production secrets; a shared LXC alone does not
+protect the bot's credentials from untrusted code. Do not run untrusted PRs on
+an ordinary shared host using this default. Set `SANDBOX_MODE=podman` explicitly
+where container isolation is required; failures do not automatically fall back
+to direct mode. Existing explicit Podman configuration remains effective.
+
+Podman has **not worked in our tested nested Proxmox LXC environment**: cgroup
+controller delegation and UID/GID mapping errors blocked execution. This is an
+environment-specific open limitation, not a claim that Podman fails everywhere.
+See [issue #20](https://github.com/thozoz/pr-review-go/issues/20) for tracking.
+`ALLOW_ROOTFUL_SANDBOX` remains disabled by default; it is not needed in direct mode.
+
+## Optional model fallback
+
+```bash
+export LLM_MODEL="primary-model"
+export LLM_FALLBACK_MODELS="backup-model-1,backup-model-2"
+```
+
+The comma-separated fallback chain is opt-in (empty by default), ordered, and
+uses the same configured API endpoint and credentials. After retries for a model
+fail with HTTP 429 or 5xx, the client tries the next model. Authentication errors,
+invalid requests, network failures, malformed/empty responses and cancellation
+are not fallback triggers. Duplicate/blank names are ignored. Each model retains
+the existing retry policy; the caller's context/deadline bounds the whole chain.
+Every new call starts with the primary model (no permanent model switch).
+
+Only list models/providers you approve: fallback may incur additional charges
+and send the same PR content to a different provider behind your proxy.
+
 ## Quick Start
 
 ### Install a release

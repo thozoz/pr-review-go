@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -22,8 +24,8 @@ const (
 	DefaultLLMMinInterval      = 1 * time.Second
 	MinLLMMinInterval          = 1 * time.Millisecond
 	MaxLLMMinInterval          = 1 * time.Minute
-	DefaultLLMResponseMaxBytes = 1048576 // 1 MiB
-	MinLLMResponseMaxBytes     = 65536   // 64 KiB
+	DefaultLLMResponseMaxBytes = 1048576  // 1 MiB
+	MinLLMResponseMaxBytes     = 65536    // 64 KiB
 	MaxLLMResponseMaxBytes     = 16777216 // 16 MiB
 )
 
@@ -35,7 +37,7 @@ type Clock interface {
 
 type realClock struct{}
 
-func (realClock) Now() time.Time { return time.Now() }
+func (realClock) Now() time.Time                         { return time.Now() }
 func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
 // RequestGate limits concurrent LLM requests and spaces request starts.
@@ -180,11 +182,12 @@ type Client struct {
 	httpClient       *http.Client
 	maxResponseBytes int64
 	retryPolicy      retry.Policy
+	fallbackModels   []string
 }
 
 func NewClient(baseURL, apiKey, model string) *Client {
 	baseURL = strings.TrimSuffix(baseURL, "/")
-	return &Client{
+	client := &Client{
 		baseURL: baseURL,
 		apiKey:  apiKey,
 		model:   model,
@@ -194,6 +197,8 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		maxResponseBytes: DefaultLLMResponseMaxBytes,
 		retryPolicy:      retry.DefaultPolicy(),
 	}
+	client.SetFallbackModels(strings.Split(os.Getenv("LLM_FALLBACK_MODELS"), ","))
+	return client
 }
 
 // SetTimeout allows customizing the HTTP timeout
@@ -247,7 +252,50 @@ type ChatResponse struct {
 	} `json:"error,omitempty"`
 }
 
+// SetFallbackModels configures an ordered, opt-in chain at the same endpoint.
+// Configure before serving concurrent requests. Empty and duplicate names are ignored.
+func (c *Client) SetFallbackModels(models []string) {
+	seen := map[string]bool{c.model: true}
+	c.fallbackModels = nil
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model != "" && !seen[model] {
+			seen[model] = true
+			c.fallbackModels = append(c.fallbackModels, model)
+		}
+	}
+}
+
+type fallbackHTTPError struct {
+	status int
+	body   string
+}
+
+func (e *fallbackHTTPError) Error() string {
+	return fmt.Sprintf("api error (status %d): %s", e.status, e.body)
+}
+
 func (c *Client) ChatCompletion(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	models := append([]string{c.model}, c.fallbackModels...)
+	var lastErr error
+	for _, model := range models {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		result, err := c.chatCompletionModel(ctx, systemPrompt, userPrompt, model)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		var statusErr *fallbackHTTPError
+		if !errors.As(err, &statusErr) || (statusErr.status != 429 && statusErr.status < 500) {
+			return "", err
+		}
+	}
+	return "", lastErr
+}
+
+func (c *Client) chatCompletionModel(ctx context.Context, systemPrompt, userPrompt, model string) (string, error) {
 	// Validate inputs
 	if c.baseURL == "" {
 		return "", fmt.Errorf("base URL is not configured")
@@ -282,7 +330,7 @@ func (c *Client) ChatCompletion(ctx context.Context, systemPrompt, userPrompt st
 	}
 
 	reqBody := ChatRequest{
-		Model: c.model,
+		Model: model,
 		Messages: []ChatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
@@ -324,7 +372,7 @@ func (c *Client) ChatCompletion(ctx context.Context, systemPrompt, userPrompt st
 		}
 
 		if resp.StatusCode >= 400 {
-			return "", fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(bodyBytes))
+			return "", &fallbackHTTPError{status: resp.StatusCode, body: string(bodyBytes)}
 		}
 
 		var chatResp ChatResponse
