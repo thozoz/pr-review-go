@@ -123,7 +123,10 @@ func TestRunner_RunSnapshot_DependencyStatuses(t *testing.T) {
 			},
 		}
 
-		report, err := r.RunSnapshot(context.Background(), snap)
+		// Prep failures are exercised through the open fetch gate: the
+		// mapping under test belongs to the fetch stage, which only runs
+		// for a trusted opt-in (RunSnapshot defaults closed/offline).
+		report, err := r.RunSnapshotWithNetwork(context.Background(), snap, true, true)
 		if err != nil {
 			t.Fatalf("unexpected RunSnapshot error: %v", err)
 		}
@@ -152,7 +155,8 @@ func TestRunner_RunSnapshot_DependencyStatuses(t *testing.T) {
 			},
 		}
 
-		report, err := r.RunSnapshot(context.Background(), snap)
+		// Same open-gate routing as subtest 1: prep mapping needs the fetch stage.
+		report, err := r.RunSnapshotWithNetwork(context.Background(), snap, true, true)
 		if err != nil {
 			t.Fatalf("unexpected RunSnapshot error: %v", err)
 		}
@@ -181,7 +185,8 @@ func TestRunner_RunSnapshot_DependencyStatuses(t *testing.T) {
 			},
 		}
 
-		report, err := r.RunSnapshot(context.Background(), snap)
+		// Same open-gate routing as subtest 1: prep mapping needs the fetch stage.
+		report, err := r.RunSnapshotWithNetwork(context.Background(), snap, true, true)
 		if err != nil {
 			t.Fatalf("unexpected RunSnapshot error: %v", err)
 		}
