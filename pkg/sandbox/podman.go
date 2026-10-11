@@ -339,3 +339,118 @@ func (p *PodmanBackend) ReconcileOrphanContainers(ctx context.Context) error {
 
 	return nil
 }
+
+// In-loop command execution (Phase 06-03, D-03, podman parity).
+//
+// InLoopExecCommand runs one matrix-constrained build/test command inside the
+// writable /work mount of an existing verification container via podman exec.
+// It applies the IDENTICAL element-level gate as InLoopCommand (empty,
+// shell-metacharacter, and traversal rejection with the same error strings)
+// plus the shared matrix-head allow-list, then restricts argv to the union
+// of every known matrix row (per-project binding is impossible here: the
+// container side has no workDir to detect from, so the strictest
+// workDir-free gate is the full known-good set). No shell wrapper anywhere
+// in the exec path. A container exit 127 maps to the same
+// ErrInLoopToolchainMissing unavailable shape as a missing direct binary —
+// never to a failed verdict. Inner pass is advisory only.
+func (r *Runner) InLoopExecCommand(ctx context.Context, containerID string, argv []string, timeout time.Duration, maxOutputBytes int) (string, string, int, error) {
+	if strings.TrimSpace(containerID) == "" {
+		return "", "", -1, fmt.Errorf("in-loop exec requires a container ID")
+	}
+	if err := validateInLoopArgv(argv); err != nil {
+		return "", "", -1, err
+	}
+	if !inLoopHeadAllowed(argv[0]) {
+		return "", "", -1, fmt.Errorf("%s: %q", inLoopMatrixMismatch, strings.Join(argv, " "))
+	}
+	if !inLoopArgvAllowed(argv, inLoopAllowedUnion()) {
+		return "", "", -1, fmt.Errorf("%s: %q", inLoopMatrixMismatch, strings.Join(argv, " "))
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", -1, err
+	}
+	binary := "podman"
+	if r != nil && r.Backend != nil && strings.TrimSpace(r.Backend.cfg.BinaryPath) != "" {
+		binary = r.Backend.cfg.BinaryPath
+	}
+	if _, err := exec.LookPath(binary); err != nil {
+		return "", "", 127, fmt.Errorf("%w: podman binary %q is missing on PATH (in-loop exec unavailable)", ErrInLoopToolchainMissing, binary)
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	if maxOutputBytes <= 0 {
+		maxOutputBytes = defaultInLoopMaxOutputBytes
+	}
+
+	execArgs := []string{"exec", "-w", "/work", containerID}
+	execArgs = append(execArgs, argv...)
+
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, binary, execArgs...)
+	cmd.Stdin = nil
+
+	stdoutCollector := NewLimitedCollector(maxOutputBytes)
+	stderrCollector := NewLimitedCollector(maxOutputBytes)
+	cmd.Stdout = stdoutCollector
+	cmd.Stderr = stderrCollector
+
+	runErr := cmd.Run()
+	stdout := formatInLoopOutput(stdoutCollector, maxOutputBytes)
+	stderr := formatInLoopOutput(stderrCollector, maxOutputBytes)
+
+	if runErr != nil {
+		exitCode := 1
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+		if execCtx.Err() == context.DeadlineExceeded {
+			return stdout, stderr, 124, execCtx.Err()
+		}
+		if exitCode == 127 {
+			return stdout, stderr, 127, fmt.Errorf("%w: %q is missing in container %q (exit 127, in-loop command unavailable)", ErrInLoopToolchainMissing, argv[0], containerID)
+		}
+		return stdout, stderr, exitCode, nil
+	}
+	return stdout, stderr, 0, nil
+}
+
+// inLoopAllowedUnion is the full known-good argv set across every project
+// matrix (build plus test rows only; install/network rows excluded). The
+// podman backend gates against it because exec has no workDir to detect a
+// single project from. inloop_test.go pins that every detectDirectProject
+// row is a member, so the union cannot drift from the matrix.
+func inLoopAllowedUnion() [][]string {
+	return [][]string{
+		{"go", "build", "./..."},
+		{"go", "vet", "./..."},
+		{"go", "test", "-race", "./..."},
+		{"poetry", "run", "pytest"},
+		{"pytest"},
+		{"python3", "-m", "pytest"},
+		{"python", "-m", "pytest"},
+		{"python3", "-m", "unittest"},
+		{"python", "-m", "unittest"},
+		{"pnpm", "test"},
+		{"yarn", "test"},
+		{"npm", "test"},
+		{"cargo", "test"},
+		{"mvn", "-q", "test"},
+		{"gradle", "test"},
+		{"make", "test"},
+	}
+}
+
+// inLoopHeadAllowed reports whether head is a binary appearing in the shared
+// matrix union (derived, never a separate literal list, so both backends
+// share identical gate strings by construction).
+func inLoopHeadAllowed(head string) bool {
+	for _, row := range inLoopAllowedUnion() {
+		if len(row) > 0 && row[0] == head {
+			return true
+		}
+	}
+	return false
+}
