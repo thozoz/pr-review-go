@@ -28,8 +28,10 @@ const (
 	DefaultEditMaxTotalLines = 500
 	// DefaultEditMaxTotalBytes caps the total written bytes per loop run (1 MiB).
 	DefaultEditMaxTotalBytes = 1048576
-	// MaxGatedEditTurns bounds the LLM turn loop.
-	MaxGatedEditTurns = 8
+	// MaxGatedEditTurns bounds the LLM turn loop (D-01 inner budget: 15 rounds
+	// per outer attempt; worst case 15 inner x 3 outer editVerifyMaxAttempts =
+	// 45 LLM calls, bounded by RequestGate plus the 10-minute job timeout).
+	MaxGatedEditTurns = 15
 	// MaxGatedEditViolations aborts the loop after repeated forbidden actions.
 	MaxGatedEditViolations = 3
 )
@@ -110,7 +112,7 @@ STRICT RULES:
 - Every path must be relative to the work copy root (e.g. "pkg/foo/bar.go").
 - Absolute paths, parent-directory escapes (".."), and .git paths are rejected.
 - "commit_and_push", "exec", "shell", "push", "commit", "bash", and "delete_file" are forbidden and will be refused. Only the allow-listed run_command form above may execute anything; everything else is file edits, then answer.
-- Keep edits small and focused. You have up to 8 turns before the loop stops.
+- Keep edits small and focused. You have up to 15 turns before the loop stops.
 - Output MUST be a single strict JSON object matching {"action": "...", ...}.
 - Never include markdown codeblocks surrounding your JSON tool calls.`
 
