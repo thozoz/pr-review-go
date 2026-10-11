@@ -62,6 +62,24 @@ environment-specific open limitation, not a claim that Podman fails everywhere.
 See [issue #20](https://github.com/thozoz/pr-review-go/issues/20) for tracking.
 `ALLOW_ROOTFUL_SANDBOX` remains disabled by default; it is not needed in direct mode.
 
+## Optional model fallback
+
+```bash
+export LLM_MODEL="primary-model"
+export LLM_FALLBACK_MODELS="backup-model-1,backup-model-2"
+```
+
+The comma-separated fallback chain is opt-in (empty by default), ordered, and
+uses the same configured API endpoint and credentials. After retries for a model
+fail with HTTP 429 or 5xx, the client tries the next model. Authentication errors,
+invalid requests, network failures, malformed/empty responses and cancellation
+are not fallback triggers. Duplicate/blank names are ignored. Each model retains
+the existing retry policy; the caller's context/deadline bounds the whole chain.
+Every new call starts with the primary model (no permanent model switch).
+
+Only list models/providers you approve: fallback may incur additional charges
+and send the same PR content to a different provider behind your proxy.
+
 ## Quick Start
 
 ### Install a release
