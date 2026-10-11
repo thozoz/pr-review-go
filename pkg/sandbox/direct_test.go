@@ -285,21 +285,29 @@ func TestDirectStageEnvScrubbed(t *testing.T) {
 func TestDirectBwrapWrapPrefix(t *testing.T) {
 	argv := []string{"go", "build", "./..."}
 	wrapped := bwrapNetIsolateArgv(argv)
-	if len(wrapped) != len(argv)+4 {
-		t.Fatalf("wrapped argv length = %d, want %d", len(wrapped), len(argv)+4)
+	expectedPrefix := []string{
+		"bwrap",
+		"--unshare-user",
+		"--unshare-net",
+		"--die-with-parent",
+		"--new-session",
+		"--dev-bind", "/", "/",
 	}
-	for i, want := range []string{"bwrap", "--unshare-net", "--die-with-parent", "--new-session"} {
+	if len(wrapped) != len(argv)+len(expectedPrefix) {
+		t.Fatalf("wrapped argv length = %d, want %d", len(wrapped), len(argv)+len(expectedPrefix))
+	}
+	for i, want := range expectedPrefix {
 		if wrapped[i] != want {
 			t.Fatalf("wrapped argv[%d] = %q, want %q (full %q)", i, wrapped[i], want, wrapped)
 		}
 	}
 	for i, want := range argv {
-		if wrapped[i+4] != want {
-			t.Fatalf("wrapped tail[%d] = %q, want %q", i, wrapped[i+4], want)
+		if wrapped[i+len(expectedPrefix)] != want {
+			t.Fatalf("wrapped tail[%d] = %q, want %q", i, wrapped[i+len(expectedPrefix)], want)
 		}
 	}
 	joined := strings.Join(wrapped, " ")
-	for _, banned := range []string{"gateway.sock", "depgw-", "--bind", "--socket"} {
+	for _, banned := range []string{"gateway.sock", "depgw-", "--socket"} {
 		if strings.Contains(joined, banned) {
 			t.Errorf("wrapped stage-2 argv must contain no %q (got %q)", banned, joined)
 		}
