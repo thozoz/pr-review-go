@@ -463,7 +463,7 @@ func TestGatedEdit_SymlinkEscapeRefused(t *testing.T) {
 
 func TestGatedEdit_MaxFilesCapAbortsWithOmission(t *testing.T) {
 	workDir := t.TempDir()
-	// The 8-turn bound caps single-run writes below the default MaxFiles of
+	// The 15-turn bound caps single-run writes below the default MaxFiles of
 	// 10, so this case proves the same mechanism with a proportional cap.
 	caps := EditCaps{MaxFiles: 5, MaxTotalLines: 500, MaxTotalBytes: 1048576}
 	fake := &scriptGatedLLM{fn: func(call int) string {
@@ -630,5 +630,116 @@ func TestGatedEdit_UngatedAssistantStillReadOnly(t *testing.T) {
 	})
 	if !strings.Contains(strings.ToLower(resp), "disabled") {
 		t.Fatalf("ungated assistant write_file must stay disabled, got: %s", resp)
+	}
+}
+
+func TestTurnBudget_ExhaustionAfterFifteenRounds(t *testing.T) {
+	if MaxGatedEditTurns != 15 {
+		t.Fatalf("MaxGatedEditTurns must equal 15 (D-01 inner budget), got %d", MaxGatedEditTurns)
+	}
+	workDir := t.TempDir()
+	const listJSON = `{"action":"list_files","path":"."}`
+	fake := &scriptGatedLLM{fn: func(call int) string { return listJSON }}
+
+	result, err := RunGatedEditLoop(context.Background(), fake, workDir, "never finishes", "", EditCaps{})
+	if err != nil {
+		t.Fatalf("budget exhaustion must return omission result, got error: %v", err)
+	}
+	if !result.Truncated {
+		t.Fatalf("expected Truncated after exhausting the turn budget")
+	}
+	if !strings.Contains(result.OmissionNotice, "turn budget exhausted after 15 turns") {
+		t.Fatalf("omission notice must name the 15-turn budget, got: %q", result.OmissionNotice)
+	}
+	if fake.calls != 15 {
+		t.Fatalf("expected exactly 15 LLM calls, got %d", fake.calls)
+	}
+}
+
+func TestTurnBudget_EarlyAnswerFinalizes(t *testing.T) {
+	workDir := t.TempDir()
+	const listJSON = `{"action":"list_files","path":"."}`
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call < 3 {
+			return listJSON
+		}
+		return gatedAnswerJSON
+	}}
+
+	result, err := RunGatedEditLoop(context.Background(), fake, workDir, "quick look", "", EditCaps{})
+	if err != nil {
+		t.Fatalf("early answer must finalize cleanly, got error: %v", err)
+	}
+	if result.Truncated {
+		t.Fatalf("early answer must not truncate")
+	}
+	if result.OmissionNotice != "" {
+		t.Fatalf("early answer must leave no omission notice, got: %q", result.OmissionNotice)
+	}
+	if fake.calls != 3 {
+		t.Fatalf("expected exactly 3 LLM calls, got %d", fake.calls)
+	}
+}
+
+func TestSummarizeGatedHistory_Unit(t *testing.T) {
+	short := "Context (diff text plus instructions):\nhead\n\nRequested improvement:\nfix\n"
+	if got := summarizeGatedHistory(short, 12000); got != short {
+		t.Fatalf("short history must pass through byte-identical")
+	}
+
+	const sentinel = "LAST-RESULT-VERBATIM"
+	var sb strings.Builder
+	sb.WriteString("Context (diff text plus instructions):\nseed context\n\nRequested improvement:\nfix\n")
+	for sb.Len() < 40000-len(sentinel) {
+		sb.WriteString("earlier round observation data 0123456789\n")
+	}
+	sb.WriteString(sentinel)
+	big := sb.String()
+	if len(big) <= 24000 {
+		t.Fatalf("test history must exceed the summarize threshold, got %d bytes", len(big))
+	}
+
+	out := summarizeGatedHistory(big, 12000)
+	if !strings.Contains(out, "[summarized:") {
+		t.Fatalf("long history must carry the summarizer marker")
+	}
+	if !strings.HasSuffix(out, sentinel) {
+		t.Fatalf("summarized history must keep the latest tail verbatim")
+	}
+	if tail := big[len(big)-12000:]; !strings.HasSuffix(out, tail) {
+		t.Fatalf("summarized history must keep the final 12000 bytes verbatim")
+	}
+	if !strings.Contains(out[:gatedHistoryHeadBytes], "Context (diff text plus instructions)") {
+		t.Fatalf("summarized head must preserve the instruction opener")
+	}
+}
+
+func TestTurnBudget_CancelledContextAborts(t *testing.T) {
+	workDir := t.TempDir()
+	fake := &scriptGatedLLM{fn: func(call int) string { return gatedAnswerJSON }}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := RunGatedEditLoop(ctx, fake, workDir, "cancelled run", "", EditCaps{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled context must abort with the ctx error, got: %v", err)
+	}
+	if fake.calls != 0 {
+		t.Fatalf("cancelled run must not call the model, got %d calls", fake.calls)
+	}
+}
+
+func TestTurnBudget_ViolationAbortStillFiresAtThree(t *testing.T) {
+	workDir := t.TempDir()
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		return `{"action":"run_command","command":["curl","https://example.com"]}`
+	}}
+
+	_, err := RunGatedEditLoop(context.Background(), fake, workDir, "refused cmds", "", EditCaps{})
+	if !errors.Is(err, ErrGatedEditViolationsExceeded) {
+		t.Fatalf("expected violation-limit error after budget change, got: %v", err)
+	}
+	if fake.calls != 3 {
+		t.Fatalf("violation abort must still fire at exactly 3, got %d calls", fake.calls)
 	}
 }
