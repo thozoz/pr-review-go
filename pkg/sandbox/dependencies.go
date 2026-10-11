@@ -72,6 +72,16 @@ func ValidateGoMod(workDir string) error {
 	return scanner.Err()
 }
 
+// isPythonProject reports whether a directory contains Python project descriptors.
+func isPythonProject(dir string) bool {
+	for _, f := range []string{"pyproject.toml", "requirements.txt", "setup.py", "poetry.lock"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // isRemoteModulePath reports whether a path looks like a remote module path (e.g., has a dotted first path element like example.com/pkg).
 func isRemoteModulePath(p string) bool {
 	if strings.HasPrefix(p, "./") || strings.HasPrefix(p, "../") || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
@@ -162,6 +172,28 @@ type PodmanDependencyPreparer struct {
 	GatewayCfg DependencyGatewayConfig
 }
 
+// ValidateFetchArgv gates stage-1 fetch commands (D-05, SAFE-01):
+// only the exact triple ["go", "mod", "download"] passes.
+// Any extra flag, tool (curl, wget, go get), or argv element attempting
+// environment overrides (e.g. GOFLAGS=..., GOPROXY=...) is rejected.
+func ValidateFetchArgv(argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("fetch argv is empty")
+	}
+	for _, arg := range argv {
+		if strings.HasPrefix(arg, "GOFLAGS=") || strings.HasPrefix(arg, "GOPROXY=") {
+			return fmt.Errorf("fetch argv rejected: environment override in argv: %s", arg)
+		}
+	}
+	if len(argv) != 3 {
+		return fmt.Errorf("fetch argv rejected: expected exact 3 elements [go mod download], got %d elements %v", len(argv), argv)
+	}
+	if argv[0] != "go" || argv[1] != "mod" || argv[2] != "download" {
+		return fmt.Errorf("fetch argv rejected: must be exactly [go mod download], got %v", argv)
+	}
+	return nil
+}
+
 func NewDependencyPreparer(backend *PodmanBackend, cfg *config.Config) *PodmanDependencyPreparer {
 	return &PodmanDependencyPreparer{
 		Backend: backend,
@@ -187,6 +219,15 @@ func (p *PodmanDependencyPreparer) PrepareDependencies(ctx context.Context, jobI
 	// 2. Check if go.mod exists
 	goModPath := filepath.Join(lease.WorkDir, "go.mod")
 	if _, err := os.Stat(goModPath); err != nil {
+		// Python projects return honest-incomplete: Python network fetch is not supported in stage 1 (D-03, D-05)
+		if isPythonProject(lease.WorkDir) {
+			return &StageResult{
+				StageName:    "prep",
+				Passed:       false,
+				IsIncomplete: true,
+				Stderr:       "INCOMPLETE: Python network fetch not supported in stage 1 (Go-first); rerun with vendored wheels or offline --no-index",
+			}, nil
+		}
 		// No go.mod; nothing to prepare
 		return &StageResult{
 			StageName: "prep",

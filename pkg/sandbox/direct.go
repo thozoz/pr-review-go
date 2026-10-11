@@ -322,6 +322,16 @@ func (d *DirectRunner) VerifyDir(ctx context.Context, dir, commitSHA string) (*V
 
 	env := buildDirectStageEnv(proj.offline)
 
+	// Lock Python scope to Go-first with honest-incomplete (D-03, D-05):
+	// any Python project whose install would need network returns StatusIncomplete.
+	if proj.lang == "python" && len(proj.installArgs) > 0 {
+		report.FailedStage = "install"
+		report.Status = StatusIncomplete
+		report.Reason = "INCOMPLETE: Python network fetch not supported in stage 1 (Go-first); rerun with vendored wheels or offline --no-index"
+		report.Summary = report.Reason
+		return report, nil
+	}
+
 	// Stage 0: Dependency installation (warms the cache the hermetic
 	// build/test stages rely on). Failure is Incomplete, not a code verdict.
 	if len(proj.installArgs) > 0 {
