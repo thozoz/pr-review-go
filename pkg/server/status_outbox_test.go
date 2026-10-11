@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,6 +152,89 @@ func TestQueuedStatusOutbox(t *testing.T) {
 
 		if posted.Load() != 0 {
 			t.Fatalf("delayed queued write must not post to GitHub for running job; got %d posts", posted.Load())
+		}
+	})
+
+	t.Run("MidPublishClaimDoesNotRevertToQueued", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "jobs.db")
+		store, err := OpenJobStore(dbPath, StoreOptions{BacklogLimit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		key, _ := MakePRKey("github.com", 1234, 1)
+		job := seedTestJob(t, store, key, "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222")
+
+		// Gate the status POST: the outbox reads the queued row, then blocks
+		// inside the publish call. While blocked, simulate the worker claim.
+		postEntered := make(chan struct{})
+		var postEnterOnce sync.Once
+		postRelease := make(chan struct{})
+		ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.URL.Path == "/user":
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 100, "login": "bot-user"})
+			case r.Method == "GET":
+				_ = json.NewEncoder(w).Encode([]any{})
+			case r.Method == "POST":
+				postEnterOnce.Do(func() { close(postEntered) })
+				<-postRelease
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 502, "body": "queued"})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer ghServer.Close()
+
+		gh, _ := ghclient.NewTestClient(ghServer.URL)
+		outbox := NewStatusOutbox(store, gh, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		outbox.Start(ctx)
+		defer outbox.Stop()
+
+		outbox.Wake()
+
+		select {
+		case <-postEntered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("outbox never reached the status POST")
+		}
+
+		// Claim lands mid-publish: the outbox holds a stale queued copy.
+		running := *job
+		running.Status = "running"
+		if err := store.UpdateJob(context.Background(), &running); err != nil {
+			t.Fatal(err)
+		}
+		close(postRelease)
+
+		// Wait for intent completion, then verify running survived with cid.
+		marker := fmt.Sprintf("<!-- pr-review-status:%s -->", job.ID)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			intent, err := store.GetOutputIntent(ctx, marker)
+			if err == nil && intent != nil && intent.Status == "completed" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("status intent never completed")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		stored, err := store.GetJob(context.Background(), job.ID)
+		if err != nil || stored == nil {
+			t.Fatalf("job missing after outbox publish: %v", err)
+		}
+		if stored.Status != "running" {
+			t.Fatalf("mid-publish claim must not revert to queued, got %q", stored.Status)
+		}
+		if stored.StatusCommentID != 502 {
+			t.Fatalf("expected StatusCommentID 502, got %d", stored.StatusCommentID)
 		}
 	})
 }
