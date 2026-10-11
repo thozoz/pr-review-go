@@ -98,6 +98,24 @@ func (p *Publication) ownedByID(ctx context.Context, owner, repo string, id int6
 	return true, false, c.GetBody(), nil
 }
 
+// saveStatusCommentID persists the status comment ID without disturbing the
+// job's current status. The passed job may predate a concurrent claim (the
+// outbox reads the row, then publishes over the network), so this re-reads the
+// freshest row and only patches StatusCommentID: overwriting running/terminal
+// status with a stale "queued" copy resurrects phantom backlog rows that flip
+// later admissions to 503.
+func (p *Publication) saveStatusCommentID(ctx context.Context, job *Job, id int64) error {
+	if job == nil {
+		return errors.New("nil job provided")
+	}
+	target := job
+	if fresh, err := p.store.GetJob(ctx, job.ID); err == nil && fresh != nil {
+		target = fresh
+	}
+	target.StatusCommentID = id
+	return p.store.UpdateJob(ctx, target)
+}
+
 // PublishStatus updates or creates a service-owned status comment for a job.
 // Every create/edit/replacement first commits a recoverable intent (body, stable
 // marker, exact head, digest, owner identity); if that commit fails no remote write
@@ -182,10 +200,10 @@ func (p *Publication) PublishStatus(ctx context.Context, job *Job, statusText st
 			return 0, err
 		}
 		if job.StatusCommentID != id {
-			job.StatusCommentID = id
-			if err := p.store.UpdateJob(ctx, job); err != nil {
+			if err := p.saveStatusCommentID(ctx, job, id); err != nil {
 				return 0, persistErr("save status comment id", err)
 			}
+			job.StatusCommentID = id
 		}
 		return finish(id)
 	}
@@ -238,10 +256,10 @@ func (p *Publication) PublishStatus(ctx context.Context, job *Job, statusText st
 	if err := p.store.UpdateOutputIntent(ctx, intent); err != nil {
 		return 0, persistErr("save created status comment id", err)
 	}
-	job.StatusCommentID = newID
-	if err := p.store.UpdateJob(ctx, job); err != nil {
+	if err := p.saveStatusCommentID(ctx, job, newID); err != nil {
 		return 0, persistErr("save status comment id on job", err)
 	}
+	job.StatusCommentID = newID
 	return finish(newID)
 }
 

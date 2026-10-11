@@ -897,6 +897,25 @@ func TestWebhookEndToEnd(t *testing.T) {
 			t.Fatalf("expected 200 for job 1, got %d", r1.Code)
 		}
 
+		// Wait for the async scheduler worker to claim job 1 (status leaves
+		// "queued") before filling the backlog. Claiming is asynchronous:
+		// admitting job 3 while job 1 is still unclaimed counts 2 queued
+		// jobs against the backlog of 2 and flakes 503.
+		claimDeadline := time.Now().Add(15 * time.Second)
+		for {
+			queued, err := srv.store.ListQueuedJobs(context.Background())
+			if err != nil {
+				t.Fatalf("ListQueuedJobs failed: %v", err)
+			}
+			if len(queued) == 0 {
+				break
+			}
+			if time.Now().After(claimDeadline) {
+				t.Fatalf("timed out waiting for worker to claim job 1 (still queued: %d)", len(queued))
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
 		// Job 2 is admitted into queue backlog
 		p2 := makePROpenedPayload(repoID, 72, shaBase, shaA, "alice")
 		r2 := sendSignedWebhook(srv.Routes(), secret, "pull_request", "deliv-qf-2", p2)

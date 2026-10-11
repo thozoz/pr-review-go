@@ -155,8 +155,12 @@ func (o *StatusOutbox) processIntent(ctx context.Context, intent *OutputIntent) 
 	}
 
 	if commentID > 0 {
-		job.StatusCommentID = commentID
-		_ = o.store.UpdateJob(ctx, job)
+		// PublishStatus already persisted the comment ID via
+		// saveStatusCommentID (status-preserving); here only complete the
+		// intent. Never write our entry-time job copy back: it may predate
+		// a concurrent claim, and overwriting running status with stale
+		// "queued" resurrects phantom backlog rows that flip later
+		// admissions to 503.
 		intent.Status = "completed"
 		intent.CommentID = commentID
 		_ = o.store.UpdateOutputIntent(ctx, intent)
