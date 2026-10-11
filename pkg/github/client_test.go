@@ -832,6 +832,10 @@ func TestServiceActor(t *testing.T) {
 					"name": "PR Bot App",
 				})
 			case "/users/pr-bot-app[bot]":
+				if auth := r.Header.Get("Authorization"); auth != "" {
+					http.Error(w, "expected no Authorization header on public user endpoint, got "+auth, http.StatusBadRequest)
+					return
+				}
 				json.NewEncoder(w).Encode(map[string]any{
 					"id":    8899,
 					"login": "pr-bot-app[bot]",
