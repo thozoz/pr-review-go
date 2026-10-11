@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/assistant"
-	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/config"
+	ghclient "github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
-	"github.com/thozoz/pr-review-go/pkg/reviewer"
 	"github.com/thozoz/pr-review-go/pkg/retry"
+	"github.com/thozoz/pr-review-go/pkg/reviewer"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
 
@@ -1093,6 +1093,15 @@ func (e *ServerJobExecutor) supersedeEditJob(ctx context.Context, job *Job, reas
 	return nil
 }
 
+func editCommandBackend(cfg *config.Config) func(context.Context, string, []string) (string, string, int, error) {
+	return func(ctx context.Context, workDir string, argv []string) (string, string, int, error) {
+		if cfg == nil || !cfg.EnableSandbox || cfg.SandboxMode != config.SandboxModeDirect {
+			return "", "", -1, fmt.Errorf("tool-unavailable: no job-owned Podman command container; host fallback refused")
+		}
+		return sandbox.InLoopCommand(ctx, workDir, argv, 0, 0)
+	}
+}
+
 func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error {
 	if e.server == nil {
 		return e.failEditJob(ctx, job, "server unavailable")
@@ -1157,9 +1166,7 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 				return platformRunner.RunSnapshotWithNetwork(vctx, vsnap, job.NetworkFetch, true)
 			}
 		}
-		inLoopBackend = func(ictx context.Context, workDir string, argv []string) (string, string, int, error) {
-			return sandbox.InLoopCommand(ictx, workDir, argv, 0, 0)
-		}
+		inLoopBackend = editCommandBackend(e.server.cfg)
 	}
 	loop := e.editLoop
 	if loop == nil {
@@ -1454,11 +1461,11 @@ type Scheduler struct {
 	// deferPollInterval bounds the idle wake when deferred attempts are
 	// parked: workers sleep at most this long before re-checking due jobs.
 	deferPollInterval time.Duration
-	mu          sync.Mutex
-	wakeCh      chan struct{}
-	stopCh      chan struct{}
-	stopped     bool
-	wg          sync.WaitGroup
+	mu                sync.Mutex
+	wakeCh            chan struct{}
+	stopCh            chan struct{}
+	stopped           bool
+	wg                sync.WaitGroup
 }
 
 func NewScheduler(store JobStore, executor JobExecutor, workers int) *Scheduler {
