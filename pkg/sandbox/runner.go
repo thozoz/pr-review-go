@@ -513,7 +513,7 @@ func (r *Runner) runSnapshotGated(ctx context.Context, snapshot *Snapshot, fetch
 	// Direct mode skips slot leasing, attestation, and containers: the
 	// snapshot source directory is verified in place on the trusted host.
 	if r.Direct != nil {
-		return r.runDirectSnapshot(ctx, snapshot)
+		return r.runDirectSnapshot(ctx, snapshot, fetchOK)
 	}
 
 	// On non-Linux platforms (macOS/Windows), build/test isolation is unavailable (D-02)

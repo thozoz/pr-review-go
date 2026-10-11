@@ -1073,6 +1073,7 @@ func (s *BoltJobStore) RecoverJobs(ctx context.Context) ([]*Job, error) {
 		jobsBucket := tx.Bucket(bucketJobs)
 		prsBucket := tx.Bucket(bucketPRs)
 		intentsBucket := tx.Bucket(bucketIntents)
+		decisionsBucket := tx.Bucket(bucketDecisions)
 
 		c := jobsBucket.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
@@ -1108,6 +1109,38 @@ func (s *BoltJobStore) RecoverJobs(ctx context.Context) ([]*Job, error) {
 				case "improve":
 					j.Status = "queued"
 					j.RecoveryPhase = "requeued_static"
+
+				case "approve", "request_changes":
+					// Decision jobs store outcome in bucketDecisions (DecisionLedger).
+					// If already recorded as published, job recovers to completed.
+					// Otherwise, parks as needs_attention for operator resolution.
+					decisionProven := false
+					if decisionsBucket != nil && j.HeadSHA != "" {
+						keyBytes := decisionLedgerKey(j.PRKey, j.HeadSHA)
+						if recBytes := decisionsBucket.Get(keyBytes); recBytes != nil {
+							var rec DecisionRecord
+							if err := json.Unmarshal(recBytes, &rec); err == nil && rec.Status == DecisionStatusPublished {
+								decisionProven = true
+							}
+						}
+					}
+					if !decisionProven {
+						marker := fmt.Sprintf("<!-- pr-%s-output:%s -->", j.Kind, j.ID)
+						if itBytes := intentsBucket.Get([]byte(marker)); itBytes != nil {
+							var it OutputIntent
+							if err := json.Unmarshal(itBytes, &it); err == nil && it.Status == "completed" {
+								decisionProven = true
+							}
+						}
+					}
+
+					if decisionProven {
+						j.Status = "completed"
+					} else {
+						j.Status = "needs_attention"
+						j.RecoveryPhase = "interrupted_unproven"
+						j.Error = "interrupted action cannot prove external outcome; requires operator resolution"
+					}
 
 				case "describe", "summary", "docs", "changelog", "assistant", "edit":
 					// Non-idempotent action, routed explicitly per kind (no silent
