@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -198,4 +200,113 @@ func TestRunner_RunSnapshot_DependencyStatuses(t *testing.T) {
 		}
 	})
 }
+
+func TestNetworkedHooksYieldIncomplete(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping container runner tests on non-linux host (requires linux container isolation)")
+	}
+	tempDir := t.TempDir()
+	sourceDir := filepath.Join(tempDir, "src")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	validSHA := "0123456789abcdef0123456789abcdef01234567"
+	snap := &Snapshot{
+		CommitSHA: validSHA,
+		SourceDir: sourceDir,
+	}
+
+	cases := []struct {
+		name   string
+		stderr string
+	}{
+		{
+			name:   "SetupPyExecutionNeedingNetwork",
+			stderr: "INCOMPLETE: setup.py install requires network access to index.python.org",
+		},
+		{
+			name:   "NetworkedGoGenerateCodegen",
+			stderr: "INCOMPLETE: go:generate tool failed: dial tcp 142.250.190.46:443: i/o timeout",
+		},
+		{
+			name:   "MissingCacheDownloadWithoutOptIn",
+			stderr: "INCOMPLETE: module download required but network fetch disabled (opt-in missing)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockSlot := newMockSlotManager(t)
+			r := &Runner{
+				Timeout:     5 * time.Minute,
+				SlotManager: mockSlot,
+				Backend:     newMockPodmanBackend(t),
+				DepPreparer: &mockDependencyPreparer{
+					result: &StageResult{
+						StageName:    "prep",
+						Passed:       false,
+						IsIncomplete: true,
+						Stderr:       tc.stderr,
+					},
+				},
+			}
+
+			report, err := r.RunSnapshotWithNetwork(context.Background(), snap, true, true)
+			if err != nil {
+				t.Fatalf("unexpected RunSnapshotWithNetwork error: %v", err)
+			}
+			if report.Status != StatusIncomplete {
+				t.Errorf("expected StatusIncomplete, got: %q", report.Status)
+			}
+			if report.Status == StatusPassed {
+				t.Errorf("never expected StatusPassed for networked hook")
+			}
+			if report.FailedStage != "prep" {
+				t.Errorf("expected FailedStage 'prep', got: %q", report.FailedStage)
+			}
+			if !strings.Contains(report.Reason, "INCOMPLETE:") {
+				t.Errorf("expected Reason to contain INCOMPLETE: prefix, got: %q", report.Reason)
+			}
+		})
+	}
+}
+
+func TestPythonNetworkFetch_YieldsIncomplete(t *testing.T) {
+	tempDir := t.TempDir()
+	sourceDir := filepath.Join(tempDir, "src")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "requirements.txt"), []byte("pytest==8.0.0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := &Snapshot{
+		CommitSHA: "0123456789abcdef0123456789abcdef01234567",
+		SourceDir: sourceDir,
+	}
+
+	r := &Runner{
+		Timeout: 5 * time.Minute,
+		Direct:  NewDirectRunner(2 * time.Minute),
+	}
+
+	report, err := r.RunSnapshot(context.Background(), snap)
+	if err != nil {
+		t.Fatalf("unexpected RunSnapshot error: %v", err)
+	}
+	if report.Status != StatusIncomplete {
+		t.Errorf("expected StatusIncomplete, got: %q", report.Status)
+	}
+	if report.Status == StatusPassed {
+		t.Errorf("never expected StatusPassed for Python network fetch")
+	}
+	const expected = "INCOMPLETE: Python network fetch not supported in stage 1 (Go-first); rerun with vendored wheels or offline --no-index"
+	if !strings.Contains(report.Reason, expected) {
+		t.Errorf("expected Reason to contain %q, got: %q", expected, report.Reason)
+	}
+}
+
+
 
