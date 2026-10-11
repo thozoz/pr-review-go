@@ -58,8 +58,14 @@ func ValidateGoMod(workDir string) error {
 		var replaceClause string
 		if inReplaceBlock {
 			replaceClause = line
-		} else if strings.HasPrefix(line, "replace ") {
-			replaceClause = strings.TrimPrefix(line, "replace ")
+		} else {
+			fields := strings.Fields(line)
+			if len(fields) > 1 && fields[0] == "replace" {
+				// Trim the leading "replace" token and any following whitespace
+				trimmed := strings.TrimSpace(line)
+				trimmed = strings.TrimPrefix(trimmed, "replace")
+				replaceClause = strings.TrimSpace(trimmed)
+			}
 		}
 
 		if replaceClause != "" {
