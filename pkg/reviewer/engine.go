@@ -55,8 +55,15 @@ func (e *Engine) SetSandbox(s *sandbox.Runner) {
 
 // ReviewPRAtHead verifies the expected commit OID, fetches PR details, ensures
 // the PR head matches expectedHead, retrieves the diff using GetDiffAtCommits,
-// and executes the review bound to that immutable head.
+// and executes the review bound to that immutable head offline (networkFetch=false).
 func (e *Engine) ReviewPRAtHead(ctx context.Context, owner, repo string, number int, expectedHead string) (*ReviewReport, error) {
+	return e.ReviewPRAtHeadWithNetwork(ctx, owner, repo, number, expectedHead, false, false)
+}
+
+// ReviewPRAtHeadWithNetwork verifies the expected commit OID, fetches PR details, ensures
+// the PR head matches expectedHead, retrieves the diff using GetDiffAtCommits,
+// and executes the review bound to that immutable head with optional network preparation.
+func (e *Engine) ReviewPRAtHeadWithNetwork(ctx context.Context, owner, repo string, number int, expectedHead string, networkFetch, trustedReverified bool) (*ReviewReport, error) {
 	if err := github.ValidateCommitOID(expectedHead); err != nil {
 		return nil, fmt.Errorf("invalid expected head commit OID: %w", err)
 	}
@@ -82,7 +89,7 @@ func (e *Engine) ReviewPRAtHead(ctx context.Context, owner, repo string, number 
 		return nil, fmt.Errorf("failed to fetch diff at commits: %w", err)
 	}
 
-	report, err := e.executeAgentReview(ctx, pr, diff)
+	report, err := e.executeAgentReview(ctx, pr, diff, networkFetch, trustedReverified)
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +112,7 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	return e.executeReview(ctx, pr, diff)
 }
 
-func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, rawDiff string) (*ReviewReport, error) {
+func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, rawDiff string, networkFetch, trustedReverified bool) (*ReviewReport, error) {
 	owner := pr.Owner
 	repo := pr.Repo
 	number := pr.Number
@@ -154,7 +161,7 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 			}
 
 			// Run sandbox verification
-			verReport, err := e.sandbox.RunSnapshot(ctx, snap)
+			verReport, err := e.sandbox.RunSnapshotWithNetwork(ctx, snap, networkFetch, trustedReverified)
 			if err == nil {
 				verificationStatus = verReport.Status
 				verificationReason = verReport.Reason

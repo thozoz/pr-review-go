@@ -844,4 +844,67 @@ func TestDependencyGateway_HostileRouteAttacks(t *testing.T) {
 	}
 }
 
+func TestDNSFlipPrivate(t *testing.T) {
+	sockDir := t.TempDir()
+	sockPath := filepath.Join(sockDir, "dns-flip.sock")
+
+	// Stub resolver that returns loopback at dial time (simulating a DNS rebinding flip)
+	stubLookup := func(ctx context.Context, network, host string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}
+
+	gw, err := StartDependencyGateway(DependencyGatewayConfig{
+		SocketPath:        sockPath,
+		ProxyBaseURL:      "https://proxy.golang.org",
+		AllowedHosts:      []string{"proxy.golang.org"},
+		AllowTestLoopback: false, // Ensure loopback is denied via isRestrictedIP
+		LookupIP:          stubLookup,
+	})
+	if err != nil {
+		t.Fatalf("failed to start dependency gateway: %v", err)
+	}
+	defer gw.Close()
+
+	client := newUnixClient(sockPath)
+	req, _ := http.NewRequest(http.MethodGet, "http://unix/golang.org/x/sync/@v/v0.7.0.info", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway && resp.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 502 or 403 for DNS flip to restricted IP, got: %d", resp.StatusCode)
+	}
+}
+
+func TestFetchArgvGate(t *testing.T) {
+	// 1. Exact triple passes
+	if err := ValidateFetchArgv([]string{"go", "mod", "download"}); err != nil {
+		t.Errorf("expected [go mod download] to pass, got: %v", err)
+	}
+
+	// 2. Reject alternatives, flags, environment overrides, and go generate
+	deniedCases := [][]string{
+		{},
+		{"curl", "https://proxy.golang.org"},
+		{"wget", "https://proxy.golang.org"},
+		{"go", "get", "golang.org/x/sync@v0.7.0"},
+		{"go", "mod", "download", "-x"},
+		{"go", "mod", "download", "-json"},
+		{"go", "mod", "download", "all"},
+		{"go", "mod", "download", "GOFLAGS=-mod=mod"},
+		{"GOFLAGS=-mod=mod", "go", "mod", "download"},
+		{"GOPROXY=direct", "go", "mod", "download"},
+		{"go", "generate", "./..."},
+	}
+
+	for _, argv := range deniedCases {
+		if err := ValidateFetchArgv(argv); err == nil {
+			t.Errorf("expected argv %v to be rejected, but it passed", argv)
+		}
+	}
+}
+
+
 

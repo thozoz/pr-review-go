@@ -30,6 +30,59 @@ var (
 	ErrDependencyRedirectLoop = errors.New("dependency gateway redirect loop or depth exceeded")
 )
 
+// PrivateFetchRefusal is the exact fixed refusal for private fetch signals in
+// stage 1 (D-05/D-12): private modules need credentials the stage-1 proxy
+// never holds, so GOPRIVATE/GONOSUMDB/GONOSUMCHECK/GOSUMDB=off and
+// GOFLAGS=-mod=mod/-insecure signals are refused, never silently downgraded.
+const PrivateFetchRefusal = "REFUSED: private module fetch not supported in stage 1"
+
+// privateFetchSignalled reports whether the given Go env values carry a
+// private-module fetch signal: any GOPRIVATE/GONOSUMDB/GONOSUMCHECK setting,
+// GOSUMDB=off, or GOFLAGS containing -mod=mod or -insecure.
+func privateFetchSignalled(goprivate, gonosumdb, gonosumcheck, gosumdb, goflags string) bool {
+	if goprivate != "" || gonosumdb != "" || gonosumcheck != "" {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(gosumdb), "off") {
+		return true
+	}
+	if strings.Contains(goflags, "-mod=mod") || strings.Contains(goflags, "-insecure") {
+		return true
+	}
+	return false
+}
+
+// PrivateFetchEnvRefusal inspects the process environment for private-module
+// fetch signals and returns PrivateFetchRefusal when any is set, or "" when
+// the environment is public-modules-only. Callers map a non-empty return to
+// an INCOMPLETE stage result, never to a silent downgrade.
+func PrivateFetchEnvRefusal() string {
+	if privateFetchSignalled(
+		os.Getenv("GOPRIVATE"),
+		os.Getenv("GONOSUMDB"),
+		os.Getenv("GONOSUMCHECK"),
+		os.Getenv("GOSUMDB"),
+		os.Getenv("GOFLAGS"),
+	) {
+		return PrivateFetchRefusal
+	}
+	return ""
+}
+
+// isPrivateFetchRequest reports whether a proxied gateway request carries a
+// private-module fetch signal in forwarded Go env headers. Stage-1 helpers
+// forward their hermetic env as headers so the proxy (outside the boundary)
+// enforces the same refusal the host-side env check enforces.
+func isPrivateFetchRequest(r *http.Request) bool {
+	return privateFetchSignalled(
+		r.Header.Get("GOPRIVATE"),
+		r.Header.Get("GONOSUMDB"),
+		r.Header.Get("GONOSUMCHECK"),
+		r.Header.Get("GOSUMDB"),
+		r.Header.Get("GOFLAGS"),
+	)
+}
+
 // GitGatewayConfig defines the configuration for the preparation-only Git data gateway.
 type GitGatewayConfig struct {
 	SocketPath        string        // Path to the Unix domain socket
@@ -394,6 +447,9 @@ type DependencyGatewayConfig struct {
 	MaxBodyBytes      int64         // Maximum streamed response size (default: 500 MiB)
 	RequestTimeout    time.Duration // Timeout for upstream requests (default: 2 minutes)
 	AllowTestLoopback bool          // Allow localhost/loopback destinations ONLY in automated test fixtures
+	UpstreamToken     string        // Optional proxy-side credential, injected under mutex per TokenHosts only; never sandbox env (D-12)
+	TokenHosts        []string      // Hosts eligible for proxy-side token injection (default: none — public fetch is keyless)
+	LookupIP          func(ctx context.Context, network, host string) ([]net.IP, error) // DNS resolver seam (default: net.DefaultResolver.LookupIP); tests pin DNS-flip denial
 	OnClose           func()        // Optional cleanup hook invoked on Close
 }
 
@@ -407,6 +463,35 @@ type DependencyGateway struct {
 	client   *http.Client
 	mu       sync.Mutex
 	closed   bool
+	// upstreamToken is the proxy-side credential, held outside the sandbox
+	// boundary and injected per TokenHosts only (D-12). Client-supplied auth
+	// headers are always stripped first; the sandbox env never carries creds.
+	upstreamToken string
+}
+
+// tokenForHost returns the proxy-side credential for host when host is an
+// eligible TokenHosts entry, or "" otherwise. Public-module fetch ships with
+// no token (keyless); private fetch is refused, never credentialed.
+func (g *DependencyGateway) tokenForHost(host string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.upstreamToken == "" {
+		return ""
+	}
+	h := strings.ToLower(host)
+	if hostOnly, _, err := net.SplitHostPort(h); err == nil {
+		h = hostOnly
+	}
+	for _, th := range g.cfg.TokenHosts {
+		t := strings.ToLower(th)
+		if tokenHostOnly, _, err := net.SplitHostPort(t); err == nil {
+			t = tokenHostOnly
+		}
+		if h == t {
+			return g.upstreamToken
+		}
+	}
+	return ""
 }
 
 func isAllowedHost(target string, allowed []string) bool {
@@ -503,6 +588,10 @@ func StartDependencyGateway(cfg DependencyGatewayConfig) (*DependencyGateway, er
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 2 * time.Minute
 	}
+	if cfg.LookupIP == nil {
+		cfg.LookupIP = net.DefaultResolver.LookupIP
+	}
+	resolveIP := cfg.LookupIP
 
 	proxyURL, err := url.Parse(cfg.ProxyBaseURL)
 	if err != nil {
@@ -540,7 +629,7 @@ func StartDependencyGateway(cfg DependencyGatewayConfig) (*DependencyGateway, er
 				return nil, fmt.Errorf("%w: host %s is not in allowed hosts %v", ErrDependencyHostDenied, host, cfg.AllowedHosts)
 			}
 
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			ips, err := resolveIP(ctx, "ip", host)
 			if err != nil {
 				return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
 			}
@@ -582,9 +671,10 @@ func StartDependencyGateway(cfg DependencyGatewayConfig) (*DependencyGateway, er
 	}
 
 	gw := &DependencyGateway{
-		cfg:      cfg,
-		listener: listener,
-		client:   client,
+		cfg:           cfg,
+		listener:      listener,
+		client:        client,
+		upstreamToken: cfg.UpstreamToken,
 	}
 
 	server := &http.Server{
@@ -605,6 +695,14 @@ func (g *DependencyGateway) handleRequest(w http.ResponseWriter, r *http.Request
 	// 1. Method check: only GET and HEAD permitted
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, ErrDependencyMethodDenied.Error(), http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 1b. Private-module fetch signals are refused with the fixed message:
+	// stage 1 holds no private credentials (D-12), and GOSUMDB stays on for
+	// public modules by default — GOSUMDB=off and its variants never downgrade.
+	if isPrivateFetchRequest(r) {
+		http.Error(w, PrivateFetchRefusal, http.StatusForbidden)
 		return
 	}
 
@@ -684,6 +782,12 @@ func (g *DependencyGateway) handleRequest(w http.ResponseWriter, r *http.Request
 	// Explicitly strip client auth headers
 	req.Header.Del("Authorization")
 	req.Header.Del("Proxy-Authorization")
+	// Proxy-side credential injection under mutex, per TokenHosts only:
+	// public-module fetch is keyless by default; creds never come from the
+	// sandbox env (D-12).
+	if tok := g.tokenForHost(baseParsed.Host); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 
 	// 6. Forward with bounded redirect handling (up to 3 hops)
 	currentReq := req
@@ -741,6 +845,11 @@ func (g *DependencyGateway) handleRequest(w http.ResponseWriter, r *http.Request
 				if val := currentReq.Header.Get(h); val != "" {
 					nextReq.Header.Set(h, val)
 				}
+			}
+			nextReq.Header.Del("Authorization")
+			nextReq.Header.Del("Proxy-Authorization")
+			if tok := g.tokenForHost(locURL.Host); tok != "" {
+				nextReq.Header.Set("Authorization", "Bearer "+tok)
 			}
 			currentReq = nextReq
 			continue

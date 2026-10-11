@@ -50,6 +50,9 @@ type EditCaps struct {
 	MaxTotalLines int
 	// MaxTotalBytes caps total bytes written. Zero means DefaultEditMaxTotalBytes.
 	MaxTotalBytes int
+	// RunCommandBackend optionally provides the in-loop exec backend for run_command.
+	// If nil, falls back to the package-level gatedRunCommandBackend.
+	RunCommandBackend func(ctx context.Context, workDir string, argv []string) (stdout string, stderr string, exitCode int, err error)
 }
 
 // DefaultEditCaps returns the plan-mandated bounds: 10 files, 500 lines, 1 MiB.
@@ -535,11 +538,15 @@ func RunGatedEditLoop(ctx context.Context, llmClient GatedEditLLM, workDir strin
 				}
 				break
 			}
-			if gatedRunCommandBackend == nil {
+			cmdBackend := caps.RunCommandBackend
+			if cmdBackend == nil {
+				cmdBackend = gatedRunCommandBackend
+			}
+			if cmdBackend == nil {
 				history += fmt.Sprintf("\nAction requested: run_command (command: %s)\nTool Result:\nError: tool-unavailable: no command backend is assigned; the allow-listed argv was accepted but not executed.\nNext action:", strings.Join(step.Command, " "))
 				break
 			}
-			stdout, stderr, exitCode, rErr := gatedRunCommandBackend(ctx, canonicalWorkDir, step.Command)
+			stdout, stderr, exitCode, rErr := cmdBackend(ctx, canonicalWorkDir, step.Command)
 			if rErr != nil {
 				history += fmt.Sprintf("\nAction requested: run_command (command: %s)\nTool Result:\nError: %v\nNext action:", strings.Join(step.Command, " "), rErr)
 				break
