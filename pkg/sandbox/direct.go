@@ -183,7 +183,16 @@ func buildDirectStageEnv(offline []string) []string {
 // directStage2WrapPrefix is the bwrap kernel network-removal prefix for
 // stage-2 exec on Linux CTs (T-07-01): a fresh network namespace with NO
 // socket bind. Env vars alone are advisory; this removes the interface.
-var directStage2WrapPrefix = []string{"bwrap", "--unshare-net", "--die-with-parent", "--new-session"}
+// Requires --unshare-user for unprivileged execution without setuid, and
+// --dev-bind / / to provide access to system libraries and toolchains.
+var directStage2WrapPrefix = []string{
+	"bwrap",
+	"--unshare-user",
+	"--unshare-net",
+	"--die-with-parent",
+	"--new-session",
+	"--dev-bind", "/", "/",
+}
 
 // bwrapNetIsolateArgv prepends the network-removal prefix to a stage-2 argv.
 // The wrapped command keeps its cwd, inherited (scrubbed) env, and fixed argv;
