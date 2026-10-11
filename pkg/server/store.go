@@ -125,6 +125,11 @@ type Job struct {
 	// unchanged and schema version stays 1.
 	NotBeforeAt     time.Time  `json:"not_before_at,omitempty"`
 	Payload         string     `json:"payload,omitempty"`
+	// NetworkFetch opts this job's agent tools into the gateway-mediated
+	// fetch path for this job only. False is the default (offline, D-02);
+	// true is valid only for the job that carried an explicit trusted
+	// opt-in (D-03) and resets to false at terminal state.
+	NetworkFetch    bool       `json:"network_fetch,omitempty"`
 	Error           string     `json:"error,omitempty"`
 }
 
