@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
 
 // Default edit-loop bounds (D-39).
@@ -164,6 +166,20 @@ func isGatedRefusedAction(act string) bool {
 // direct/podman-backed implementation). This plan asserts the argv gate, not
 // the backend.
 var gatedRunCommandBackend func(ctx context.Context, workDir string, argv []string) (stdout string, stderr string, exitCode int, err error)
+
+// SetGatedInLoopBackends wires the run_command tool to the sandbox in-loop
+// exec entries (Phase 06-03, D-03): podman exec into the writable /work mount
+// when a container ID is present, otherwise direct work-copy execution. The
+// seam passes argv only, never shell strings; no secret material of any kind
+// crosses it (token containment, T-05-02).
+func SetGatedInLoopBackends(runner *sandbox.Runner, containerID string) {
+	gatedRunCommandBackend = func(ctx context.Context, workDir string, argv []string) (string, string, int, error) {
+		if containerID != "" && runner != nil {
+			return runner.InLoopExecCommand(ctx, containerID, argv, 0, 0)
+		}
+		return sandbox.InLoopCommand(ctx, workDir, argv, 0, 0)
+	}
+}
 
 // gatedRunCommandAllowlist pins the runnable binary head to the build/test
 // matrix from pkg/sandbox/direct.go detectDirectProject. No shell, no
