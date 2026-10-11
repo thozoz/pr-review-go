@@ -59,6 +59,18 @@ func TestValidateGoMod_EscapingReplacement(t *testing.T) {
 			name:    "block parent traversal",
 			content: "module example.com/testmod\n\ngo 1.22\n\nreplace (\n\texample.com/foo => ../outside\n)\n",
 		},
+		{
+			name:    "tab separated parent traversal",
+			content: "module example.com/testmod\n\ngo 1.22\n\nreplace\texample.com/foo\t=>\t../outside\n",
+		},
+		{
+			name:    "multi space parent traversal",
+			content: "module example.com/testmod\n\ngo 1.22\n\nreplace   example.com/foo   =>   ../outside\n",
+		},
+		{
+			name:    "tab separated remote module swap",
+			content: "module example.com/testmod\n\ngo 1.22\n\nreplace\texample.com/foo\tv1.0.0\t=>\tevil.com/bar\tv1.0.0\n",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -77,6 +89,38 @@ func TestValidateGoMod_EscapingReplacement(t *testing.T) {
 				t.Fatalf("expected ErrEscapingReplacement, got: %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateGoMod_TabSeparatedReplace(t *testing.T) {
+	dir := t.TempDir()
+	content := "module example.com/testmod\n\ngo 1.22\n\nreplace\texample.com/a\t=>\t../escape\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ValidateGoMod(dir)
+	if err == nil {
+		t.Fatalf("expected tab-separated replacement to fail validation")
+	}
+	if !errors.Is(err, ErrEscapingReplacement) {
+		t.Fatalf("expected ErrEscapingReplacement, got: %v", err)
+	}
+}
+
+func TestValidateGoMod_MultiSpaceReplace(t *testing.T) {
+	dir := t.TempDir()
+	content := "module example.com/testmod\n\ngo 1.22\n\nreplace    example.com/a    =>    ../escape\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ValidateGoMod(dir)
+	if err == nil {
+		t.Fatalf("expected multi-space replacement to fail validation")
+	}
+	if !errors.Is(err, ErrEscapingReplacement) {
+		t.Fatalf("expected ErrEscapingReplacement, got: %v", err)
 	}
 }
 
