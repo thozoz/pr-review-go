@@ -3164,6 +3164,220 @@ func TestDecisionHead_AdvancedMidFlowPostsOldSHANotice(t *testing.T) {
 	}
 }
 
+func networkFetchTestServer(t *testing.T, permission string) (*Server, *httptest.Server, JobStore) {
+	t.Helper()
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/collaborators/") && strings.HasSuffix(r.URL.Path, "/permission") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"permission": permission})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(ghServer.Close)
+
+	ghClient, err := ghclient.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	store, err := OpenJobStore(filepath.Join(stateDir, "network_fetch.db"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := &config.Config{
+		GitHubToken:     "test-token",
+		LLMAPIKey:       "test-key",
+		LLMModel:        "test-model",
+		LLMBaseURL:      "http://example.invalid",
+		WebhookSecret:   testSecret,
+		WebhookStateDir: stateDir,
+	}
+	srv := NewServer(cfg)
+	srv.gh = ghClient
+	srv.engine = nil
+	srv.SetStore(store)
+	t.Cleanup(srv.Stop)
+	return srv, ghServer, store
+}
+
+func admitNetworkFetchJob(t *testing.T, store JobStore, job Job, deliveryID string) *Job {
+	t.Helper()
+	deliv := Delivery{
+		Host:        "github.com",
+		RepoID:      12345,
+		DeliveryID:  deliveryID,
+		EventKind:   "issue_comment",
+		ReceivedAt:  time.Now().UTC(),
+	}
+	res, err := store.Admit(context.Background(), deliv, []Job{job})
+	if err != nil || res.Status != AdmitAccepted {
+		t.Fatalf("admit failed: %v %+v", err, res)
+	}
+	queued, err := store.ListQueuedJobs(context.Background())
+	if err != nil || len(queued) == 0 {
+		t.Fatalf("expected queued job, got %v err=%v", queued, err)
+	}
+	for _, q := range queued {
+		if q.CommentID == job.CommentID && job.CommentID != 0 {
+			return q
+		}
+	}
+	return queued[0]
+}
+
+func TestNetworkFetchStaleTrustDenied(t *testing.T) {
+	// Allowed at admission (admitted directly to the ledger), revoked at
+	// execution: network denied fail-closed and the job fails with the exact
+	// error strings.
+	srv, _, store := networkFetchTestServer(t, "read") // DENIED at execution
+	prKey, _ := MakePRKey("github.com", 12345, 10)
+	admitted := admitNetworkFetchJob(t, store, Job{
+		Kind:         "labels",
+		Trigger:      "explicit",
+		Author:       "stale-dev",
+		CommentID:    5001,
+		PRKey:        prKey,
+		Owner:        "org",
+		Repo:         "repo",
+		PRNumber:     10,
+		NetworkFetch: true,
+	}, "deliv-net-stale-1")
+
+	exec := NewServerJobExecutor(srv, store)
+	err := exec.ExecuteJob(context.Background(), admitted)
+	if err == nil || !strings.Contains(err.Error(), "reauthorization denied: actor stale-dev") {
+		t.Fatalf("expected reauthorization denied error naming the actor, got %v", err)
+	}
+
+	jobAfter, _ := store.GetJob(context.Background(), admitted.ID)
+	if jobAfter == nil || jobAfter.Status != "failed" {
+		t.Fatalf("expected job status failed, got %+v", jobAfter)
+	}
+	if jobAfter.Error != "actor permission revoked or unavailable" {
+		t.Fatalf("expected exact revoke error, got %q", jobAfter.Error)
+	}
+	if jobAfter.NetworkFetch {
+		t.Fatalf("stale trust must reset NetworkFetch false: %+v", jobAfter)
+	}
+}
+
+func TestNetworkFetchAutoJobOffline(t *testing.T) {
+	// Stored true but Trigger automatic: execution runs with NetworkFetch
+	// false (D-02), regardless of the stored value.
+	srv, _, store := networkFetchTestServer(t, "write")
+	srv.labeler = nil // no-op labels: the execution-time flag value is what matters
+	prKey, _ := MakePRKey("github.com", 12345, 11)
+	admitted := admitNetworkFetchJob(t, store, Job{
+		Kind:         "labels",
+		Trigger:      "automatic",
+		Author:       "auto",
+		PRKey:        prKey,
+		Owner:        "org",
+		Repo:         "repo",
+		PRNumber:     11,
+		NetworkFetch: true,
+	}, "deliv-net-auto-1")
+
+	exec := NewServerJobExecutor(srv, store)
+	// Labels with no labeler is a no-op success; the execution-time value of
+	// the flag is what matters.
+	if err := exec.ExecuteJob(context.Background(), admitted); err != nil {
+		t.Fatalf("ExecuteJob failed: %v", err)
+	}
+	if admitted.NetworkFetch {
+		t.Fatalf("automatic job must run with NetworkFetch false despite stored true")
+	}
+}
+
+func TestNetworkFetchAllowedExplicitHonored(t *testing.T) {
+	// Trusted at execution: opt-in survives the gate and executes.
+	srv, _, store := networkFetchTestServer(t, "write") // ALLOWED
+	srv.labeler = nil // no-op labels: the execution-time flag value is what matters
+	prKey, _ := MakePRKey("github.com", 12345, 12)
+	admitted := admitNetworkFetchJob(t, store, Job{
+		Kind:         "labels",
+		Trigger:      "explicit",
+		Author:       "trusted-dev",
+		CommentID:    5002,
+		PRKey:        prKey,
+		Owner:        "org",
+		Repo:         "repo",
+		PRNumber:     12,
+		NetworkFetch: true,
+	}, "deliv-net-allow-exec-1")
+
+	exec := NewServerJobExecutor(srv, store)
+	if err := exec.ExecuteJob(context.Background(), admitted); err != nil {
+		t.Fatalf("ExecuteJob failed: %v", err)
+	}
+	if !admitted.NetworkFetch {
+		t.Fatalf("allowed explicit opt-in must keep NetworkFetch true during execution")
+	}
+}
+
+func TestNetworkFetchResetAfterTerminal(t *testing.T) {
+	srv, _, store := networkFetchTestServer(t, "write")
+	exec := NewServerJobExecutor(srv, store)
+	ctx := context.Background()
+	commentSeq := int64(6000)
+
+	for _, status := range []string{"completed", "failed", "superseded", "cancelled"} {
+		// Exercise the reset logic through a real terminal persist: admit a
+		// job, flip it terminal, persist via updateJob, read back.
+		prKey, _ := MakePRKey("github.com", 12345, 13)
+		admitted := admitNetworkFetchJob(t, store, Job{
+			Kind:      "labels",
+			Trigger:   "explicit",
+			Author:    "trusted-dev",
+			CommentID: commentSeq,
+			PRKey:     prKey,
+			Owner:     "org",
+			Repo:      "repo",
+			PRNumber:  13,
+			Payload:   status,
+		}, "deliv-net-reset-"+status)
+		commentSeq++
+		admitted.Status = status
+		admitted.NetworkFetch = true
+		if err := exec.updateJob(ctx, admitted); err != nil {
+			t.Fatalf("updateJob failed: %v", err)
+		}
+		after, _ := store.GetJob(ctx, admitted.ID)
+		if after.NetworkFetch {
+			t.Fatalf("terminal status %q must reset NetworkFetch false: %+v", status, after)
+		}
+	}
+
+	// Nonterminal persists keep the flag for the job's lifetime.
+	for _, status := range []string{"queued", "running", "uncertain", "needs_attention"} {
+		prKey, _ := MakePRKey("github.com", 12345, 14)
+		admitted := admitNetworkFetchJob(t, store, Job{
+			Kind:      "labels",
+			Trigger:   "explicit",
+			Author:    "trusted-dev",
+			CommentID: commentSeq,
+			PRKey:     prKey,
+			Owner:     "org",
+			Repo:      "repo",
+			PRNumber:  14,
+			Payload:   status,
+		}, "deliv-net-keep-"+status)
+		commentSeq++
+		admitted.Status = status
+		admitted.NetworkFetch = true
+		if err := exec.updateJob(ctx, admitted); err != nil {
+			t.Fatalf("updateJob failed: %v", err)
+		}
+		after, _ := store.GetJob(ctx, admitted.ID)
+		if !after.NetworkFetch {
+			t.Fatalf("nonterminal status %q must keep NetworkFetch true: %+v", status, after)
+		}
+	}
+}
+
 
 
 

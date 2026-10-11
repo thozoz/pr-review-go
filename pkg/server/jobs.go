@@ -82,8 +82,37 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 			job.Error = "actor permission revoked or unavailable"
 			now := time.Now().UTC()
 			job.FinishedAt = &now
-			_ = e.store.UpdateJob(jobCtx, job)
+			_ = e.updateJob(jobCtx, job)
 			return fmt.Errorf("reauthorization denied: actor %s", job.Author)
+		}
+	}
+
+	// Job-scoped network gate (D-01..D-03): automatic/untriggered jobs always
+	// run offline regardless of the stored flag. An explicit opt-in is
+	// re-verified fail-closed at execution time so stale trust denies and the
+	// flag never outlives the job.
+	if job.Trigger != "explicit" {
+		job.NetworkFetch = false
+	} else if job.NetworkFetch {
+		if e.server != nil && e.server.gh != nil {
+			netCtx, netCancel := context.WithTimeout(jobCtx, 5*time.Second)
+			netAllowed, netErr := e.server.gh.CanWriteRepository(netCtx, job.Owner, job.Repo, job.Author)
+			netCancel()
+			if netErr != nil || !netAllowed {
+				log.Printf("[jobs] Network reverify failed for %s by %q on %s/%s: allowed=%v err=%v",
+					job.ID, job.Author, job.Owner, job.Repo, netAllowed, netErr)
+				job.NetworkFetch = false
+				job.Status = "failed"
+				job.Error = "actor permission revoked or unavailable"
+				now := time.Now().UTC()
+				job.FinishedAt = &now
+				_ = e.updateJob(jobCtx, job)
+				return fmt.Errorf("reauthorization denied: actor %s", job.Author)
+			}
+		} else {
+			// Trust cannot be verified without a GitHub client: fail closed
+			// to offline rather than honoring a stored opt-in.
+			job.NetworkFetch = false
 		}
 	}
 
@@ -120,8 +149,20 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 	default:
 		job.Status = "failed"
 		job.Error = fmt.Sprintf("unknown job kind: %s", job.Kind)
-		return e.store.UpdateJob(jobCtx, job)
+		return e.updateJob(jobCtx, job)
 	}
+}
+
+// updateJob persists a job, resetting a job-scoped NetworkFetch opt-in once
+// the job reaches terminal state so trust never outlives the job (D-03
+// stale-trust). Nonterminal persists keep the flag for the job's lifetime,
+// including across deferred parks of the same job.
+func (e *ServerJobExecutor) updateJob(ctx context.Context, job *Job) error {
+	switch job.Status {
+	case "completed", "failed", "superseded", "cancelled":
+		job.NetworkFetch = false
+	}
+	return e.store.UpdateJob(ctx, job)
 }
 
 // deferCap resolves the maximum park duration for a deferred attempt: the
@@ -207,7 +248,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		job.Error = prErr.Error()
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return prErr
 	}
 
@@ -216,7 +257,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		job.Error = fmt.Sprintf("invalid live head SHA %s: %v", livePR.HeadSHA, err)
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return fmt.Errorf("invalid live head SHA: %w", err)
 	}
 
@@ -225,7 +266,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		job.Error = fmt.Sprintf("invalid live base SHA %s: %v", livePR.BaseSHA, err)
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return fmt.Errorf("invalid live base SHA: %w", err)
 	}
 
@@ -240,17 +281,17 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 				job.Status = "superseded"
 				now := time.Now().UTC()
 				job.FinishedAt = &now
-				_ = e.store.UpdateJob(ctx, job)
+				_ = e.updateJob(ctx, job)
 				return nil
 			}
 			job.HeadSHA = livePR.HeadSHA
 			job.BaseSHA = livePR.BaseSHA
-			_ = e.store.UpdateJob(ctx, job)
+			_ = e.updateJob(ctx, job)
 		} else {
 			// Explicit review retargets same request
 			job.HeadSHA = livePR.HeadSHA
 			job.BaseSHA = livePR.BaseSHA
-			_ = e.store.UpdateJob(ctx, job)
+			_ = e.updateJob(ctx, job)
 		}
 	}
 
@@ -295,7 +336,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		job.Error = err.Error()
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return err
 	}
 
@@ -327,12 +368,12 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 				job.Generation = prState.Generation
 			}
 			job.Status = "queued"
-			_ = e.store.UpdateJob(ctx, job)
+			_ = e.updateJob(ctx, job)
 		} else {
 			job.Status = "superseded"
 			now := time.Now().UTC()
 			job.FinishedAt = &now
-			_ = e.store.UpdateJob(ctx, job)
+			_ = e.updateJob(ctx, job)
 
 			// If head changed without a delivered event, schedule latest-head review intent using reserved successor
 			if headChanged && livePR2 != nil {
@@ -348,7 +389,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		job.Error = "OID/diff/source/report disagreement before publication"
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return errors.New("OID/diff/source/report disagreement before publication")
 	}
 
@@ -460,7 +501,7 @@ func (e *ServerJobExecutor) executeLabelsJob(ctx context.Context, job *Job) erro
 	}
 	now := time.Now().UTC()
 	job.FinishedAt = &now
-	_ = e.store.UpdateJob(ctx, job)
+	_ = e.updateJob(ctx, job)
 	return err
 }
 
@@ -477,7 +518,7 @@ func (e *ServerJobExecutor) executeDescribeJob(ctx context.Context, job *Job) er
 	}
 	now := time.Now().UTC()
 	job.FinishedAt = &now
-	_ = e.store.UpdateJob(ctx, job)
+	_ = e.updateJob(ctx, job)
 	return err
 }
 
@@ -488,7 +529,7 @@ func (e *ServerJobExecutor) markNeedsAttention(ctx context.Context, job *Job, re
 	job.Status = "needs_attention"
 	job.Error = reason
 	job.FinishedAt = nil
-	if err := e.store.UpdateJob(ctx, job); err != nil {
+	if err := e.updateJob(ctx, job); err != nil {
 		log.Printf("[jobs] Failed persisting needs_attention for %s: %v", job.ID, err)
 		return
 	}
@@ -526,7 +567,7 @@ func (e *ServerJobExecutor) executeImproveJob(ctx context.Context, job *Job) err
 	}
 	now := time.Now().UTC()
 	job.FinishedAt = &now
-	_ = e.store.UpdateJob(ctx, job)
+	_ = e.updateJob(ctx, job)
 	return err
 }
 
@@ -543,7 +584,7 @@ func (e *ServerJobExecutor) executeSummaryJob(ctx context.Context, job *Job) err
 	}
 	now := time.Now().UTC()
 	job.FinishedAt = &now
-	_ = e.store.UpdateJob(ctx, job)
+	_ = e.updateJob(ctx, job)
 	return err
 }
 
@@ -560,7 +601,7 @@ func (e *ServerJobExecutor) executeChangelogJob(ctx context.Context, job *Job) e
 	}
 	now := time.Now().UTC()
 	job.FinishedAt = &now
-	_ = e.store.UpdateJob(ctx, job)
+	_ = e.updateJob(ctx, job)
 	return err
 }
 
@@ -572,7 +613,7 @@ func (e *ServerJobExecutor) executeDocsJob(ctx context.Context, job *Job) error 
 	job.Status = "completed"
 	now := time.Now().UTC()
 	job.FinishedAt = &now
-	return e.store.UpdateJob(ctx, job)
+	return e.updateJob(ctx, job)
 }
 
 func (e *ServerJobExecutor) executeAssistantJob(ctx context.Context, job *Job) error {
@@ -588,7 +629,7 @@ func (e *ServerJobExecutor) executeAssistantJob(ctx context.Context, job *Job) e
 	}
 	now := time.Now().UTC()
 	job.FinishedAt = &now
-	_ = e.store.UpdateJob(ctx, job)
+	_ = e.updateJob(ctx, job)
 	return err
 }
 
@@ -625,7 +666,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		job.Error = "github client unavailable"
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return errors.New("github client unavailable")
 	}
 
@@ -637,7 +678,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		job.Error = "decision ledger unavailable"
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return errors.New("decision ledger unavailable")
 	}
 
@@ -652,7 +693,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		job.Error = prErr.Error()
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return prErr
 	}
 
@@ -661,7 +702,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		job.Error = fmt.Sprintf("invalid live head SHA %s: %v", livePR.HeadSHA, err)
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return fmt.Errorf("invalid live head SHA: %w", err)
 	}
 
@@ -678,7 +719,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		job.Error = fmt.Sprintf("voided by newer commit %s", livePR.HeadSHA)
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return nil
 	}
 
@@ -694,7 +735,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		job.Error = fmt.Sprintf("decision already recorded for head %s (job %s)", job.HeadSHA, existing.JobID)
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return nil
 	}
 
@@ -720,7 +761,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 			job.Error = rerr.Error()
 			now := time.Now().UTC()
 			job.FinishedAt = &now
-			_ = e.store.UpdateJob(ctx, job)
+			_ = e.updateJob(ctx, job)
 			return rerr
 		}
 	}
@@ -736,7 +777,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		job.BaseSHA = livePR2.BaseSHA
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return nil
 	}
 
@@ -779,7 +820,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 			job.Error = fmt.Sprintf("decision already recorded for head %s", job.HeadSHA)
 			now := time.Now().UTC()
 			job.FinishedAt = &now
-			_ = e.store.UpdateJob(ctx, job)
+			_ = e.updateJob(ctx, job)
 			return nil
 		}
 		if ghclient.IsUncertainWriteError(pubErr) {
@@ -789,7 +830,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 		job.Error = pubErr.Error()
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.store.UpdateJob(ctx, job)
+		_ = e.updateJob(ctx, job)
 		return pubErr
 	}
 	_ = res
@@ -810,7 +851,7 @@ func (e *ServerJobExecutor) executeDecisionJob(ctx context.Context, job *Job, ev
 	job.Status = "completed"
 	now := time.Now().UTC()
 	job.FinishedAt = &now
-	_ = e.store.UpdateJob(ctx, job)
+	_ = e.updateJob(ctx, job)
 	return nil
 }
 
@@ -1013,7 +1054,7 @@ func (e *ServerJobExecutor) failEditJob(ctx context.Context, job *Job, msg strin
 	if e.store == nil {
 		return errors.New(msg)
 	}
-	if uerr := e.store.UpdateJob(ctx, job); uerr != nil {
+	if uerr := e.updateJob(ctx, job); uerr != nil {
 		log.Printf("[jobs] Failed persisting failed edit job %s: %v", job.ID, uerr)
 	}
 	if msg == "" {
@@ -1030,7 +1071,7 @@ func (e *ServerJobExecutor) completeEditJob(ctx context.Context, job *Job) error
 	if e.store == nil {
 		return errors.New("job store unavailable")
 	}
-	if uerr := e.store.UpdateJob(ctx, job); uerr != nil {
+	if uerr := e.updateJob(ctx, job); uerr != nil {
 		log.Printf("[jobs] Failed persisting completed edit job %s: %v", job.ID, uerr)
 		return uerr
 	}
@@ -1045,7 +1086,7 @@ func (e *ServerJobExecutor) supersedeEditJob(ctx context.Context, job *Job, reas
 	if e.store == nil {
 		return errors.New("job store unavailable")
 	}
-	if uerr := e.store.UpdateJob(ctx, job); uerr != nil {
+	if uerr := e.updateJob(ctx, job); uerr != nil {
 		log.Printf("[jobs] Failed persisting superseded edit job %s: %v", job.ID, uerr)
 		return uerr
 	}
