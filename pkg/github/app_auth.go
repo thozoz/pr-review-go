@@ -323,7 +323,8 @@ func (a *AppAuth) GetServiceActor(ctx context.Context) (*ServiceActor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: create bot user request: %v", ErrServiceActorUnavailable, err)
 	}
-	userReq.Header.Set("Authorization", "Bearer "+jwt)
+	// GitHub public user endpoints reject App JWTs with 401 Bad credentials;
+	// /users/{username} is public and does not accept or require an App JWT.
 	userReq.Header.Set("Accept", "application/vnd.github+json")
 	userReq.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
@@ -491,11 +492,18 @@ func (a *AppAuth) CreateRetrievalCredential(ctx context.Context, owner, repo str
 		return nil, fmt.Errorf("returned token already expired: %v", result.ExpiresAt)
 	}
 
-	// Verify permissions strictly: exactly contents:read, no other permissions (SAFE-01)
+	// Verify permissions strictly: contents:read required; GitHub always includes
+	// mandatory "metadata": "read" on installation tokens (D-10).
 	if len(result.Permissions) == 0 {
 		return nil, fmt.Errorf("%w: missing permissions in token response", ErrScopeTooBroad)
 	}
 	for perm, val := range result.Permissions {
+		if perm == "metadata" {
+			if val != "read" {
+				return nil, fmt.Errorf("%w: metadata permission is %q (only read permitted)", ErrScopeTooBroad, val)
+			}
+			continue // GitHub always implicitly grants metadata:read to all tokens
+		}
 		if perm != "contents" {
 			return nil, fmt.Errorf("%w: token contains extra permission %q", ErrScopeTooBroad, perm)
 		}
@@ -683,11 +691,18 @@ func (a *AppAuth) CreatePushCredential(ctx context.Context, owner, repo string, 
 		return nil, fmt.Errorf("returned token already expired: %v", result.ExpiresAt)
 	}
 
-	// Verify permissions strictly: exactly contents:write, no other permissions (D-29)
+	// Verify permissions strictly: contents:write required; GitHub always includes
+	// mandatory "metadata": "read" on installation tokens (D-29).
 	if len(result.Permissions) == 0 {
 		return nil, fmt.Errorf("%w: missing permissions in token response", ErrScopeTooBroad)
 	}
 	for perm, val := range result.Permissions {
+		if perm == "metadata" {
+			if val != "read" {
+				return nil, fmt.Errorf("%w: metadata permission is %q (only read permitted)", ErrScopeTooBroad, val)
+			}
+			continue // GitHub always implicitly grants metadata:read to all tokens
+		}
 		if perm != "contents" {
 			return nil, fmt.Errorf("%w: token contains extra permission %q", ErrScopeTooBroad, perm)
 		}

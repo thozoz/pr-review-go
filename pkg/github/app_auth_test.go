@@ -936,7 +936,7 @@ func TestCreateRetrievalCredential_NarrowScopeExactHeadRepo(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"token":                "ghs_narrow_head_token_xyz999",
 				"expires_at":           time.Now().Add(1 * time.Hour),
-				"permissions":          map[string]string{"contents": "read"},
+				"permissions":          map[string]string{"contents": "read", "metadata": "read"},
 				"repository_selection": "selected",
 				"repositories": []map[string]any{
 					{"id": 887766, "name": "head-repo"},
@@ -1049,6 +1049,19 @@ func TestCreateRetrievalCredential_RejectsBroaderOrInvalidScope(t *testing.T) {
 				"permissions": map[string]string{"contents": "read", "issues": "read"},
 			},
 			wantErrSub: "too broad",
+		},
+		{
+			name:       "Metadata write permission returned (too broad)",
+			owner:      "org",
+			repo:       "repo",
+			repoID:     100,
+			statusCode: 201,
+			responseJSON: map[string]any{
+				"token":       "tok-meta-write",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "read", "metadata": "write"},
+			},
+			wantErrSub: "only read permitted",
 		},
 		{
 			name:       "Contents write permission returned (too broad)",
@@ -1356,7 +1369,7 @@ func TestCreatePushCredential_NarrowWriteScopeExactHeadRepo(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"token":                "ghs_narrow_push_token_xyz999",
 				"expires_at":           time.Now().Add(1 * time.Hour),
-				"permissions":          map[string]string{"contents": "write"},
+				"permissions":          map[string]string{"contents": "write", "metadata": "read"},
 				"repository_selection": "selected",
 				"repositories": []map[string]any{
 					{"id": 887766, "name": "head-repo"},
@@ -1447,6 +1460,16 @@ func TestCreatePushCredential_RejectsBroadScope(t *testing.T) {
 				"permissions": map[string]string{"contents": "write", "issues": "read"},
 			},
 			wantErrSub: "too broad",
+		},
+		{
+			name:   "Metadata write permission returned (too broad)",
+			repoID: 100,
+			responseJSON: map[string]any{
+				"token":       "tok-meta-write",
+				"expires_at":  time.Now().Add(1 * time.Hour),
+				"permissions": map[string]string{"contents": "write", "metadata": "write"},
+			},
+			wantErrSub: "only read permitted",
 		},
 		{
 			name:   "Contents read instead of write",
