@@ -409,10 +409,8 @@ func (r *Runner) InLoopExecCommand(ctx context.Context, containerID string, argv
 		if execCtx.Err() == context.DeadlineExceeded {
 			return stdout, stderr, 124, execCtx.Err()
 		}
-		if exitCode == 127 {
-			return stdout, stderr, 127, fmt.Errorf("%w: %q is missing in container %q (exit 127, in-loop command unavailable)", ErrInLoopToolchainMissing, argv[0], containerID)
-		}
-		return stdout, stderr, exitCode, nil
+		mappedCode, mapErr := mapInLoopPodmanExit(containerID, argv[0], exitCode)
+		return stdout, stderr, mappedCode, mapErr
 	}
 	return stdout, stderr, 0, nil
 }
@@ -453,4 +451,15 @@ func inLoopHeadAllowed(head string) bool {
 		}
 	}
 	return false
+}
+
+// mapInLoopPodmanExit maps a podman exec exit code to the in-loop result:
+// exit 127 (binary missing in the container) becomes the shared
+// ErrInLoopToolchainMissing unavailable shape — never a failed verdict —
+// while every other nonzero exit is an observation with a nil error.
+func mapInLoopPodmanExit(containerID, tool string, exitCode int) (int, error) {
+	if exitCode == 127 {
+		return 127, fmt.Errorf("%w: %q is missing in container %q (exit 127, in-loop command unavailable)", ErrInLoopToolchainMissing, tool, containerID)
+	}
+	return exitCode, nil
 }
