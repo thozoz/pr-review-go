@@ -183,15 +183,16 @@ func buildDirectStageEnv(offline []string) []string {
 // directStage2WrapPrefix is the bwrap kernel network-removal prefix for
 // stage-2 exec on Linux CTs (T-07-01): a fresh network namespace with NO
 // socket bind. Env vars alone are advisory; this removes the interface.
-// Requires --unshare-user for unprivileged execution without setuid, and
-// --dev-bind / / to provide access to system libraries and toolchains.
+// Legacy decision-test prefix only. Production execution uses
+// directIsolatedArgv with a private filesystem root and job-owned mounts.
 var directStage2WrapPrefix = []string{
 	"bwrap",
 	"--unshare-user",
 	"--unshare-net",
 	"--die-with-parent",
 	"--new-session",
-	"--dev-bind", "/", "/",
+	"--unshare-pid",
+	"--clearenv",
 }
 
 // bwrapNetIsolateArgv prepends the network-removal prefix to a stage-2 argv.
@@ -268,6 +269,12 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 		return report, nil
 	}
 	report.DetectedType = proj.lang
+	if proj.lang == "node" {
+		report.Status = StatusIncomplete
+		report.Reason = "Node dependency preparation is unsupported: installers and lifecycle scripts are disabled"
+		report.Summary = "INCOMPLETE: " + report.Reason
+		return report, nil
+	}
 
 	// Linux stage-2 network isolation (T-07-01, D-11): PR code never runs
 	// with the host network. When bwrap/userns isolation is unavailable the
@@ -275,6 +282,12 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 	// REDUCED-GUARANTEE — env vars alone are not a boundary, so execution
 	// is refused rather than silently passed.
 	linuxNetIsolated := false
+	if runtime.GOOS != "linux" {
+		report.Status = StatusUnavailable
+		report.Reason = "direct execution requires Linux filesystem and network isolation"
+		report.Summary = "UNAVAILABLE: " + report.Reason
+		return report, nil
+	}
 	if runtime.GOOS == "linux" {
 		if err := AttestBwrap(ctx); err != nil {
 			degraded := BwrapUnavailableReport(err.Error())
@@ -336,10 +349,16 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 	}
 
 	env := buildDirectStageEnv(proj.offline)
-	installEnv := env
-	if fetchOK && proj.lang == "go" {
-		// When authorized with --with-network, stage-0 dependency fetch runs without GOPROXY=off.
-		installEnv = buildDirectStageEnv([]string{"GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"})
+	cacheDir, tmpDir, cleanupDirs, err := directJobDirs()
+	if err != nil {
+		return nil, err
+	}
+	defer cleanupDirs()
+	if proj.lang == "node" {
+		report.Status = StatusIncomplete
+		report.Reason = "Node dependency preparation is unsupported: installers and lifecycle scripts are disabled"
+		report.Summary = "INCOMPLETE: " + report.Reason
+		return report, nil
 	}
 
 	// Lock Python scope to Go-first with honest-incomplete (D-03, D-05):
@@ -361,7 +380,20 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
 			return report, nil
 		}
-		installRes := runDirectStage(ctx, d.stageTimeout(), workDir, "install", proj.installArgs, installEnv)
+		var installRes *StageResult
+		if proj.lang != "go" || !fetchOK {
+			report.Status = StatusIncomplete
+			report.Reason = "dependency preparation requires supported authorized gateway fetch"
+			report.Summary = "INCOMPLETE: " + report.Reason
+			return report, nil
+		}
+		installRes, err = directPrepare(ctx, d.stageTimeout(), workDir, cacheDir, tmpDir)
+		if err != nil {
+			report.Status = StatusIncomplete
+			report.Reason = err.Error()
+			report.Summary = "INCOMPLETE: " + report.Reason
+			return report, nil
+		}
 		report.Results = append(report.Results, directExecutionResult(installRes))
 		if installRes.Truncated {
 			report.Truncated = true
@@ -379,7 +411,10 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 	if len(proj.buildArgs) > 0 {
 		buildArgv := proj.buildArgs
 		if linuxNetIsolated {
-			buildArgv = bwrapNetIsolateArgv(proj.buildArgs)
+			buildArgv, err = directIsolatedArgv(workDir, cacheDir, tmpDir, proj.buildArgs, "", "")
+			if err != nil {
+				return nil, err
+			}
 		}
 		buildRes := runDirectStage(ctx, d.stageTimeout(), workDir, "build", buildArgv, env)
 		report.Results = append(report.Results, directExecutionResult(buildRes))
@@ -404,7 +439,10 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 
 	stageTestArgv := testArgs
 	if linuxNetIsolated {
-		stageTestArgv = bwrapNetIsolateArgv(testArgs)
+		stageTestArgv, err = directIsolatedArgv(workDir, cacheDir, tmpDir, testArgs, "", "")
+		if err != nil {
+			return nil, err
+		}
 	}
 	testRes := runDirectStage(ctx, d.stageTimeout(), workDir, "test", stageTestArgv, env)
 	report.Results = append(report.Results, directExecutionResult(testRes))
@@ -620,7 +658,18 @@ func InLoopCommand(ctx context.Context, workDir string, argv []string, timeout t
 	// In-loop stage-2 exec gets the same kernel network removal as the outer
 	// stages on Linux CTs (T-07-01); without bwrap the command is refused
 	// with the D-11 honest-degradation signal, never run on host network.
-	execArgv, err := wrapDirectStage2Argv(ctx, argv)
+	if runtime.GOOS != "linux" {
+		return "", "", -1, fmt.Errorf("%w: Linux isolation required", ErrBwrapUnavailable)
+	}
+	if err := AttestBwrap(ctx); err != nil {
+		return "", "", -1, err
+	}
+	cache, tmp, cleanup, err := directJobDirs()
+	if err != nil {
+		return "", "", -1, err
+	}
+	defer cleanup()
+	execArgv, err := directIsolatedArgv(workDir, cache, tmp, argv, "", "")
 	if err != nil {
 		return "", "", -1, fmt.Errorf("%s (%v)", ReducedGuaranteeLabel, err)
 	}

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,12 @@ func writeDirectModule(t *testing.T, files map[string]string) string {
 
 func requireGoToolchain(t *testing.T) {
 	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("direct enforcement requires Linux; refusal tested separately")
+	}
+	if err := AttestBwrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go toolchain not installed")
 	}
@@ -38,8 +45,8 @@ func requireGoToolchain(t *testing.T) {
 func TestDirectRunner_Passing(t *testing.T) {
 	requireGoToolchain(t)
 	dir := writeDirectModule(t, map[string]string{
-		"go.mod":      "module example.com/directpass\n\ngo 1.24\n",
-		"main.go":     "package main\n\nfunc Add(a, b int) int { return a + b }\n\nfunc main() {}\n",
+		"go.mod":       "module example.com/directpass\n\ngo 1.24\n",
+		"main.go":      "package main\n\nfunc Add(a, b int) int { return a + b }\n\nfunc main() {}\n",
 		"main_test.go": "package main\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 5 {\n\t\tt.Fatal(\"bad add\")\n\t}\n}\n",
 	})
 
@@ -49,8 +56,12 @@ func TestDirectRunner_Passing(t *testing.T) {
 		t.Fatalf("VerifyDir error: %v", err)
 	}
 	if report.Status != StatusPassed {
+		outStr := ""
+		if len(report.Results) > 0 {
+			outStr = report.Results[0].Stdout
+		}
 		t.Fatalf("expected StatusPassed, got %q (%s)\nstdout: %s\nstderr: %s",
-			report.Status, report.Reason, report.Results[0].Stdout, lastResultStderr(report))
+			report.Status, report.Reason, outStr, lastResultStderr(report))
 	}
 	if len(report.Results) != 2 {
 		t.Fatalf("expected 2 stage results, got %d", len(report.Results))
@@ -88,8 +99,8 @@ func TestDirectRunner_BuildFailure(t *testing.T) {
 func TestDirectRunner_TestFailure(t *testing.T) {
 	requireGoToolchain(t)
 	dir := writeDirectModule(t, map[string]string{
-		"go.mod":      "module example.com/directtestfail\n\ngo 1.24\n",
-		"main.go":     "package main\n\nfunc Add(a, b int) int { return a + b }\n\nfunc main() {}\n",
+		"go.mod":       "module example.com/directtestfail\n\ngo 1.24\n",
+		"main.go":      "package main\n\nfunc Add(a, b int) int { return a + b }\n\nfunc main() {}\n",
 		"main_test.go": "package main\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 99 {\n\t\tt.Fatal(\"intentional failure\")\n\t}\n}\n",
 	})
 
@@ -122,8 +133,8 @@ func TestDirectRunner_NodePass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
 	}
-	if report.Status != StatusPassed {
-		t.Fatalf("expected StatusPassed, got %q (%s)", report.Status, report.Reason)
+	if report.Status != StatusIncomplete || len(report.Results) != 0 {
+		t.Fatalf("Node installer must be refused, got %q (%s)", report.Status, report.Reason)
 	}
 	if report.DetectedType != "node" {
 		t.Errorf("expected DetectedType node, got %q", report.DetectedType)
@@ -291,7 +302,8 @@ func TestDirectBwrapWrapPrefix(t *testing.T) {
 		"--unshare-net",
 		"--die-with-parent",
 		"--new-session",
-		"--dev-bind", "/", "/",
+		"--unshare-pid",
+		"--clearenv",
 	}
 	if len(wrapped) != len(argv)+len(expectedPrefix) {
 		t.Fatalf("wrapped argv length = %d, want %d", len(wrapped), len(argv)+len(expectedPrefix))

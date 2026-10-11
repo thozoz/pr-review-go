@@ -111,7 +111,15 @@ func TestOfflineDialOutLinux(t *testing.T) {
 	// prefix MUST observe isolation (exit 0) — dial failure, not env content.
 	wrapCtx, wrapCancel := context.WithTimeout(context.Background(), time.Minute)
 	defer wrapCancel()
-	wrapped := bwrapNetIsolateArgv([]string{"go", "run", probeSrc, target, sockPath})
+	cache, tmp, cleanup, err := directJobDirs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	wrapped, err := directIsolatedArgv(probeDir, cache, tmp, []string{"go", "run", "dialprobe.go", target, sockPath}, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	wrapCmd := exec.CommandContext(wrapCtx, wrapped[0], wrapped[1:]...)
 	wrapCmd.Dir = probeDir
 	if out, err := wrapCmd.CombinedOutput(); err != nil {

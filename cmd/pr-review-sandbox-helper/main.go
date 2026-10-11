@@ -254,11 +254,16 @@ func runPrepare(ctx context.Context, args []string) {
 		"GOPATH=/cache/go",
 		"HOME=/tmp",
 		"TMPDIR=/tmp",
-		"PATH=/usr/local/go/bin:/usr/bin:/bin",
+		"PATH=" + os.Getenv("PATH"),
+		"GOROOT=" + os.Getenv("GOROOT"),
+		"GO111MODULE=on",
 	}
 
-	out, err := downloadCmd.CombinedOutput()
-	outStr := string(out)
+	output := sandbox.NewLimitedCollector(sandbox.DefaultMaxRetainedBytes)
+	downloadCmd.Stdout = output
+	downloadCmd.Stderr = output
+	err = downloadCmd.Run()
+	outStr := output.Formatted("prepare")
 
 	if err != nil {
 		lowerOut := strings.ToLower(outStr)
@@ -300,4 +305,3 @@ func runPrepare(ctx context.Context, args []string) {
 		os.Exit(1)
 	}
 }
-
