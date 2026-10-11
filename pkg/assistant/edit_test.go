@@ -255,7 +255,7 @@ func TestGatedEdit_MaxLinesCapAbortsWithOmission(t *testing.T) {
 func TestGatedEdit_ViolationAbortAtThree(t *testing.T) {
 	workDir := t.TempDir()
 	fake := &scriptGatedLLM{fn: func(call int) string {
-		return `{"action":"run_command","command":"cat /etc/passwd"}`
+		return `{"action":"run_command","command":["curl","https://example.com"]}`
 	}}
 
 	_, err := RunGatedEditLoop(context.Background(), fake, workDir, "run cmd", "", EditCaps{})

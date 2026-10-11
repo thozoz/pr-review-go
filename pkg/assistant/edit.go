@@ -101,12 +101,15 @@ AVAILABLE ACTIONS:
 2. "list_files": List files in a directory inside the work copy. ({"action": "list_files", "path": "."})
 3. "write_file": Create a NEW file INSIDE the work copy only. ({"action": "write_file", "path": "path/to/file", "content": "full file content"}) Do NOT use write_file to overwrite an existing file; use str_replace for edits to existing files.
 4. "str_replace": Replace one exact occurrence of old_str with new_str in an existing file INSIDE the work copy. old_str must match EXACTLY ONCE; zero or multiple matches fail with no write. ({"action": "str_replace", "path": "path/to/file", "old_str": "exact text", "new_str": "replacement"})
-5. "answer": Finish and report what was changed. ({"action": "answer", "final_text": "summary of edits..."})
+5. "run_command": Run one allow-listed build/test command INSIDE the work copy (fixed argv only, no shell; binary must be one of go, npm, pnpm, yarn, pytest, python3, python, cargo, mvn, gradle, make). ({"action": "run_command", "command": ["go", "test", "./..."]})
+6. "grep": Search file contents inside the work copy (read-only). ({"action": "grep", "pattern": "text", "path": "."})
+7. "glob": Find files by name inside the work copy (read-only). ({"action": "glob", "pattern": "*.go", "path": "."})
+8. "answer": Finish and report what was changed. ({"action": "answer", "final_text": "summary of edits..."})
 
 STRICT RULES:
 - Every path must be relative to the work copy root (e.g. "pkg/foo/bar.go").
 - Absolute paths, parent-directory escapes (".."), and .git paths are rejected.
-- "run_command", "commit_and_push", "exec", "shell", and "push" are forbidden and will be refused. You cannot run commands or push; just edit files, then answer.
+- "commit_and_push", "exec", "shell", "push", "commit", "bash", and "delete_file" are forbidden and will be refused. Only the allow-listed run_command form above may execute anything; everything else is file edits, then answer.
 - Keep edits small and focused. You have up to 8 turns before the loop stops.
 - Output MUST be a single strict JSON object matching {"action": "...", ...}.
 - Never include markdown codeblocks surrounding your JSON tool calls.`
@@ -115,12 +118,14 @@ STRICT RULES:
 // for write_file, which the read-only ToolCallRequest cannot express, plus
 // patch (old_str/new_str) fields for the Phase 6 str_replace tool.
 type gatedToolCall struct {
-	Action    string `json:"action"`
-	Path      string `json:"path,omitempty"`
-	Content   string `json:"content,omitempty"`
-	FinalText string `json:"final_text,omitempty"`
-	OldStr    string `json:"old_str,omitempty"`
-	NewStr    string `json:"new_str,omitempty"`
+	Action    string   `json:"action"`
+	Path      string   `json:"path,omitempty"`
+	Content   string   `json:"content,omitempty"`
+	FinalText string   `json:"final_text,omitempty"`
+	OldStr    string   `json:"old_str,omitempty"`
+	NewStr    string   `json:"new_str,omitempty"`
+	Command   []string `json:"command,omitempty"`
+	Pattern   string   `json:"pattern,omitempty"`
 }
 
 func parseGatedToolCall(raw string) (*gatedToolCall, error) {
@@ -145,10 +150,158 @@ func parseGatedToolCall(raw string) (*gatedToolCall, error) {
 // which must stay byte-identical for the read-only paths.
 func isGatedRefusedAction(act string) bool {
 	switch strings.ToLower(strings.TrimSpace(act)) {
-	case "run_command", "commit_and_push", "exec", "shell", "push", "commit", "bash", "delete_file":
+	case "commit_and_push", "exec", "shell", "push", "commit", "bash", "delete_file":
 		return true
 	}
 	return false
+}
+
+// gatedRunCommandBackend executes an allow-listed argv with cwd pinned to the
+// work copy. It is nil by default: with no backend assigned the gated loop
+// reports tool-unavailable for well-formed commands (a later plan assigns the
+// direct/podman-backed implementation). This plan asserts the argv gate, not
+// the backend.
+var gatedRunCommandBackend func(ctx context.Context, workDir string, argv []string) (stdout string, stderr string, exitCode int, err error)
+
+// gatedRunCommandAllowlist pins the runnable binary head to the build/test
+// matrix from pkg/sandbox/direct.go detectDirectProject. No shell, no
+// network fetchers, no version-control or push binaries.
+var gatedRunCommandAllowlist = map[string]bool{
+	"go": true, "npm": true, "pnpm": true, "yarn": true,
+	"pytest": true, "python3": true, "python": true,
+	"cargo": true, "mvn": true, "gradle": true, "make": true,
+}
+
+// validateGatedRunCommand enforces the fixed-argv gate: 1..8 elements, an
+// allow-listed relative binary head, no shell metacharacters, no absolute
+// paths, and no parent-directory traversal in any element.
+func validateGatedRunCommand(argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("empty command argv")
+	}
+	if len(argv) > 8 {
+		return fmt.Errorf("command argv exceeds 8 elements")
+	}
+	head := argv[0]
+	if head == "" {
+		return fmt.Errorf("empty command binary")
+	}
+	if !gatedRunCommandAllowlist[head] {
+		return fmt.Errorf("binary %q is not in the run_command allow-list", head)
+	}
+	for i, el := range argv {
+		if strings.ContainsAny(el, ";&|$`\\\n\r") {
+			return fmt.Errorf("shell metacharacter in argv element %d", i)
+		}
+		if filepath.IsAbs(el) || filepath.VolumeName(el) != "" ||
+			strings.HasPrefix(el, "/") || strings.HasPrefix(el, "\\") {
+			return fmt.Errorf("absolute path in argv element %d", i)
+		}
+		if el == ".." || strings.HasPrefix(el, "../") || strings.HasPrefix(el, `..\`) {
+			return fmt.Errorf("parent-directory traversal in argv element %d", i)
+		}
+	}
+	return nil
+}
+
+// gatedGrepOutputCap bounds grep observations fed back into the loop.
+const gatedGrepOutputCap = 6000
+
+// gatedGrepFiles line-matches pattern with strings.Contains across every
+// readable file under userPath inside the jail. It is read-only: files are
+// opened through the same OpenRoot plus handle-verified read path as
+// read_file, and nothing is written.
+func gatedGrepFiles(canonicalWorkDir, userPath, pattern string) (string, error) {
+	p := userPath
+	if p == "" {
+		p = "."
+	}
+	listing, err := listWorkspaceFiles(canonicalWorkDir, p)
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	truncated := false
+	for _, rel := range strings.Split(listing, "\n") {
+		if rel == "" {
+			continue
+		}
+		slashRel := filepath.ToSlash(rel)
+		content, err := readWorkspaceFile(canonicalWorkDir, slashRel)
+		if err != nil {
+			continue // directories and unreadable entries are skipped
+		}
+		for i, line := range strings.Split(content, "\n") {
+			if strings.Contains(line, pattern) {
+				fmt.Fprintf(&sb, "%s:%d:%s\n", slashRel, i+1, line)
+				if sb.Len() > gatedGrepOutputCap {
+					truncated = true
+					break
+				}
+			}
+		}
+		if truncated {
+			break
+		}
+	}
+	out := sb.String()
+	if len(out) > gatedGrepOutputCap {
+		out = out[:gatedGrepOutputCap]
+	}
+	if truncated {
+		out += "\n...[truncated: grep output exceeds 6000 bytes]..."
+	}
+	return out, nil
+}
+
+// gatedGlobMaxEntries bounds glob observations fed back into the loop.
+const gatedGlobMaxEntries = 200
+
+// gatedGlobFiles matches pattern against file names under userPath inside the
+// jail. Patterns without a path separator match base names; patterns with a
+// separator match the full work-copy-relative slash path. Read-only: it only
+// lists through the jailed listWorkspaceFiles path and writes nothing.
+func gatedGlobFiles(canonicalWorkDir, userPath, pattern string) (string, error) {
+	p := userPath
+	if p == "" {
+		p = "."
+	}
+	listing, err := listWorkspaceFiles(canonicalWorkDir, p)
+	if err != nil {
+		return "", err
+	}
+	hasSep := strings.Contains(pattern, "/") || strings.Contains(pattern, "\\")
+	var matched []string
+	for _, rel := range strings.Split(listing, "\n") {
+		if rel == "" {
+			continue
+		}
+		slashRel := filepath.ToSlash(rel)
+		candidate := slashRel
+		matchPattern := pattern
+		if !hasSep {
+			candidate = slashRel[strings.LastIndex(slashRel, "/")+1:]
+		} else {
+			// Compare in OS-native form so separators match on every platform.
+			candidate = filepath.FromSlash(slashRel)
+			matchPattern = filepath.FromSlash(pattern)
+		}
+		ok, mErr := filepath.Match(matchPattern, candidate)
+		if mErr != nil {
+			return "", fmt.Errorf("invalid glob pattern: %w", mErr)
+		}
+		if ok {
+			matched = append(matched, slashRel)
+			if len(matched) > gatedGlobMaxEntries {
+				break
+			}
+		}
+	}
+	if len(matched) > gatedGlobMaxEntries {
+		matched = matched[:gatedGlobMaxEntries]
+		return strings.Join(matched, "\n") + "\n...[truncated: glob output exceeds 200 entries]...", nil
+	}
+	return strings.Join(matched, "\n"), nil
 }
 
 // RunGatedEditLoop applies one LLM-directed improvement inside workDir, the
@@ -202,7 +355,7 @@ func RunGatedEditLoop(ctx context.Context, llmClient GatedEditLLM, workDir strin
 		if isGatedRefusedAction(step.Action) {
 			violations++
 			refusal := fmt.Sprintf("Error: %s is disabled: the gated edit loop permits file edits only; command execution and push transport are not available.", step.Action)
-			history += fmt.Sprintf("\nAction requested: %s\nTool Result:\n%s\nNext action (write_file, read_file, list_files, or answer):",
+			history += fmt.Sprintf("\nAction requested: %s\nTool Result:\n%s\nNext action (read_file, list_files, write_file, str_replace, run_command, grep, glob, or answer):",
 				step.Action, refusal)
 			if violations >= MaxGatedEditViolations {
 				return result, fmt.Errorf("%w: refused %d forbidden attempts (%s)", ErrGatedEditViolationsExceeded, violations, step.Action)
@@ -304,8 +457,55 @@ func RunGatedEditLoop(ctx context.Context, llmClient GatedEditLLM, workDir strin
 			result.TotalLines += newLines
 			result.TotalBytes += newBytes
 			history += fmt.Sprintf("\nAction requested: str_replace (path: %s)\nTool Result:\nPatched 1 occurrence, wrote %d bytes.\nNext action (or answer):", step.Path, newBytes)
+		case "run_command":
+			if err := validateGatedRunCommand(step.Command); err != nil {
+				violations++
+				refusal := fmt.Sprintf("Error: %s is disabled: the gated edit loop permits file edits only; command execution and push transport are not available. (gate: %v)", step.Action, err)
+				history += fmt.Sprintf("\nAction requested: %s\nTool Result:\n%s\nNext action:",
+					step.Action, refusal)
+				if violations >= MaxGatedEditViolations {
+					return result, fmt.Errorf("%w: refused %d forbidden attempts (%s)", ErrGatedEditViolationsExceeded, violations, step.Action)
+				}
+				break
+			}
+			if gatedRunCommandBackend == nil {
+				history += fmt.Sprintf("\nAction requested: run_command (command: %s)\nTool Result:\nError: tool-unavailable: no command backend is assigned; the allow-listed argv was accepted but not executed.\nNext action:", strings.Join(step.Command, " "))
+				break
+			}
+			stdout, stderr, exitCode, rErr := gatedRunCommandBackend(ctx, canonicalWorkDir, step.Command)
+			if rErr != nil {
+				history += fmt.Sprintf("\nAction requested: run_command (command: %s)\nTool Result:\nError: %v\nNext action:", strings.Join(step.Command, " "), rErr)
+				break
+			}
+			observation := fmt.Sprintf("exit code: %d\nstdout:\n%s\nstderr:\n%s", exitCode, stdout, stderr)
+			if len(observation) > gatedGrepOutputCap {
+				observation = observation[:gatedGrepOutputCap] + "\n...[truncated: run_command output exceeds 6000 bytes]..."
+			}
+			history += fmt.Sprintf("\nAction requested: run_command (command: %s)\nTool Result:\n%s\nNext action:", strings.Join(step.Command, " "), observation)
+		case "grep":
+			if strings.TrimSpace(step.Pattern) == "" {
+				history += fmt.Sprintf("\nAction requested: grep\nTool Result:\nError: pattern must not be empty.\nNext action:")
+				break
+			}
+			out, gErr := gatedGrepFiles(canonicalWorkDir, step.Path, step.Pattern)
+			if gErr != nil {
+				history += fmt.Sprintf("\nAction requested: grep (pattern: %s, path: %s)\nTool Result:\nError: %v\nNext action:", step.Pattern, step.Path, gErr)
+			} else {
+				history += fmt.Sprintf("\nAction requested: grep (pattern: %s, path: %s)\nTool Result:\n```\n%s\n```\nNext action:", step.Pattern, step.Path, out)
+			}
+		case "glob":
+			if strings.TrimSpace(step.Pattern) == "" {
+				history += fmt.Sprintf("\nAction requested: glob\nTool Result:\nError: pattern must not be empty.\nNext action:")
+				break
+			}
+			matched, mErr := gatedGlobFiles(canonicalWorkDir, step.Path, step.Pattern)
+			if mErr != nil {
+				history += fmt.Sprintf("\nAction requested: glob (pattern: %s, path: %s)\nTool Result:\nError: %v\nNext action:", step.Pattern, step.Path, mErr)
+			} else {
+				history += fmt.Sprintf("\nAction requested: glob (pattern: %s, path: %s)\nTool Result:\n```\n%s\n```\nNext action:", step.Pattern, step.Path, matched)
+			}
 		default:
-			history += fmt.Sprintf("\nAction requested: %s\nTool Result:\nUnknown action: %s. Use read_file, list_files, write_file, str_replace, or answer.\nNext action:", step.Action, step.Action)
+			history += fmt.Sprintf("\nAction requested: %s\nTool Result:\nUnknown action: %s. Use read_file, list_files, write_file, str_replace, run_command, grep, glob, or answer.\nNext action:", step.Action, step.Action)
 		}
 	}
 
