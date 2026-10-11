@@ -468,6 +468,7 @@ func (p *Publication) ReconcileOutput(ctx context.Context, intent *OutputIntent)
 	// 5. Confirmed current-head publication: atomic terminal commit.
 	intent.Status = "completed"
 	job.Status = "completed"
+	job.NetworkFetch = false
 	job.Error = ""
 	now := time.Now().UTC()
 	job.FinishedAt = &now

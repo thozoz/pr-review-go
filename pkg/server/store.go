@@ -1882,6 +1882,11 @@ func (s *BoltJobStore) commitOutcome(ctx context.Context, intent *OutputIntent, 
 			return ErrGenerationChanged
 		}
 
+		// Defense-in-depth: terminal jobs must never persist with NetworkFetch true (T-07-07)
+		if job.Status == "completed" || job.Status == "failed" || job.Status == "superseded" {
+			job.NetworkFetch = false
+		}
+
 		jobRaw, err := json.Marshal(job)
 		if err != nil {
 			return err

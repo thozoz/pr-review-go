@@ -1224,6 +1224,26 @@ func TestPublicationDurability(t *testing.T) {
 			t.Fatalf("pr state after commit: %+v", after)
 		}
 	})
+
+	t.Run("TerminalOutcomeCommitResetsNetworkFetch", func(t *testing.T) {
+		e := newPubEnv(t)
+		in := e.saveReview("report")
+		job := *e.job
+		job.Status = "completed"
+		job.NetworkFetch = true
+		in.Status = "completed"
+
+		if err := e.store.CommitPublicationOutcome(ctx, in, &job, nil); err != nil {
+			t.Fatalf("CommitPublicationOutcome failed: %v", err)
+		}
+		persisted, err := e.store.GetJob(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("GetJob failed: %v", err)
+		}
+		if persisted.NetworkFetch {
+			t.Fatalf("expected NetworkFetch to be reset to false in BoltDB on terminal outcome, got true")
+		}
+	})
 }
 
 func TestPublicationHeadRecovery(t *testing.T) {
