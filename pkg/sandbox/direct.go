@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -425,4 +426,172 @@ func (r *Runner) runDirectSnapshot(ctx context.Context, snapshot *Snapshot) (*Ve
 	}
 	r.extractCustomRules(snapshot.SourceDir, report)
 	return report, nil
+}
+
+// In-loop command execution (Phase 06-03, D-03).
+//
+// InLoopCommand is the constrained exec entry for the gated ReAct loop's
+// run_command tool in direct mode. Commands run in the SAME work copy that
+// holds the edits (the caller passes the work-copy dir; VerifyDir-style
+// ephemeral copying is the outer pipeline's job, not the inner loop's).
+// Argv is resolved from the shared detectDirectProject matrix: only the
+// build/test rows for the detected project type may run. No shell, no
+// caller-supplied commands, cwd pinned to workDir, stdin detached, per-call
+// timeout, output capped. A passing inner command is advisory only; only the
+// outer platformRunner.RunSnapshot green authorizes push.
+const defaultInLoopMaxOutputBytes = 6000
+
+// ErrInLoopToolchainMissing reports a matrix-allowed binary absent from PATH
+// (direct) or from the container (podman exec exit 127). Callers map it to an
+// honest-unavailable completion (StatusUnavailable, never retried), never to
+// a failed verdict.
+var ErrInLoopToolchainMissing = errors.New("toolchain not installed")
+
+// inLoopMatrixMismatch is the shared rejection text both backends return
+// when argv is not a matrix row for the project.
+const inLoopMatrixMismatch = "in-loop command not in project matrix"
+
+// InLoopCommand runs one matrix-constrained build/test command in workDir.
+// It returns (stdout, stderr, exitCode, nil) for executed commands — a
+// nonzero exit is an observation, not an error — and ("", "", -1, err) for
+// gate rejections or (..., 127, err) wrapping ErrInLoopToolchainMissing when
+// the matrix-allowed binary is absent.
+func InLoopCommand(ctx context.Context, workDir string, argv []string, timeout time.Duration, maxOutputBytes int) (string, string, int, error) {
+	if err := validateInLoopArgv(argv); err != nil {
+		return "", "", -1, err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", -1, err
+	}
+	proj := detectDirectProject(workDir)
+	if proj == nil {
+		return "", "", -1, fmt.Errorf("%s: no recognized project in %q", inLoopMatrixMismatch, workDir)
+	}
+	if !inLoopArgvAllowed(argv, inLoopAllowedCommands(proj)) {
+		return "", "", -1, fmt.Errorf("%s: %q", inLoopMatrixMismatch, strings.Join(argv, " "))
+	}
+	if _, err := exec.LookPath(argv[0]); err != nil {
+		return "", "", 127, fmt.Errorf("%w: %q is missing on PATH (in-loop command unavailable)", ErrInLoopToolchainMissing, argv[0])
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	if maxOutputBytes <= 0 {
+		maxOutputBytes = defaultInLoopMaxOutputBytes
+	}
+	env := append(os.Environ(), proj.offline...)
+	return runInLoopDirectStage(ctx, timeout, workDir, argv, env, maxOutputBytes)
+}
+
+// validateInLoopArgv applies the element-level gate shared by both backends:
+// non-empty argv, no shell metacharacters, no parent-directory traversal.
+// Matrix-row membership is checked separately by each backend.
+func validateInLoopArgv(argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("in-loop command argv is empty")
+	}
+	for i, el := range argv {
+		if el == "" {
+			return fmt.Errorf("in-loop command argv element %d is empty", i)
+		}
+		if strings.ContainsAny(el, ";&|$`\\\n\r") {
+			return fmt.Errorf("in-loop command rejected: shell metacharacter in argv element %d", i)
+		}
+		if el == ".." || strings.HasPrefix(el, "../") || strings.HasPrefix(el, `..\`) ||
+			strings.Contains(el, "/../") || strings.Contains(el, `\..\`) {
+			return fmt.Errorf("in-loop command rejected: parent-directory traversal in argv element %d", i)
+		}
+	}
+	return nil
+}
+
+// inLoopAllowedCommands returns the runnable rows for one detected project:
+// the build argv plus every test-option row. Install rows are deliberately
+// excluded (network fetchers never run in-loop). Go additionally allows
+// vet, per the Phase 6 matrix (go build/vet/test).
+func inLoopAllowedCommands(proj *directProject) [][]string {
+	if proj == nil {
+		return nil
+	}
+	var out [][]string
+	if len(proj.buildArgs) > 0 {
+		out = append(out, append([]string(nil), proj.buildArgs...))
+	}
+	for _, candidate := range proj.testOptions {
+		if len(candidate) > 0 {
+			out = append(out, append([]string(nil), candidate...))
+		}
+	}
+	if proj.lang == "go" {
+		out = append(out, []string{"go", "vet", "./..."})
+	}
+	return out
+}
+
+// inLoopArgvAllowed reports whether argv exactly equals one allowed row.
+func inLoopArgvAllowed(argv []string, allowed [][]string) bool {
+	for _, row := range allowed {
+		if len(row) != len(argv) {
+			continue
+		}
+		match := true
+		for i := range row {
+			if row[i] != argv[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// runInLoopDirectStage mirrors runDirectStage (fixed argv only,
+// exec.CommandContext, cmd.Dir pinned, stdin detached) with a
+// caller-supplied per-stream byte cap and the in-loop truncation marker.
+// runDirectStage stays unexported and untouched: its 100 KiB Formatted
+// marker would be the wrong text here, so the equivalent is replicated with
+// the exact plan marker instead of re-truncating its formatted strings.
+func runInLoopDirectStage(ctx context.Context, timeout time.Duration, dir string, argv, env []string, maxOutputBytes int) (string, string, int, error) {
+	stageCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(stageCtx, argv[0], argv[1:]...)
+	cmd.Dir = dir
+	cmd.Env = env
+	// Detach from stdin so a hostile test cannot block on input.
+	cmd.Stdin = nil
+
+	stdoutCollector := NewLimitedCollector(maxOutputBytes)
+	stderrCollector := NewLimitedCollector(maxOutputBytes)
+	cmd.Stdout = stdoutCollector
+	cmd.Stderr = stderrCollector
+
+	runErr := cmd.Run()
+	stdout := formatInLoopOutput(stdoutCollector, maxOutputBytes)
+	stderr := formatInLoopOutput(stderrCollector, maxOutputBytes)
+
+	if runErr != nil {
+		exitCode := 1
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+		if stageCtx.Err() == context.DeadlineExceeded {
+			return stdout, stderr, 124, stageCtx.Err()
+		}
+		return stdout, stderr, exitCode, nil
+	}
+	return stdout, stderr, 0, nil
+}
+
+// formatInLoopOutput renders one capped stream with the exact in-loop
+// truncation marker shared by both backends.
+func formatInLoopOutput(c *LimitedCollector, maxOutputBytes int) string {
+	s := c.String()
+	if c.Truncated() {
+		s += fmt.Sprintf("\n...[truncated: command output exceeds %d bytes]...", maxOutputBytes)
+	}
+	return s
 }
