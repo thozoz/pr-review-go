@@ -12,7 +12,7 @@ Inspired by GitHub Copilot's agentic architecture and PR-Agent:
 7. **Documentation Report (`/add_docs`, `pkg/docgen`)**: Scans PR code for undocumented functions/types and reports missing comments without modifying files.
 8. **Effort Levels (`lite` vs `balanced`)**: Choose between fast diff-only inspection (`-effort lite`) and workspace-assisted review (`-effort balanced`).
 9. **Auto-Labeler (`/labels`)**: Context-aware categorization using PR title, description, and diff.
-10. **Atomic Changelog Updates (`/update-changelog`)**: Compares immutable commit SHAs and commits via GitHub GraphQL CAS (`createCommitOnBranch` with `expectedHeadOid`). Aborts cleanly if branch moves.
+10. **Atomic Changelog Updates (`/update_changelog`)**: Compares immutable commit SHAs and commits via GitHub GraphQL CAS (`createCommitOnBranch` with `expectedHeadOid`). Aborts cleanly if branch moves.
 11. **Daemonless & Lightweight**: Consumes only ~10-15 MB RAM as a daemon.
 
 ## Architecture
