@@ -2,9 +2,11 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -190,4 +192,172 @@ func lastResultStderr(report *VerificationReport) string {
 		return ""
 	}
 	return report.Results[len(report.Results)-1].Stderr
+}
+
+// TestDirectGoOfflineIncludesGoEnvOff pins the GOENV=off port: without it a
+// go.env file setting GOPROXY=https would re-enable fetch where env alone is
+// the boundary.
+func TestDirectGoOfflineIncludesGoEnvOff(t *testing.T) {
+	dir := writeDirectModule(t, map[string]string{"go.mod": "module example.com/goenvpin\n\ngo 1.24\n"})
+	proj := detectDirectProject(dir)
+	if proj == nil || proj.lang != "go" {
+		t.Fatalf("expected go project, got %+v", proj)
+	}
+	for _, want := range []string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"} {
+		found := false
+		for _, have := range proj.offline {
+			if have == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("go offline list must contain %q, got %q", want, proj.offline)
+		}
+	}
+}
+
+// TestDirectStageEnvScrubbed proves the keyless build: secret-bearing keys and
+// Go override keys are dropped from inheritance while the pinned offline list
+// and innocent vars survive.
+func TestDirectStageEnvScrubbed(t *testing.T) {
+	secrets := map[string]string{
+		"GH_TOKEN": "gh-test", "GITHUB_TOKEN": "ghs-test", "GITHUB_APP_KEY": "k",
+		"LLM_API_KEY": "llm", "LLM_BASE_URL": "u", "APP_BOT_TOKEN": "b",
+		"OPENAI_API_KEY": "o", "ANTHROPIC_API_KEY": "a",
+	}
+	for k, v := range secrets {
+		t.Setenv(k, v)
+	}
+	t.Setenv("GOFLAGS", "-mod=mod")
+	t.Setenv("GOPROXY", "https://proxy.golang.org")
+	t.Setenv("GONOSUMDB", "*")
+	t.Setenv("GONOSUMCHECK", "1")
+	t.Setenv("GOPRIVATE", "*")
+	t.Setenv("GOSUMDB", "off")
+	t.Setenv("MYAPP_FOO", "innocent")
+
+	env := buildDirectStageEnv([]string{"GOPROXY=off", "GOENV=off"})
+	has := func(key string) (string, bool) {
+		for _, kv := range env {
+			if kv == key || strings.HasPrefix(kv, key+"=") {
+				return kv, true
+			}
+		}
+		return "", false
+	}
+	for k := range secrets {
+		if kv, found := has(k); found {
+			t.Errorf("stage env must not contain secret key %q (got %q)", k, kv)
+		}
+	}
+	for _, k := range []string{"GOFLAGS", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB"} {
+		if kv, found := has(k); found {
+			t.Errorf("stage env must not inherit override %q (got %q)", k, kv)
+		}
+	}
+	if kv, found := has("GOPROXY"); !found || kv != "GOPROXY=off" {
+		t.Errorf("stage env must pin GOPROXY=off exactly, got %q found=%v", kv, found)
+	}
+	if kv, found := has("GOENV"); !found || kv != "GOENV=off" {
+		t.Errorf("stage env must pin GOENV=off exactly, got %q found=%v", kv, found)
+	}
+	// Exactly one GOPROXY entry: the inherited override was dropped, not doubled.
+	count := 0
+	for _, kv := range env {
+		if kv == "GOPROXY=off" || strings.HasPrefix(kv, "GOPROXY=") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly one GOPROXY entry, got %d in %q", count, env)
+	}
+	if _, found := has("MYAPP_FOO"); !found {
+		t.Error("innocent non-matching vars must survive the scrub")
+	}
+	if _, found := has("PATH"); !found {
+		t.Error("PATH must survive the scrub (toolchain must resolve)")
+	}
+}
+
+// TestDirectBwrapWrapPrefix proves the Linux wrap shape: kernel network
+// removal flags first, original argv as tail, and no socket bind anywhere.
+func TestDirectBwrapWrapPrefix(t *testing.T) {
+	argv := []string{"go", "build", "./..."}
+	wrapped := bwrapNetIsolateArgv(argv)
+	if len(wrapped) != len(argv)+4 {
+		t.Fatalf("wrapped argv length = %d, want %d", len(wrapped), len(argv)+4)
+	}
+	for i, want := range []string{"bwrap", "--unshare-net", "--die-with-parent", "--new-session"} {
+		if wrapped[i] != want {
+			t.Fatalf("wrapped argv[%d] = %q, want %q (full %q)", i, wrapped[i], want, wrapped)
+		}
+	}
+	for i, want := range argv {
+		if wrapped[i+4] != want {
+			t.Fatalf("wrapped tail[%d] = %q, want %q", i, wrapped[i+4], want)
+		}
+	}
+	joined := strings.Join(wrapped, " ")
+	for _, banned := range []string{"gateway.sock", "depgw-", "--bind", "--socket"} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("wrapped stage-2 argv must contain no %q (got %q)", banned, joined)
+		}
+	}
+}
+
+// TestDirectBwrapUnavailableIsUnavailable proves D-11 honest degradation: on
+// Linux without bwrap the wrap decision fails with the typed sentinel (the
+// caller maps it to StatusUnavailable + REDUCED-GUARANTEE, never a pass),
+// while off-Linux argv passes through for env-only execution.
+func TestDirectBwrapUnavailableIsUnavailable(t *testing.T) {
+	failAttest := func(context.Context) error {
+		return errors.Join(ErrBwrapUnavailable, errors.New("userns probe failed in test"))
+	}
+	argv := []string{"go", "test", "-race", "./..."}
+	if _, err := wrapDirectStage2ArgvForOS("linux", failAttest, context.Background(), argv); !errors.Is(err, ErrBwrapUnavailable) {
+		t.Fatalf("linux without bwrap must yield ErrBwrapUnavailable, got: %v", err)
+	}
+	report := BwrapUnavailableReport("userns probe failed in test")
+	if report.Status != StatusUnavailable {
+		t.Fatalf("degraded report must carry StatusUnavailable, got %q", report.Status)
+	}
+	if !strings.Contains(report.Reason, ReducedGuaranteeLabel) || !strings.Contains(report.Summary, ReducedGuaranteeLabel) {
+		t.Fatalf("degraded report must carry the REDUCED-GUARANTEE label, got reason=%q summary=%q", report.Reason, report.Summary)
+	}
+	if report.Status == StatusPassed {
+		t.Fatal("degraded report must never carry StatusPassed")
+	}
+	got, err := wrapDirectStage2ArgvForOS("windows", failAttest, context.Background(), argv)
+	if err != nil {
+		t.Fatalf("non-Linux must not attest, got error: %v", err)
+	}
+	if strings.Join(got, " ") != strings.Join(argv, " ") {
+		t.Fatalf("non-Linux argv must pass through unchanged, got %q", got)
+	}
+	okAttest := func(context.Context) error { return nil }
+	got, err = wrapDirectStage2ArgvForOS("linux", okAttest, context.Background(), argv)
+	if err != nil {
+		t.Fatalf("linux with bwrap must wrap, got error: %v", err)
+	}
+	if len(got) == 0 || got[0] != "bwrap" || !strings.Contains(strings.Join(got, " "), "--unshare-net") {
+		t.Fatalf("linux with bwrap must return the unshare-net wrap, got %q", got)
+	}
+}
+
+// TestInLoopNoGenerateRow pins the plan invariant: go generate is never an
+// allowed in-loop row (it executes arbitrary directives).
+func TestInLoopNoGenerateRow(t *testing.T) {
+	dir := writeDirectModule(t, map[string]string{"go.mod": "module example.com/nogen\n\ngo 1.24\n"})
+	proj := detectDirectProject(dir)
+	if proj == nil {
+		t.Fatal("expected go project")
+	}
+	for _, row := range inLoopAllowedCommands(proj) {
+		for _, el := range row {
+			if el == "generate" {
+				t.Fatalf("in-loop matrix must never admit go generate (row %q)", row)
+			}
+		}
+	}
 }
