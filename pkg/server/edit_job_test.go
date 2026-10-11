@@ -836,3 +836,167 @@ func TestEditJobDispatchViaExecuteJob(t *testing.T) {
 		t.Fatalf("commitCalls = %d, want 1 via dispatch", h.gh.commitCalls)
 	}
 }
+
+// ReAct wiring cases (plan 06-04, Task 2, D-04). Mock-based on the existing
+// fakes: no live credentials, no Podman. Every case asserts exact push-call
+// accounting (0 or 1, never more).
+
+func TestEditCommentShape_TurnExhaustionPartial(t *testing.T) {
+	h := newEditHarness(t)
+	// Inner loop stub: 15 rounds spent, truncation with the exact plan
+	// omission notice; nothing pushed because the outer gate stays red.
+	h.editResult = assistant.EditResult{
+		FilesChanged:   []string{"a.go"},
+		TotalLines:     2,
+		TotalBytes:     16,
+		Truncated:      true,
+		OmissionNotice: "turn budget exhausted after 15 turns; further edits omitted",
+	}
+	h.reportStates = []sandbox.VerificationStatus{
+		sandbox.StatusTestFailed, sandbox.StatusTestFailed, sandbox.StatusTestFailed,
+	}
+	h.reportNote = "assertion failed: want 99"
+	job := h.admitEdit(t, 7, editTestHead, editTestBase, "alice", "fix it with exhausted budget", 801)
+	after, _ := h.run(t, job)
+	if after.Status != "failed" {
+		t.Fatalf("status = %q, want failed", after.Status)
+	}
+	if h.verifyCalls != editVerifyMaxAttempts {
+		t.Fatalf("verifyCalls = %d, want %d", h.verifyCalls, editVerifyMaxAttempts)
+	}
+	if h.gh.commitCalls != 0 || h.gh.minted != 0 {
+		t.Fatalf("commits=%d minted=%d, want 0/0", h.gh.commitCalls, h.gh.minted)
+	}
+	text := h.publishedText()
+	if !strings.Contains(text, "Partial:") {
+		t.Fatalf("terminal comment must carry Partial: notice, got: %q", text)
+	}
+	if !strings.Contains(text, "turn budget exhausted after 15 turns") {
+		t.Fatalf("terminal comment must carry turn-exhaustion omission, got: %q", text)
+	}
+}
+
+func TestEditCommentShape_AdvisoryGreenOuterRed(t *testing.T) {
+	h := newEditHarness(t)
+	// Inner stub reports advisory changes; the outer RunSnapshot gate stays
+	// red through all retries, so nothing pushes.
+	h.reportStates = []sandbox.VerificationStatus{
+		sandbox.StatusTestFailed, sandbox.StatusTestFailed, sandbox.StatusTestFailed,
+	}
+	h.reportNote = "advisory inner pass, outer red"
+	job := h.admitEdit(t, 7, editTestHead, editTestBase, "alice", "advisory green outer red", 802)
+	after, _ := h.run(t, job)
+	if after.Status != "failed" {
+		t.Fatalf("status = %q, want failed", after.Status)
+	}
+	if h.gh.commitCalls != 0 || h.gh.minted != 0 {
+		t.Fatalf("commits=%d minted=%d, want 0/0", h.gh.commitCalls, h.gh.minted)
+	}
+	if !strings.Contains(h.publishedText(), "Verification did not pass") {
+		t.Fatalf("missing verification-did-not-pass comment, got: %q", h.publishedText())
+	}
+	if strings.Contains(h.publishedText(), "Partial:") {
+		t.Fatalf("non-truncated run must not carry Partial:, got: %q", h.publishedText())
+	}
+}
+
+func TestEditCommentShape_FinalSummaryFields(t *testing.T) {
+	h := newEditHarness(t)
+	job := h.admitEdit(t, 7, editTestHead, editTestBase, "alice", "final shape happy path", 803)
+	after, err := h.run(t, job)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if after.Status != "completed" {
+		t.Fatalf("status = %q, want completed", after.Status)
+	}
+	if h.gh.commitCalls != 1 {
+		t.Fatalf("commitCalls = %d, want exactly 1", h.gh.commitCalls)
+	}
+	text := h.publishedText()
+	for _, want := range []string{"Files changed", "Verification: passed", "Commit:", editTestNew} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("final summary must contain %q, got: %q", want, text)
+		}
+	}
+}
+
+func TestEditCommentShape_NoMidLoopStream(t *testing.T) {
+	h := newEditHarness(t)
+	// Route status text through the fake GitHub surface so PostComment order
+	// is observable; the injected publisher would bypass it.
+	h.exec.editPublish = nil
+	const inLoopSentinel = "in-loop-sentinel-7f3a9c"
+	var loopObserved []string
+	h.exec.editLoop = func(_ context.Context, _, instruction, sticky string) (assistant.EditResult, error) {
+		h.instrSeen = append(h.instrSeen, instruction)
+		h.stickySeen = append(h.stickySeen, sticky)
+		// Three scripted inner rounds where two run_command observations
+		// failed: all of it stays inside the loop, only the final result
+		// crosses the seam.
+		loopObserved = append(loopObserved,
+			"round 1 run_command failed: "+inLoopSentinel,
+			"round 2 run_command failed: "+inLoopSentinel,
+			"round 3 str_replace applied",
+		)
+		return h.editResult, h.editErr
+	}
+	job := h.admitEdit(t, 7, editTestHead, editTestBase, "alice", "no stream check", 804)
+	after, err := h.run(t, job)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if after.Status != "completed" {
+		t.Fatalf("status = %q, want completed", after.Status)
+	}
+	if len(loopObserved) != 3 {
+		t.Fatalf("loop observations = %d, want 3 scripted rounds", len(loopObserved))
+	}
+	comments := h.gh.comments
+	editIdx, finalIdx := -1, -1
+	for i, c := range comments {
+		if strings.Contains(c, inLoopSentinel) {
+			t.Fatalf("mid-loop tool output leaked into comment %d: %q", i, c)
+		}
+		if strings.Contains(c, "Editing") {
+			editIdx = i
+		}
+		if strings.Contains(c, "Files changed") {
+			finalIdx = i
+		}
+	}
+	if editIdx < 0 || finalIdx < 0 || finalIdx <= editIdx {
+		t.Fatalf("editing idx=%d final idx=%d, want ordered pair in %q", editIdx, finalIdx, comments)
+	}
+	// Only the locked-pipeline verifying transition may sit between the
+	// editing transition and the final summary: zero mid-loop comments.
+	between := comments[editIdx+1 : finalIdx]
+	if len(between) != 1 || !strings.Contains(between[0], "Verifying") {
+		t.Fatalf("want exactly the verifying transition between editing and summary, got %q", between)
+	}
+	if h.gh.commitCalls != 1 {
+		t.Fatalf("commitCalls = %d, want exactly 1", h.gh.commitCalls)
+	}
+}
+
+func TestEditVerifyFeedback_TailCap6000(t *testing.T) {
+	const marker = "...[truncated: failure output exceeds 6000 bytes]..."
+	big := strings.Repeat("E", 9000)
+	rep := &sandbox.VerificationReport{
+		Status: sandbox.StatusTestFailed,
+		Reason: "failing stage",
+		Results: []sandbox.ExecutionResult{
+			{Command: "go test ./...", ExitCode: 1, Passed: false, Stderr: big},
+		},
+	}
+	out := editVerifyFeedback(rep)
+	if !strings.Contains(out, marker) {
+		t.Fatalf("feedback must carry byte-exact tail-cap marker, got %q", out)
+	}
+	if strings.Contains(out, big) {
+		t.Fatalf("feedback must not carry the full oversized stderr")
+	}
+	if !strings.Contains(out, big[:editVerifyFeedbackMaxBytes]) {
+		t.Fatalf("feedback must keep the head %d bytes of stderr", editVerifyFeedbackMaxBytes)
+	}
+}
