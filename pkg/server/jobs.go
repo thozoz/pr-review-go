@@ -358,6 +358,15 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 	if len(boundedMarkdown) > MaxReviewBodyBytes {
 		boundedMarkdown = boundedMarkdown[:MaxReviewBodyBytes]
 	}
+	// Final summary carries the network marking once; reserve room so the
+	// append never pushes the intent over the 128 KiB bound.
+	if job.NetworkFetch && !strings.Contains(boundedMarkdown, NetworkFetchStatusLine) {
+		room := MaxReviewBodyBytes - len(NetworkFetchStatusLine) - 2
+		if len(boundedMarkdown) > room {
+			boundedMarkdown = boundedMarkdown[:room]
+		}
+		boundedMarkdown += "\n\n" + NetworkFetchStatusLine
+	}
 
 	reviewIntent := &OutputIntent{
 		Marker:    reviewMarker,
@@ -386,6 +395,7 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 // job (nonterminal, preserved for recovery); remote-only status failures are
 // logged since the comment is cosmetic and the saved intent keeps it recoverable.
 func (e *ServerJobExecutor) publishStatus(ctx context.Context, pub *Publication, job *Job, text string) error {
+	text = appendNetworkFetchLine(text, job.NetworkFetch)
 	id, err := pub.PublishStatus(ctx, job, text)
 	if id > 0 {
 		job.StatusCommentID = id
@@ -1086,6 +1096,7 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 	// say posts user-facing text best-effort: the durable terminal state is
 	// authoritative, so a cosmetic comment failure never flips the outcome.
 	say := func(text string) {
+		text = appendNetworkFetchLine(text, job.NetworkFetch)
 		if err := publish(ctx, job, text); err != nil {
 			log.Printf("[jobs] Edit comment for %s failed (continuing): %v", job.ID, err)
 		}
