@@ -99,8 +99,9 @@ You apply a single requested improvement to the files in the work copy.
 AVAILABLE ACTIONS:
 1. "read_file": Read a file inside the work copy. ({"action": "read_file", "path": "path/to/file"})
 2. "list_files": List files in a directory inside the work copy. ({"action": "list_files", "path": "."})
-3. "write_file": Create or overwrite a file INSIDE the work copy only. ({"action": "write_file", "path": "path/to/file", "content": "full file content"})
-4. "answer": Finish and report what was changed. ({"action": "answer", "final_text": "summary of edits..."})
+3. "write_file": Create a NEW file INSIDE the work copy only. ({"action": "write_file", "path": "path/to/file", "content": "full file content"}) Do NOT use write_file to overwrite an existing file; use str_replace for edits to existing files.
+4. "str_replace": Replace one exact occurrence of old_str with new_str in an existing file INSIDE the work copy. old_str must match EXACTLY ONCE; zero or multiple matches fail with no write. ({"action": "str_replace", "path": "path/to/file", "old_str": "exact text", "new_str": "replacement"})
+5. "answer": Finish and report what was changed. ({"action": "answer", "final_text": "summary of edits..."})
 
 STRICT RULES:
 - Every path must be relative to the work copy root (e.g. "pkg/foo/bar.go").
@@ -111,12 +112,15 @@ STRICT RULES:
 - Never include markdown codeblocks surrounding your JSON tool calls.`
 
 // gatedToolCall is the gated loop's wire format. It carries a content payload
-// for write_file, which the read-only ToolCallRequest cannot express.
+// for write_file, which the read-only ToolCallRequest cannot express, plus
+// patch (old_str/new_str) fields for the Phase 6 str_replace tool.
 type gatedToolCall struct {
 	Action    string `json:"action"`
 	Path      string `json:"path,omitempty"`
 	Content   string `json:"content,omitempty"`
 	FinalText string `json:"final_text,omitempty"`
+	OldStr    string `json:"old_str,omitempty"`
+	NewStr    string `json:"new_str,omitempty"`
 }
 
 func parseGatedToolCall(raw string) (*gatedToolCall, error) {
@@ -255,8 +259,53 @@ func RunGatedEditLoop(ctx context.Context, llmClient GatedEditLLM, workDir strin
 			result.TotalLines += newLines
 			result.TotalBytes += newBytes
 			history += fmt.Sprintf("\nAction requested: write_file (path: %s)\nTool Result:\nWrote %d bytes.\nNext action (or answer):", step.Path, newBytes)
+		case "str_replace", "str_replace_editor":
+			original, rErr := readWorkspaceFile(canonicalWorkDir, step.Path)
+			if rErr != nil {
+				history += fmt.Sprintf("\nAction requested: str_replace (path: %s)\nTool Result:\nError: %v\nNext action:", step.Path, rErr)
+				break
+			}
+			if step.OldStr == "" {
+				history += fmt.Sprintf("\nAction requested: str_replace (path: %s)\nTool Result:\nError: old_str must not be empty (exactly-once match required, found 0 matches); no bytes written.\nNext action:", step.Path)
+				break
+			}
+			matches := strings.Count(original, step.OldStr)
+			if matches != 1 {
+				history += fmt.Sprintf("\nAction requested: str_replace (path: %s)\nTool Result:\nError: old_str must match exactly-once (found %d matches); no bytes written.\nNext action:", step.Path, matches)
+				break
+			}
+			patched := strings.Replace(original, step.OldStr, step.NewStr, 1)
+			newLines := countGatedLines(patched)
+			newBytes := len(patched)
+			slashPath := filepath.ToSlash(filepath.Clean(step.Path))
+
+			capHit := ""
+			switch {
+			case !seen[slashPath] && len(seen) >= caps.MaxFiles:
+				capHit = fmt.Sprintf("file cap exceeded (max %d files)", caps.MaxFiles)
+			case result.TotalLines+newLines > caps.MaxTotalLines:
+				capHit = fmt.Sprintf("line cap exceeded (max %d lines)", caps.MaxTotalLines)
+			case result.TotalBytes+newBytes > caps.MaxTotalBytes:
+				capHit = fmt.Sprintf("byte cap exceeded (max %d bytes)", caps.MaxTotalBytes)
+			}
+			if capHit != "" {
+				result.Truncated = true
+				result.OmissionNotice = fmt.Sprintf("%s: omitted %s and all further edits", capHit, step.Path)
+				return result, nil
+			}
+
+			if err := gatedWriteFile(canonicalWorkDir, step.Path, patched); err != nil {
+				return result, err
+			}
+			if !seen[slashPath] {
+				seen[slashPath] = true
+				result.FilesChanged = append(result.FilesChanged, slashPath)
+			}
+			result.TotalLines += newLines
+			result.TotalBytes += newBytes
+			history += fmt.Sprintf("\nAction requested: str_replace (path: %s)\nTool Result:\nPatched 1 occurrence, wrote %d bytes.\nNext action (or answer):", step.Path, newBytes)
 		default:
-			history += fmt.Sprintf("\nAction requested: %s\nTool Result:\nUnknown action: %s. Use read_file, list_files, write_file, or answer.\nNext action:", step.Action, step.Action)
+			history += fmt.Sprintf("\nAction requested: %s\nTool Result:\nUnknown action: %s. Use read_file, list_files, write_file, str_replace, or answer.\nNext action:", step.Action, step.Action)
 		}
 	}
 
