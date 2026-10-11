@@ -306,6 +306,47 @@ func gatedGlobFiles(canonicalWorkDir, userPath, pattern string) (string, error) 
 	return strings.Join(matched, "\n"), nil
 }
 
+// History summarization bounds (D-01). The loop history grows every round;
+// past the threshold older rounds compress while the latest tool results
+// (always appended at the tail) survive verbatim.
+const (
+	// gatedHistorySummarizeThreshold triggers summarization of the loop history.
+	gatedHistorySummarizeThreshold = 24000
+	// gatedHistoryHeadBytes preserves the opening instruction context
+	// (the Context opener plus requested improvement) verbatim.
+	gatedHistoryHeadBytes = 2000
+	// gatedHistoryTailBytes preserves the most recent rounds verbatim.
+	gatedHistoryTailBytes = 12000
+)
+
+// summarizeGatedHistory bounds loop-history growth (D-01): histories at or
+// below the summarize threshold pass through unchanged; longer histories keep
+// the first gatedHistoryHeadBytes (original instruction context) plus a byte
+// count marker plus the last keepTailBytes bytes verbatim. The marker is
+// plain data, never a tool directive: cap-trip and violation state live in
+// loop variables, never in the summarized text.
+func summarizeGatedHistory(history string, keepTailBytes int) string {
+	if len(history) <= gatedHistorySummarizeThreshold {
+		return history
+	}
+	if keepTailBytes <= 0 {
+		keepTailBytes = gatedHistoryTailBytes
+	}
+	if keepTailBytes > len(history) {
+		keepTailBytes = len(history)
+	}
+	head := history
+	if len(history) > gatedHistoryHeadBytes {
+		head = history[:gatedHistoryHeadBytes]
+	}
+	tail := history[len(history)-keepTailBytes:]
+	if dropped := len(history) - len(head) - len(tail); dropped <= 0 {
+		return history
+	} else {
+		return head + fmt.Sprintf("\n...[summarized: %d earlier bytes compressed]...\n", dropped) + tail
+	}
+}
+
 // RunGatedEditLoop applies one LLM-directed improvement inside workDir, the
 // sealed snapshot work copy. It returns the applied-change summary; the caller
 // assembles any host-side push from the returned byte state (plan 05-04).
@@ -339,7 +380,15 @@ func RunGatedEditLoop(ctx context.Context, llmClient GatedEditLLM, workDir strin
 			return result, err
 		}
 
-		rawResponse, err := llmClient.ChatCompletion(ctx, gatedEditSystemPrompt, history)
+		// Summarized view only: the accumulated history keeps growing (cap
+		// and violation state live in loop variables), but the model sees
+		// older rounds compressed with the latest tool results verbatim.
+		promptHistory := history
+		if len(history) > gatedHistorySummarizeThreshold {
+			promptHistory = summarizeGatedHistory(history, gatedHistoryTailBytes)
+		}
+
+		rawResponse, err := llmClient.ChatCompletion(ctx, gatedEditSystemPrompt, promptHistory)
 		if err != nil {
 			return result, fmt.Errorf("gated edit loop: llm step failed: %w", err)
 		}
