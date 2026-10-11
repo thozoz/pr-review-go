@@ -499,6 +499,9 @@ func (a *AppAuth) CreateRetrievalCredential(ctx context.Context, owner, repo str
 	}
 	for perm, val := range result.Permissions {
 		if perm == "metadata" {
+			if val != "read" {
+				return nil, fmt.Errorf("%w: metadata permission is %q (only read permitted)", ErrScopeTooBroad, val)
+			}
 			continue // GitHub always implicitly grants metadata:read to all tokens
 		}
 		if perm != "contents" {
@@ -695,6 +698,9 @@ func (a *AppAuth) CreatePushCredential(ctx context.Context, owner, repo string, 
 	}
 	for perm, val := range result.Permissions {
 		if perm == "metadata" {
+			if val != "read" {
+				return nil, fmt.Errorf("%w: metadata permission is %q (only read permitted)", ErrScopeTooBroad, val)
+			}
 			continue // GitHub always implicitly grants metadata:read to all tokens
 		}
 		if perm != "contents" {
