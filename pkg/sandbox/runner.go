@@ -31,9 +31,15 @@ const (
 	StatusResourceExhausted   VerificationStatus = "resource_exhausted"
 	StatusDiskExhausted       VerificationStatus = "disk_exhausted"
 	StatusUnavailable         VerificationStatus = "unavailable"
-	StatusUnsupportedLanguage  VerificationStatus = "unsupported_language"
+	StatusUnsupportedLanguage VerificationStatus = "unsupported_language"
 	StatusIncomplete          VerificationStatus = "incomplete"
 	StatusCancelled           VerificationStatus = "cancelled"
+	// StatusConfinementDenied means the confinement sandbox proved it denied
+	// a filesystem operation the target attempted. It is a sandbox
+	// environment finding, never a build or test verdict, and it is not
+	// model-retryable (CONFINE-04). The exact wire value is a JSON contract
+	// other components depend on.
+	StatusConfinementDenied VerificationStatus = "confinement_denied"
 )
 
 var (
@@ -71,9 +77,17 @@ type VerificationReport struct {
 	// ConfinementNetworkIsolated reports whether the governing rank removed
 	// the network interface. Deliberately has no omitempty so an explicit
 	// false for the landlock rank stays visible rather than absent.
-	ConfinementNetworkIsolated bool  `json:"confinement_network_isolated"`
-	Truncated                  bool  `json:"truncated,omitempty"`
-	DroppedBytes               int64 `json:"dropped_bytes,omitempty"`
+	ConfinementNetworkIsolated bool `json:"confinement_network_isolated"`
+	// ConfinementDeniedPath names the attributable path a proven confinement
+	// denial targeted. It is empty when the pre-exec negative control proved
+	// the denial without a path.
+	ConfinementDeniedPath string `json:"confinement_denied_path,omitempty"`
+	// ConfinementAdvisory carries an indeterminate classification's
+	// explanation for the operator. It NEVER changes the status by itself: an
+	// ambiguous message must not be promoted to a security denial.
+	ConfinementAdvisory string `json:"confinement_advisory,omitempty"`
+	Truncated           bool   `json:"truncated,omitempty"`
+	DroppedBytes        int64  `json:"dropped_bytes,omitempty"`
 }
 
 // Snapshot owns the immutable repository snapshot and its complete identity manifest.
@@ -621,35 +635,35 @@ func (r *Runner) runSnapshotGated(ctx context.Context, snapshot *Snapshot, fetch
 		return report, nil
 	}
 	if prepRes != nil && !prepRes.Passed {
-			report.FailedStage = "prep"
-			if prepRes.IsTimeout {
-				report.Status = StatusTimeout
-				report.Reason = "dependency preparation exceeded execution timeout"
-				report.Summary = "TIMEOUT: dependency preparation timed out."
-			} else if prepRes.IsDiskFull {
-				report.Status = StatusDiskExhausted
-				report.Reason = "filesystem disk quota exceeded during dependency preparation"
-				report.Summary = "DISK_EXHAUSTED: dependency preparation failed with ENOSPC."
-			} else if prepRes.IsOOM {
-				report.Status = StatusResourceExhausted
-				report.Reason = "memory or cgroup limit exceeded during dependency preparation"
-				report.Summary = "RESOURCE_EXHAUSTED: dependency preparation exceeded memory limits."
-			} else if prepRes.IsIncomplete || prepRes.Command == "INCOMPLETE" {
-				report.Status = StatusIncomplete
-				report.Reason = strings.TrimSpace(prepRes.Stderr)
-				if report.Reason == "" {
-					report.Reason = "dependency requirement incomplete"
-				}
-				report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
-			} else {
-				report.Status = StatusBuildFailed
-				report.Reason = strings.TrimSpace(prepRes.Stderr)
-				if report.Reason == "" {
-					report.Reason = "dependency preparation failed"
-				}
-				report.Summary = fmt.Sprintf("FAILED: dependency preparation failed: %s", report.Reason)
+		report.FailedStage = "prep"
+		if prepRes.IsTimeout {
+			report.Status = StatusTimeout
+			report.Reason = "dependency preparation exceeded execution timeout"
+			report.Summary = "TIMEOUT: dependency preparation timed out."
+		} else if prepRes.IsDiskFull {
+			report.Status = StatusDiskExhausted
+			report.Reason = "filesystem disk quota exceeded during dependency preparation"
+			report.Summary = "DISK_EXHAUSTED: dependency preparation failed with ENOSPC."
+		} else if prepRes.IsOOM {
+			report.Status = StatusResourceExhausted
+			report.Reason = "memory or cgroup limit exceeded during dependency preparation"
+			report.Summary = "RESOURCE_EXHAUSTED: dependency preparation exceeded memory limits."
+		} else if prepRes.IsIncomplete || prepRes.Command == "INCOMPLETE" {
+			report.Status = StatusIncomplete
+			report.Reason = strings.TrimSpace(prepRes.Stderr)
+			if report.Reason == "" {
+				report.Reason = "dependency requirement incomplete"
 			}
-			return report, nil
+			report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
+		} else {
+			report.Status = StatusBuildFailed
+			report.Reason = strings.TrimSpace(prepRes.Stderr)
+			if report.Reason == "" {
+				report.Reason = "dependency preparation failed"
+			}
+			report.Summary = fmt.Sprintf("FAILED: dependency preparation failed: %s", report.Reason)
+		}
+		return report, nil
 	}
 
 	// 6. Combined 5-minute deadline for build and race-test stages (D-06).

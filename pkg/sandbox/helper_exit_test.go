@@ -53,10 +53,18 @@ func TestHelperExitContractDisjoint(t *testing.T) {
 		}
 	}
 
-	// 74 is intentionally included until Phase 11 splits out
-	// StatusConfinementDenied: a discovered non-enforcing domain must be
-	// unavailable, never a build failure.
+	// 74 is a security denial owned by helperExitConfinementDenied; every
+	// other 70–76 code is an unavailable environment/configuration fault.
 	for _, code := range codes {
+		if code == HelperExitNegativeControl {
+			if _, ok := helperExitUnavailable(code); ok {
+				t.Errorf("helperExitUnavailable(%d) must be false; 74 is a denial", code)
+			}
+			if !helperExitConfinementDenied(code) {
+				t.Errorf("helperExitConfinementDenied(%d) must be true", code)
+			}
+			continue
+		}
 		reason, ok := helperExitUnavailable(code)
 		if !ok {
 			t.Errorf("helperExitUnavailable(%d) = _, false; want true", code)
@@ -64,10 +72,20 @@ func TestHelperExitContractDisjoint(t *testing.T) {
 		if reason == "" {
 			t.Errorf("helperExitUnavailable(%d) is empty", code)
 		}
+		if helperExitConfinementDenied(code) {
+			t.Errorf("helperExitConfinementDenied(%d) must be false; only 74 is a denial", code)
+		}
+	}
+	reason74, ok74 := HelperExitReason(HelperExitNegativeControl)
+	if !ok74 || reason74 == "" {
+		t.Error("HelperExitReason(74) must remain non-empty and stable")
 	}
 	for _, outside := range []int{0, 1, 2, 3, 69, 77, 124, 137} {
 		if _, ok := helperExitUnavailable(outside); ok {
 			t.Errorf("helperExitUnavailable(%d) = _, true; want false", outside)
+		}
+		if helperExitConfinementDenied(outside) {
+			t.Errorf("helperExitConfinementDenied(%d) = true; want false", outside)
 		}
 	}
 }

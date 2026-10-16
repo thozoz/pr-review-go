@@ -428,10 +428,17 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			if applyHelperExitToReport(report, spec.Rank, installRes) {
 				return report, nil
 			}
+			// Denial classification has exactly one owner per run: this outer
+			// VerifyDirGated verdict. InLoopCommand intentionally returns raw
+			// output without a verdict.
+			if applyDenialClassification(report, spec.Rank, paths, "install", installRes) {
+				return report, nil
+			}
 			report.FailedStage = "install"
 			report.Status = StatusIncomplete
 			report.Reason = fmt.Sprintf("dependency installation failed: %s", strings.Join(proj.installArgs, " "))
 			report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
+			appendConfinementAdvisory(report)
 			return report, nil
 		}
 	}
@@ -451,6 +458,9 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			if applyHelperExitToReport(report, spec.Rank, buildRes) {
 				return report, nil
 			}
+			if applyDenialClassification(report, spec.Rank, paths, "build", buildRes) {
+				return report, nil
+			}
 			report.FailedStage = "build"
 			mapDirectStageFailure(report, "build", buildRes,
 				"build stage exceeded execution timeout",
@@ -461,6 +471,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 				"RESOURCE_EXHAUSTED: build exceeded memory limits.",
 				fmt.Sprintf("%s failed to compile", strings.Join(proj.buildArgs, " ")),
 				fmt.Sprintf("FAILED: %s failed.", strings.Join(proj.buildArgs, " ")))
+			appendConfinementAdvisory(report)
 			return report, nil
 		}
 	}
@@ -479,6 +490,9 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 		if applyHelperExitToReport(report, spec.Rank, testRes) {
 			return report, nil
 		}
+		if applyDenialClassification(report, spec.Rank, paths, "test", testRes) {
+			return report, nil
+		}
 		report.FailedStage = "test"
 		mapDirectStageFailure(report, "test", testRes,
 			"test stage exceeded execution timeout",
@@ -489,6 +503,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			"RESOURCE_EXHAUSTED: test exceeded memory limits.",
 			fmt.Sprintf("%s reported failures", strings.Join(testArgs, " ")),
 			fmt.Sprintf("FAILED: %s reported failures.", strings.Join(testArgs, " ")))
+		appendConfinementAdvisory(report)
 		return report, nil
 	}
 
@@ -706,6 +721,10 @@ func InLoopCommand(ctx context.Context, workDir string, argv []string, timeout t
 	// Single confinement decision (CONFINE-01): the in-loop exec entry routes
 	// through the same ResolveConfinementRank as VerifyDirGated. A host with
 	// no usable rank is refused here rather than run unconfined.
+	//
+	// This advisory entry deliberately returns raw stdout/stderr/exit to the
+	// caller and produces NO denial verdict: denial classification has exactly
+	// one owner per run — the outer VerifyDirGated verdict.
 	spec, err := ResolveConfinementRank(ctx)
 	if err != nil {
 		return "", "", -1, err

@@ -61,11 +61,11 @@ type fakeEditGH struct {
 	lastBranch       string
 	lastExpectedHead string
 
-	minted     int
-	revoked    int
-	revokeErr  error
+	minted      int
+	revoked     int
+	revokeErr   error
 	pushCredErr error
-	nextCred   *ghclient.PushCredential
+	nextCred    *ghclient.PushCredential
 }
 
 func (f *fakeEditGH) GetPR(_ context.Context, _, _ string, _ int) (*ghclient.PRDetails, error) {
@@ -164,17 +164,17 @@ type editHarness struct {
 	exec  *ServerJobExecutor
 	gh    *fakeEditGH
 
-	published   []string
-	verdict     IntentVerdict
-	verdictErr  error
-	stickySeen  []string
-	instrSeen   []string
-	editResult  assistant.EditResult
-	editErr     error
-	reportState sandbox.VerificationStatus
+	published    []string
+	verdict      IntentVerdict
+	verdictErr   error
+	stickySeen   []string
+	instrSeen    []string
+	editResult   assistant.EditResult
+	editErr      error
+	reportState  sandbox.VerificationStatus
 	reportStates []sandbox.VerificationStatus
-	reportErr   error
-	reportNote  string
+	reportErr    error
+	reportNote   string
 
 	prepareCalls int
 	prepareFiles map[string]string
@@ -466,6 +466,7 @@ func TestEditJobNonGreenVerification(t *testing.T) {
 		{"test-failed", sandbox.StatusTestFailed, "failed", "Doğrulama"},
 		{"unsupported-language", sandbox.StatusUnsupportedLanguage, "failed", "Doğrulama"},
 		{"unavailable", sandbox.StatusUnavailable, "completed", "zole"},
+		{"confinement-denied", sandbox.StatusConfinementDenied, "failed", "Sandbox dosya erişimini reddetti"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -998,5 +999,50 @@ func TestEditVerifyFeedback_TailCap6000(t *testing.T) {
 	}
 	if !strings.Contains(out, big[:editVerifyFeedbackMaxBytes]) {
 		t.Fatalf("feedback must keep the head %d bytes of stderr", editVerifyFeedbackMaxBytes)
+	}
+}
+
+// TestConfinementDeniedIsNonRetryable pins that a sandbox denial never
+// triggers a model self-correction attempt, while the actionable build/test/
+// timeout statuses stay retryable (T-11-07).
+func TestConfinementDeniedIsNonRetryable(t *testing.T) {
+	if isRetryableVerifyStatus(sandbox.StatusConfinementDenied) {
+		t.Error("StatusConfinementDenied must not be retryable")
+	}
+	for _, status := range []sandbox.VerificationStatus{
+		sandbox.StatusBuildFailed,
+		sandbox.StatusTestFailed,
+		sandbox.StatusTimeout,
+	} {
+		if !isRetryableVerifyStatus(status) {
+			t.Errorf("%q must stay retryable", status)
+		}
+	}
+}
+
+// TestEditJobConfinementDenied proves a sandbox denial fails the edit job with
+// a sandbox-owned notice, never pushes, and never retries (T-11-07).
+func TestEditJobConfinementDenied(t *testing.T) {
+	h := newEditHarness(t)
+	h.reportState = sandbox.StatusConfinementDenied
+	h.reportNote = "landlock: a read-only root was writable after restriction"
+	job := h.admitEdit(t, 7, editTestHead, editTestBase, "alice", "fix it", 9907)
+	after, _ := h.run(t, job)
+
+	if after.Status != "failed" {
+		t.Fatalf("status = %q, want failed", after.Status)
+	}
+	if h.verifyCalls != 1 {
+		t.Fatalf("verifyCalls = %d, want 1 (a denial is never retried)", h.verifyCalls)
+	}
+	if h.gh.commitCalls != 0 || h.gh.minted != 0 {
+		t.Fatalf("commits=%d minted=%d, want 0/0", h.gh.commitCalls, h.gh.minted)
+	}
+	text := h.publishedText()
+	if !strings.Contains(text, "Sandbox dosya erişimini reddetti") {
+		t.Fatalf("denial notice missing from comment: %q", text)
+	}
+	if !strings.Contains(text, "not a code defect") {
+		t.Fatalf("notice must state the denial is not a code defect: %q", text)
 	}
 }

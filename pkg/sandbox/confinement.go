@@ -166,16 +166,28 @@ func landlockConfinementSpec() ConfinementSpec {
 }
 
 // applyHelperExitToReport maps a landlock helper's pre-exec exit code onto the
-// run's fail-closed unavailable verdict. It returns true when it claimed the
-// stage result: a returned 70–76 code means the target never ran, so it must
-// never reach mapDirectStageFailure and become a build/test failure (T-10-06).
+// run's fail-closed verdict. It returns true when it claimed the stage result:
+// a returned 70–76 code means the target never ran, so it must never reach
+// mapDirectStageFailure and become a build/test failure (T-10-06).
 //
-// HelperExitNegativeControl (74) is reported here as StatusUnavailable because
-// Phase 10 has no StatusConfinementDenied; Phase 11's reclassification is the
-// only planned change to this function's output.
+// The split is now honest: exit 74 (the negative control) proves the domain was
+// NOT enforcing and becomes StatusConfinementDenied, never StatusUnavailable;
+// 70/71/72/73/75/76 stay StatusUnavailable because they are environment or
+// helper-configuration faults, not project verdicts.
 func applyHelperExitToReport(report *VerificationReport, rank ConfinementRank, res *StageResult) bool {
 	if report == nil || res == nil || res.Passed || rank != RankLandlock {
 		return false
+	}
+	if helperExitConfinementDenied(res.ExitCode) {
+		reason, _ := HelperExitReason(HelperExitNegativeControl)
+		report.Status = StatusConfinementDenied
+		report.Reason = fmt.Sprintf("%s (helper exit %d)", reason, res.ExitCode)
+		report.Summary = "CONFINEMENT-DENIED: " + report.Reason
+		report.ConfinementDeniedPath = ""
+		report.ConfinementAdvisory = ""
+		// WorkspaceDir/CommitSHA/DetectedType/ConfinementRank/
+		// ConfinementNetworkIsolated are already set on report by the caller.
+		return true
 	}
 	reason, ok := helperExitUnavailable(res.ExitCode)
 	if !ok {
@@ -187,6 +199,63 @@ func applyHelperExitToReport(report *VerificationReport, rank ConfinementRank, r
 	// WorkspaceDir/CommitSHA/DetectedType/ConfinementRank/
 	// ConfinementNetworkIsolated are already set on report by the caller.
 	return true
+}
+
+// appendConfinementAdvisory attaches an indeterminate classification's
+// advisory to the report summary exactly once. It never changes Status: an
+// ambiguous message must ride the ordinary build/test verdict rather than
+// becoming a security denial.
+func appendConfinementAdvisory(report *VerificationReport) {
+	if report == nil || report.ConfinementAdvisory == "" {
+		return
+	}
+	marker := " (confinement advisory: "
+	if strings.Contains(report.Summary, marker) {
+		return
+	}
+	report.Summary += marker + report.ConfinementAdvisory + ")"
+}
+
+// applyDenialClassification runs the pure three-valued classifier over one
+// failed stage and applies its verdict. It returns true only when a denial is
+// PROVEN, in which case the caller must return immediately with
+// StatusConfinementDenied and never reach the generic stage mapping (T-11-04).
+//
+// An Indeterminate verdict sets ConfinementAdvisory and returns false without
+// touching Status, so the ordinary build/test verdict stands (T-11-05). This
+// is the single denial owner for a run; InLoopCommand deliberately returns raw
+// output with no verdict.
+func applyDenialClassification(report *VerificationReport, rank ConfinementRank, paths DirectJobPaths, stage string, res *StageResult) bool {
+	if report == nil || res == nil {
+		return false
+	}
+	classification := ClassifyConfinementDenial(DenialInput{
+		Rank:       rank,
+		ExitCode:   res.ExitCode,
+		Stdout:     res.Stdout,
+		Stderr:     res.Stderr,
+		WriteRoots: directWriteRoots(paths),
+	})
+	switch classification.Verdict {
+	case DenialProvenDenied:
+		report.FailedStage = stage
+		report.Status = StatusConfinementDenied
+		report.Reason = classification.Reason
+		if classification.Path != "" {
+			report.Reason = fmt.Sprintf("%s (path: %s)", report.Reason, classification.Path)
+		}
+		report.Summary = "CONFINEMENT-DENIED: " + report.Reason
+		report.ConfinementDeniedPath = classification.Path
+		report.ConfinementAdvisory = ""
+		return true
+	case DenialIndeterminate:
+		if classification.Advisory != "" {
+			report.ConfinementAdvisory = classification.Advisory
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 // confinementResolverOverride is the test seam: when set, ResolveConfinementRank
@@ -270,5 +339,7 @@ func confinementWrapFailureReport(report *VerificationReport, err error) *Verifi
 	degraded.DetectedType = report.DetectedType
 	degraded.ConfinementRank = report.ConfinementRank
 	degraded.ConfinementNetworkIsolated = report.ConfinementNetworkIsolated
+	degraded.ConfinementDeniedPath = report.ConfinementDeniedPath
+	degraded.ConfinementAdvisory = report.ConfinementAdvisory
 	return degraded
 }
