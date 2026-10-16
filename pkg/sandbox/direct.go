@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -21,13 +22,20 @@ import (
 //   - No shell execution: fixed argv whitelists, exec.Command only.
 //   - Offline resolution where supported (GOPROXY=off, GOTOOLCHAIN=local,
 //     CARGO_NET_OFFLINE=true) so builds use local caches or fail honestly.
-//   - Each job runs in an ephemeral os.MkdirTemp workspace copied from the
-//     snapshot; the snapshot source is never mutated.
+//   - Each job runs in a job-private <WorkRoot>/jobs/<id>/workspace copied
+//     from the snapshot; the snapshot source is never mutated. Tmp, home and
+//     every toolchain cache are job-private too, resolved under the
+//     configured WorkRoot/CacheRoot rather than the shared host TMPDIR.
 //   - Per-stage timeout via context; output capped by LimitedCollector.
 //   - Same verification gate: non-passed status means changes are never
 //     committed or pushed by callers.
 type DirectRunner struct {
 	Timeout time.Duration
+	// WorkRoot and CacheRoot are the operator-configured job-private roots
+	// (ROOT-01). When either is empty the runner fails closed with
+	// StatusUnavailable instead of creating directories under host /tmp.
+	WorkRoot  string
+	CacheRoot string
 }
 
 // NewDirectRunner creates a DirectRunner with the given per-stage timeout.
@@ -37,6 +45,52 @@ func NewDirectRunner(timeout time.Duration) *DirectRunner {
 		timeout = 5 * time.Minute
 	}
 	return &DirectRunner{Timeout: timeout}
+}
+
+// NewDirectRunnerWithRoots creates a DirectRunner bound to the operator's
+// job-private roots.
+func NewDirectRunnerWithRoots(timeout time.Duration, roots DirectRoots) *DirectRunner {
+	d := NewDirectRunner(timeout)
+	d.WorkRoot = roots.WorkRoot
+	d.CacheRoot = roots.CacheRoot
+	return d
+}
+
+// resolveJobPaths provisions this runner's job-private tree. An unconfigured
+// or unsafe root returns an error before any job-named path is created.
+func (d *DirectRunner) resolveJobPaths(jobID string) (DirectJobPaths, error) {
+	return provisionDirectJobDirs(DirectRoots{WorkRoot: d.WorkRoot, CacheRoot: d.CacheRoot}, jobID)
+}
+
+// directJobID derives a lowercase-hex job ID from the commit SHA and the
+// current time, mirroring the container slot job-ID shape in runner.go.
+func directJobID(commitSHA string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", commitSHA, time.Now().UnixNano())))
+	return fmt.Sprintf("%x", sum)[:12]
+}
+
+// defaultDirectRoots mirrors the state-dir-relative defaults that
+// config.Validate applies to direct mode. It exists because the in-loop exec
+// entry has no Runner at this layer; a later plan threads explicit operator
+// roots into InLoopCommand and makes an unconfigured root fail closed.
+func defaultDirectRoots() (DirectRoots, error) {
+	workRoot := strings.TrimSpace(os.Getenv("SANDBOX_DIRECT_WORK_ROOT"))
+	cacheRoot := strings.TrimSpace(os.Getenv("SANDBOX_DIRECT_CACHE_DIR"))
+	if workRoot != "" && cacheRoot != "" {
+		return DirectRoots{WorkRoot: workRoot, CacheRoot: cacheRoot}, nil
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return DirectRoots{}, fmt.Errorf("no operator work/cache root configured and no user config directory")
+	}
+	state := filepath.Join(configDir, "pr-review-go", "state")
+	if workRoot == "" {
+		workRoot = filepath.Join(state, "direct")
+	}
+	if cacheRoot == "" {
+		cacheRoot = filepath.Join(state, "direct", "cache")
+	}
+	return DirectRoots{WorkRoot: workRoot, CacheRoot: cacheRoot}, nil
 }
 
 // directProject describes the verified commands for one project type.
@@ -146,38 +200,76 @@ var directSecretEnvPrefixes = []string{"GH_TOKEN", "GITHUB_TOKEN", "GITHUB_", "L
 // (GOPROXY) or weaken verification (GOFLAGS, sumdb bypasses).
 var directGoEnvOverrides = []string{"GOFLAGS", "GOPROXY", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB"}
 
+// directRootEnvKeys lists the toolchain root env keys that must never be
+// inherited from the server process (ROOT-02, T-08-02): every one of them is
+// dropped and then re-pinned to the job's private path. Dropping first matters
+// because a duplicated key would let the child's first-match getenv resolve to
+// the server's inherited value (T-08-03).
+var directRootEnvKeys = []string{
+	"HOME", "TMPDIR", "GOTMPDIR", "GOCACHE", "GOPATH", "GOMODCACHE",
+	"XDG_CACHE_HOME", "npm_config_cache", "PNPM_HOME", "YARN_CACHE_FOLDER",
+	"PIP_CACHE_DIR", "POETRY_CACHE_DIR", "CARGO_HOME",
+}
+
+// directEnvKeyDropped reports whether an inherited key must be removed before
+// the authoritative pins are appended: secret-bearing names (T-07-06, D-12),
+// Go override keys the offline pin list owns, and every toolchain root key.
+func directEnvKeyDropped(key string) bool {
+	for _, p := range directSecretEnvPrefixes {
+		if key == p || strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	for _, k := range directGoEnvOverrides {
+		if key == k {
+			return true
+		}
+	}
+	for _, k := range directRootEnvKeys {
+		if key == k {
+			return true
+		}
+	}
+	return false
+}
+
 // buildDirectStageEnv builds the stage exec env from the current process env
-// MINUS secrets and Go override keys, PLUS the pinned offline list. Secret
-// names never appear in stage-2 env; the offline pins cannot be shadowed by
-// inheritance because the shadowed keys are dropped first.
-func buildDirectStageEnv(offline []string) []string {
-	out := make([]string, 0, len(offline)+32)
+// MINUS secrets, Go override keys and every toolchain root key, PLUS the
+// pinned offline list and — when paths is non-nil — the job-private root pins.
+// The root pins are appended after the offline list so pinned offline values
+// still win (ROOT-02). A nil paths emits no root pins (used by callers that
+// only need the pre-existing scrub behaviour).
+func buildDirectStageEnv(offline []string, paths *DirectJobPaths) []string {
+	out := make([]string, 0, len(offline)+48)
 	for _, kv := range os.Environ() {
 		key := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			key = kv[:i]
 		}
-		dropped := false
-		for _, p := range directSecretEnvPrefixes {
-			if key == p || strings.HasPrefix(key, p) {
-				dropped = true
-				break
-			}
-		}
-		if !dropped {
-			for _, k := range directGoEnvOverrides {
-				if key == k {
-					dropped = true
-					break
-				}
-			}
-		}
-		if dropped {
+		if directEnvKeyDropped(key) {
 			continue
 		}
 		out = append(out, kv)
 	}
-	return append(out, offline...)
+	out = append(out, offline...)
+	if paths == nil {
+		return out
+	}
+	return append(out,
+		"HOME="+paths.HomeDir,
+		"TMPDIR="+paths.TmpDir,
+		"GOTMPDIR="+paths.TmpDir,
+		"GOCACHE="+paths.GoBuildCache,
+		"GOPATH="+paths.GoPath,
+		"GOMODCACHE="+paths.GoModCache,
+		"XDG_CACHE_HOME="+paths.CacheDir,
+		"npm_config_cache="+paths.NpmCacheDir,
+		"PNPM_HOME="+paths.PnpmHome,
+		"YARN_CACHE_FOLDER="+paths.YarnCacheDir,
+		"PIP_CACHE_DIR="+paths.PipCacheDir,
+		"POETRY_CACHE_DIR="+paths.PoetryCacheDir,
+		"CARGO_HOME="+paths.CargoHome,
+	)
 }
 
 // directStage2WrapPrefix is the bwrap kernel network-removal prefix for
@@ -321,16 +413,18 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 		return report, nil
 	}
 
-	// Ephemeral per-job workspace: the snapshot source is copied and never
-	// mutated by build/test execution.
-	workDir, err := os.MkdirTemp("", "pr-review-workspace-*")
+	// Job-private workspace/tmp/home/cache (ROOT-01): an unconfigured or
+	// unsafe root fails closed before any copy or exec, so no path is ever
+	// created under the shared host temporary directory (T-08-05).
+	paths, err := d.resolveJobPaths(directJobID(commitSHA))
 	if err != nil {
 		report.Status = StatusUnavailable
-		report.Reason = fmt.Sprintf("failed to create ephemeral workspace: %v", err)
+		report.Reason = fmt.Sprintf("direct job roots unavailable: %v", err)
 		report.Summary = fmt.Sprintf("UNAVAILABLE: %s", report.Reason)
 		return report, nil
 	}
-	defer func() { _ = os.RemoveAll(workDir) }()
+	defer paths.Cleanup()
+	workDir := paths.WorkspaceDir
 	if err := copyDirectory(cleanDir, workDir); err != nil {
 		report.Status = StatusUnavailable
 		report.Reason = fmt.Sprintf("failed to populate ephemeral workspace: %v", err)
@@ -348,12 +442,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 		}
 	}
 
-	env := buildDirectStageEnv(proj.offline)
-	cacheDir, tmpDir, cleanupDirs, err := directJobDirs()
-	if err != nil {
-		return nil, err
-	}
-	defer cleanupDirs()
+	env := buildDirectStageEnv(proj.offline, &paths)
 	if proj.lang == "node" {
 		report.Status = StatusIncomplete
 		report.Reason = "Node dependency preparation is unsupported: installers and lifecycle scripts are disabled"
@@ -387,7 +476,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			report.Summary = "INCOMPLETE: " + report.Reason
 			return report, nil
 		}
-		installRes, err = directPrepare(ctx, d.stageTimeout(), workDir, cacheDir, tmpDir)
+		installRes, err = directPrepare(ctx, d.stageTimeout(), workDir, paths.CacheDir, paths.TmpDir)
 		if err != nil {
 			report.Status = StatusIncomplete
 			report.Reason = err.Error()
@@ -411,7 +500,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 	if len(proj.buildArgs) > 0 {
 		buildArgv := proj.buildArgs
 		if linuxNetIsolated {
-			buildArgv, err = directIsolatedArgv(workDir, cacheDir, tmpDir, proj.buildArgs, "", "")
+			buildArgv, err = directIsolatedArgv(workDir, paths.CacheDir, paths.TmpDir, proj.buildArgs, "", "")
 			if err != nil {
 				return nil, err
 			}
@@ -439,7 +528,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 
 	stageTestArgv := testArgs
 	if linuxNetIsolated {
-		stageTestArgv, err = directIsolatedArgv(workDir, cacheDir, tmpDir, testArgs, "", "")
+		stageTestArgv, err = directIsolatedArgv(workDir, paths.CacheDir, paths.TmpDir, testArgs, "", "")
 		if err != nil {
 			return nil, err
 		}
@@ -654,7 +743,6 @@ func InLoopCommand(ctx context.Context, workDir string, argv []string, timeout t
 	if maxOutputBytes <= 0 {
 		maxOutputBytes = defaultInLoopMaxOutputBytes
 	}
-	env := buildDirectStageEnv(proj.offline)
 	// In-loop stage-2 exec gets the same kernel network removal as the outer
 	// stages on Linux CTs (T-07-01); without bwrap the command is refused
 	// with the D-11 honest-degradation signal, never run on host network.
@@ -664,12 +752,20 @@ func InLoopCommand(ctx context.Context, workDir string, argv []string, timeout t
 	if err := AttestBwrap(ctx); err != nil {
 		return "", "", -1, err
 	}
-	cache, tmp, cleanup, err := directJobDirs()
+	// Job-private tmp/home/cache instead of the shared host TMPDIR (ROOT-01).
+	// In-loop has no DirectRunner at this layer in this plan; 08-02 threads
+	// explicit operator roots through an InLoopCommand option.
+	roots, err := defaultDirectRoots()
 	if err != nil {
-		return "", "", -1, err
+		return "", "", -1, fmt.Errorf("direct job roots unavailable: %w", err)
 	}
-	defer cleanup()
-	execArgv, err := directIsolatedArgv(workDir, cache, tmp, argv, "", "")
+	paths, err := provisionDirectJobDirs(roots, directJobID("inloop"))
+	if err != nil {
+		return "", "", -1, fmt.Errorf("direct job roots unavailable: %w", err)
+	}
+	defer paths.Cleanup()
+	env := buildDirectStageEnv(proj.offline, &paths)
+	execArgv, err := directIsolatedArgv(workDir, paths.CacheDir, paths.TmpDir, argv, "", "")
 	if err != nil {
 		return "", "", -1, fmt.Errorf("%s (%v)", ReducedGuaranteeLabel, err)
 	}

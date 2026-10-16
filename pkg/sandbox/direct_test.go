@@ -50,7 +50,7 @@ func TestDirectRunner_Passing(t *testing.T) {
 		"main_test.go": "package main\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 5 {\n\t\tt.Fatal(\"bad add\")\n\t}\n}\n",
 	})
 
-	d := NewDirectRunner(2 * time.Minute)
+	d := newTestDirectRunner(t, 2*time.Minute)
 	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -80,7 +80,7 @@ func TestDirectRunner_BuildFailure(t *testing.T) {
 		"main.go": "package main\n\nfunc broken( {\n",
 	})
 
-	d := NewDirectRunner(2 * time.Minute)
+	d := newTestDirectRunner(t, 2*time.Minute)
 	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -104,7 +104,7 @@ func TestDirectRunner_TestFailure(t *testing.T) {
 		"main_test.go": "package main\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 99 {\n\t\tt.Fatal(\"intentional failure\")\n\t}\n}\n",
 	})
 
-	d := NewDirectRunner(2 * time.Minute)
+	d := newTestDirectRunner(t, 2*time.Minute)
 	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -128,7 +128,7 @@ func TestDirectRunner_NodePass(t *testing.T) {
 		"package.json": `{"name":"directnodepass","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\""}}`,
 	})
 
-	d := NewDirectRunner(2 * time.Minute)
+	d := newTestDirectRunner(t, 2*time.Minute)
 	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -142,7 +142,7 @@ func TestDirectRunner_NodePass(t *testing.T) {
 }
 
 func TestDirectRunner_UnknownDirPassesWithNotice(t *testing.T) {
-	d := NewDirectRunner(time.Minute)
+	d := newTestDirectRunner(t, time.Minute)
 	report, err := d.VerifyDir(context.Background(), t.TempDir(), directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -248,7 +248,7 @@ func TestDirectStageEnvScrubbed(t *testing.T) {
 	t.Setenv("GOSUMDB", "off")
 	t.Setenv("MYAPP_FOO", "innocent")
 
-	env := buildDirectStageEnv([]string{"GOPROXY=off", "GOENV=off"})
+	env := buildDirectStageEnv([]string{"GOPROXY=off", "GOENV=off"}, nil)
 	has := func(key string) (string, bool) {
 		for _, kv := range env {
 			if kv == key || strings.HasPrefix(kv, key+"=") {
@@ -288,6 +288,13 @@ func TestDirectStageEnvScrubbed(t *testing.T) {
 	}
 	if _, found := has("PATH"); !found {
 		t.Error("PATH must survive the scrub (toolchain must resolve)")
+	}
+	// Companion assertion for the nil-paths contract: toolchain root keys are
+	// still dropped from inheritance, and no job-private pin is emitted.
+	for _, k := range directRootEnvKeys {
+		if kv, found := has(k); found {
+			t.Errorf("nil paths must drop inherited root key %q, got %q", k, kv)
+		}
 	}
 }
 
@@ -411,7 +418,7 @@ func TestKeylessStage2(t *testing.T) {
 	}
 
 	checkClean("podman", strings.Join(podmanStageEnv(), " "))
-	checkClean("direct", strings.Join(buildDirectStageEnv([]string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"}), "\n"))
+	checkClean("direct", strings.Join(buildDirectStageEnv([]string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"}, nil), "\n"))
 
 	// The in-loop exec path adds no env of its own: execArgs carry no -e at
 	// all, so the container keeps its --network=none keyless env.

@@ -111,12 +111,8 @@ func TestOfflineDialOutLinux(t *testing.T) {
 	// prefix MUST observe isolation (exit 0) — dial failure, not env content.
 	wrapCtx, wrapCancel := context.WithTimeout(context.Background(), time.Minute)
 	defer wrapCancel()
-	cache, tmp, cleanup, err := directJobDirs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	wrapped, err := directIsolatedArgv(probeDir, cache, tmp, []string{"go", "run", "dialprobe.go", target, sockPath}, "", "")
+	paths := provisionTestJobPaths(t)
+	wrapped, err := directIsolatedArgv(probeDir, paths.CacheDir, paths.TmpDir, []string{"go", "run", "dialprobe.go", target, sockPath}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
