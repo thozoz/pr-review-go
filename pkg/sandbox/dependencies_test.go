@@ -368,7 +368,7 @@ func TestPythonNetworkFetch_YieldsIncomplete(t *testing.T) {
 
 	r := &Runner{
 		Timeout: 5 * time.Minute,
-		Direct:  NewDirectRunner(2 * time.Minute),
+		Direct:  newTestDirectRunner(t, 2*time.Minute),
 	}
 
 	report, err := r.RunSnapshot(context.Background(), snap)

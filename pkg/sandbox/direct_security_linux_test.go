@@ -4,8 +4,10 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -16,11 +18,7 @@ func TestDirectPrivateRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	work := writeDirectModule(t, map[string]string{"go.mod": "module example.com/probe\n\ngo 1.24\n", "main.go": "package main\nfunc main() {}\n"})
-	cache, tmp, cleanup, err := directJobDirs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
+	paths := provisionTestJobPaths(t)
 	secret := filepath.Join(t.TempDir(), "host-secret")
 	if err := os.WriteFile(secret, []byte("sentinel"), 0600); err != nil {
 		t.Fatal(err)
@@ -30,8 +28,21 @@ func TestDirectPrivateRoot(t *testing.T) {
 	if _, err := os.ReadFile(secret); err != nil {
 		t.Fatal(err)
 	}
-	script := "set -eu; test ! -e '" + secret + "'; test -z \"${UNKNOWN_SERVICE_SECRET:-}\"; test ! -e /run/sandbox/gateway.sock; test ! -e /home; test ! -e /root; touch /work/allowed; if touch /usr/bin/forbidden 2>/dev/null; then exit 1; fi; go build ./..."
-	argv, err := directIsolatedArgv(work, cache, tmp, []string{"/bin/sh", "-c", script}, "", "")
+	// When the Go toolchain lives under the host home (a module-managed
+	// toolchain under ~/go/pkg/mod), bwrap necessarily materialises the empty
+	// /home parent chain for that read-only bind, so an unconditional
+	// `test ! -e /home` is wrong on such hosts. Prove the host home's private
+	// state is still invisible instead.
+	homeProbe := "test ! -e /home"
+	if goroot, err := filepath.EvalSymlinks(runtime.GOROOT()); err == nil && goroot != "" {
+		if hostHome, err := os.UserHomeDir(); err == nil && hostHome != "" &&
+			strings.HasPrefix(goroot, filepath.Clean(hostHome)+string(os.PathSeparator)) {
+			homeProbe = fmt.Sprintf("test ! -e %q && test ! -e %q",
+				filepath.Join(hostHome, ".ssh"), filepath.Join(hostHome, ".config"))
+		}
+	}
+	script := "set -eu; test ! -e '" + secret + "'; test -z \"${UNKNOWN_SERVICE_SECRET:-}\"; test ! -e /run/sandbox/gateway.sock; " + homeProbe + "; test ! -e /root; touch /work/allowed; if touch /usr/bin/forbidden 2>/dev/null; then exit 1; fi; go build ./..."
+	argv, err := directIsolatedArgv(work, paths.CacheDir, paths.TmpDir, []string{"/bin/sh", "-c", script}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,30 +70,22 @@ func TestDirectAuthorizedGatewayFetch(t *testing.T) {
 		t.Skip("run compiled suite beside trusted helper for live gateway proof")
 	}
 	work := writeDirectModule(t, map[string]string{"go.mod": "module example.com/gatewayproof\n\ngo 1.24\n\nrequire rsc.io/quote v1.5.2\n", "main.go": "package main\nfunc main() {}\n"})
-	cache, tmp, cleanup, err := directJobDirs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	res, err := directPrepare(context.Background(), time.Minute, work, cache, tmp)
+	paths := provisionTestJobPaths(t)
+	res, err := directPrepare(context.Background(), time.Minute, work, paths.CacheDir, paths.TmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !res.Passed {
 		t.Fatal(res.Stderr)
 	}
-	if _, err := os.Stat(filepath.Join(cache, "go/pkg/mod/rsc.io/quote@v1.5.2")); err != nil {
+	if _, err := os.Stat(filepath.Join(paths.GoModCache, "rsc.io/quote@v1.5.2")); err != nil {
 		t.Fatal("gateway did not fill private cache: ", err)
 	}
 }
 
 func TestDirectIsolationMountContract(t *testing.T) {
-	cache, tmp, cleanup, err := directJobDirs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cleanup()
-	argv, err := directIsolatedArgv(t.TempDir(), cache, tmp, []string{"go", "test", "-race", "./..."}, "", "")
+	paths := provisionTestJobPaths(t)
+	argv, err := directIsolatedArgv(t.TempDir(), paths.CacheDir, paths.TmpDir, []string{"go", "test", "-race", "./..."}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +97,7 @@ func TestDirectIsolationMountContract(t *testing.T) {
 	if strings.Contains(strings.Join(argv, " "), "gateway.sock") {
 		t.Fatal("stage2 gateway exposed")
 	}
-	if _, err := directIsolatedArgv("/", cache, tmp, []string{"go", "test", "./..."}, "", ""); err == nil {
+	if _, err := directIsolatedArgv("/", paths.CacheDir, paths.TmpDir, []string{"go", "test", "./..."}, "", ""); err == nil {
 		t.Fatal("root workspace accepted")
 	}
 }
