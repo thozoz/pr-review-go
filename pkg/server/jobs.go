@@ -1098,7 +1098,10 @@ func editCommandBackend(cfg *config.Config) func(context.Context, string, []stri
 		if cfg == nil || !cfg.EnableSandbox || cfg.SandboxMode != config.SandboxModeDirect {
 			return "", "", -1, fmt.Errorf("tool-unavailable: no job-owned Podman command container; host fallback refused")
 		}
-		return sandbox.InLoopCommand(ctx, workDir, argv, 0, 0)
+		return sandbox.InLoopCommand(ctx, workDir, argv, 0, 0, sandbox.WithDirectRoots(sandbox.DirectRoots{
+			WorkRoot:  cfg.SandboxDirectWorkRoot,
+			CacheRoot: cfg.SandboxDirectCacheDir,
+		}))
 	}
 }
 

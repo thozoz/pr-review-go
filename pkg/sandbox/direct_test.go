@@ -298,77 +298,21 @@ func TestDirectStageEnvScrubbed(t *testing.T) {
 	}
 }
 
-// TestDirectBwrapWrapPrefix proves the Linux wrap shape: kernel network
-// removal flags first, original argv as tail, and no socket bind anywhere.
-func TestDirectBwrapWrapPrefix(t *testing.T) {
-	argv := []string{"go", "build", "./..."}
-	wrapped := bwrapNetIsolateArgv(argv)
-	expectedPrefix := []string{
-		"bwrap",
-		"--unshare-user",
-		"--unshare-net",
-		"--die-with-parent",
-		"--new-session",
-		"--unshare-pid",
-		"--clearenv",
+// TestDirectConfinementRefusesNonLinux inverts the deleted passthrough
+// assertion deliberately: CONFINE-01 forbids running unconfined off-Linux, so
+// a host that is not Linux is refused with the typed sentinel and no argv.
+func TestDirectConfinementRefusesNonLinux(t *testing.T) {
+	okProbe := func(context.Context) error { return nil }
+	spec, err := resolveConfinementRankWith(context.Background(), confinementProbes{
+		goos:          "windows",
+		attestBwrapRO: okProbe,
+		probeLandlock: okProbe,
+	})
+	if !errors.Is(err, ErrConfinementUnavailable) {
+		t.Fatalf("non-Linux host must be refused with ErrConfinementUnavailable, got: %v", err)
 	}
-	if len(wrapped) != len(argv)+len(expectedPrefix) {
-		t.Fatalf("wrapped argv length = %d, want %d", len(wrapped), len(argv)+len(expectedPrefix))
-	}
-	for i, want := range expectedPrefix {
-		if wrapped[i] != want {
-			t.Fatalf("wrapped argv[%d] = %q, want %q (full %q)", i, wrapped[i], want, wrapped)
-		}
-	}
-	for i, want := range argv {
-		if wrapped[i+len(expectedPrefix)] != want {
-			t.Fatalf("wrapped tail[%d] = %q, want %q", i, wrapped[i+len(expectedPrefix)], want)
-		}
-	}
-	joined := strings.Join(wrapped, " ")
-	for _, banned := range []string{"gateway.sock", "depgw-", "--socket"} {
-		if strings.Contains(joined, banned) {
-			t.Errorf("wrapped stage-2 argv must contain no %q (got %q)", banned, joined)
-		}
-	}
-}
-
-// TestDirectBwrapUnavailableIsUnavailable proves D-11 honest degradation: on
-// Linux without bwrap the wrap decision fails with the typed sentinel (the
-// caller maps it to StatusUnavailable + REDUCED-GUARANTEE, never a pass),
-// while off-Linux argv passes through for env-only execution.
-func TestDirectBwrapUnavailableIsUnavailable(t *testing.T) {
-	failAttest := func(context.Context) error {
-		return errors.Join(ErrBwrapUnavailable, errors.New("userns probe failed in test"))
-	}
-	argv := []string{"go", "test", "-race", "./..."}
-	if _, err := wrapDirectStage2ArgvForOS("linux", failAttest, context.Background(), argv); !errors.Is(err, ErrBwrapUnavailable) {
-		t.Fatalf("linux without bwrap must yield ErrBwrapUnavailable, got: %v", err)
-	}
-	report := BwrapUnavailableReport("userns probe failed in test")
-	if report.Status != StatusUnavailable {
-		t.Fatalf("degraded report must carry StatusUnavailable, got %q", report.Status)
-	}
-	if !strings.Contains(report.Reason, ReducedGuaranteeLabel) || !strings.Contains(report.Summary, ReducedGuaranteeLabel) {
-		t.Fatalf("degraded report must carry the REDUCED-GUARANTEE label, got reason=%q summary=%q", report.Reason, report.Summary)
-	}
-	if report.Status == StatusPassed {
-		t.Fatal("degraded report must never carry StatusPassed")
-	}
-	got, err := wrapDirectStage2ArgvForOS("windows", failAttest, context.Background(), argv)
-	if err != nil {
-		t.Fatalf("non-Linux must not attest, got error: %v", err)
-	}
-	if strings.Join(got, " ") != strings.Join(argv, " ") {
-		t.Fatalf("non-Linux argv must pass through unchanged, got %q", got)
-	}
-	okAttest := func(context.Context) error { return nil }
-	got, err = wrapDirectStage2ArgvForOS("linux", okAttest, context.Background(), argv)
-	if err != nil {
-		t.Fatalf("linux with bwrap must wrap, got error: %v", err)
-	}
-	if len(got) == 0 || got[0] != "bwrap" || !strings.Contains(strings.Join(got, " "), "--unshare-net") {
-		t.Fatalf("linux with bwrap must return the unshare-net wrap, got %q", got)
+	if spec.Rank != "" || spec.WrapArgv != nil || spec.Env != nil || spec.NetworkIsolated {
+		t.Fatalf("refused host must return a zero-value ConfinementSpec, got %+v", spec)
 	}
 }
 
