@@ -1,6 +1,6 @@
 # pr-review-go
 
-Multi-language AI PR Reviewer and Autonomous Assistant written in Go. Designed to inspect, test, and edit pull requests across any programming language (Go, Python, Node.js/TypeScript, Rust, Java/Maven/Gradle, Make, and more). Supports direct execution (`SANDBOX_MODE=direct`) for pre-isolated environments (Proxmox LXC, Docker, Kubernetes, CI runners) as well as rootless Podman container isolation on Linux.
+Multi-language AI PR Reviewer and Autonomous Assistant written in Go. Designed to inspect, test, and edit pull requests across any programming language (Go, Python, Node.js/TypeScript, Rust, Java/Maven/Gradle, Make, and more). Supports confined direct execution (`SANDBOX_MODE=direct`, fail-closed `bwrap-ro` → `landlock` confinement on Linux) for pre-isolated environments (Proxmox LXC, Docker, Kubernetes, CI runners) as well as rootless Podman container isolation on Linux.
 
 Inspired by GitHub Copilot's agentic architecture and PR-Agent:
 1. **Multi-Language Verification**: Detects project ecosystem (`go.mod`, `package.json`, `pyproject.toml`/`requirements.txt`, `Cargo.toml`, `pom.xml`, `build.gradle`, `Makefile`) and runs appropriate build and test verification suites.
@@ -21,7 +21,7 @@ Inspired by GitHub Copilot's agentic architecture and PR-Agent:
 cmd/
   pr-review-go/        # Dual-mode CLI & Server daemon
   pr-review-server/    # Dedicated Webhook server binary
-  pr-review-sandbox-helper/ # Trusted helper binary inside container
+  pr-review-sandbox-helper/ # Trusted direct-mode confinement helper (landlock-run applier)
 pkg/
   config/              # Environment & LLM configuration
   github/              # GitHub API client (PRs, diffs, comments, discussions, GraphQL CAS)
@@ -44,23 +44,121 @@ If `SANDBOX_MODE` is unset or blank, verification uses **`direct`**. Podman
 is optional and must be explicitly selected:
 
 ```bash
-SANDBOX_MODE=direct  # default: run build/test commands on the execution host
+SANDBOX_MODE=direct  # default: run build/test commands on the execution host, confined
 SANDBOX_MODE=podman  # opt in to Podman isolation; provision it separately
 ```
 
-**Security:** direct mode executes repository code and build/test scripts on the
-execution host. It is not a per-job container security boundary. Use a dedicated,
-pre-isolated worker without production secrets; a shared LXC alone does not
-protect the bot's credentials from untrusted code. Do not run untrusted PRs on
-an ordinary shared host using this default. Set `SANDBOX_MODE=podman` explicitly
-where container isolation is required; failures do not automatically fall back
-to direct mode. Existing explicit Podman configuration remains effective.
+A Podman failure never falls back to direct mode: the selected backend either
+works or reports unavailable.
+
+### The fail-closed confinement chain
+
+Direct mode on Linux wraps every stage — stage-0 dependency preparation, build,
+test and in-loop commands — in **exactly one** filesystem confinement rank:
+
+```
+bwrap-ro  ──►  landlock  ──►  typed ErrConfinementUnavailable
+```
+
+- The rank policy is resolved **once per process**; enforcement is proved **per execution**.
+- When no rank is available the run executes **zero** commands and reports
+  `StatusUnavailable` with the confinement-unavailable label
+  (`CONFINEMENT-UNAVAILABLE: no filesystem confinement rank attested; zero commands executed`),
+  wrapping the typed `ErrConfinementUnavailable`. It never runs unconfined and is never retried unwrapped.
+- A denial — the helper's negative control, or an attributable `EROFS`/`EACCES`/`EXDEV`
+  under the active rank — is reported as `StatusConfinementDenied`, not as a build or
+  test failure, and is not retried.
+
+Per-rank guarantee summary:
+
+- **`bwrap-ro`** — host root read-only (`--ro-bind / /`), private `/tmp`, only the job
+  workspace/tmp/home/cache writable, network removed (`--unshare-net`).
+- **`landlock`** — kernel filesystem ruleset applied by the trusted helper; no user
+  namespaces, cgroups or daemon; **no network removal**.
+
+**Security:** direct mode still runs repository code and build/test scripts on the
+execution host, inside the host's own filesystem, PID and credential world. The
+confinement is a filesystem **write** boundary: it does not hide host files (reads are
+permitted by design), and the `landlock` rank does not remove the network. Use a
+dedicated, pre-isolated worker without production secrets; a shared LXC alone does not
+protect the bot's credentials from untrusted code. Do not run untrusted PRs on an
+ordinary shared host. Set `SANDBOX_MODE=podman` explicitly where container isolation is
+required. Existing explicit Podman configuration remains effective.
 
 Podman has **not worked in our tested nested Proxmox LXC environment**: cgroup
 controller delegation and UID/GID mapping errors blocked execution. This is an
 environment-specific open limitation, not a claim that Podman fails everywhere.
 See [issue #20](https://github.com/thozoz/pr-review-go/issues/20) for tracking.
 `ALLOW_ROOTFUL_SANDBOX` remains disabled by default; it is not needed in direct mode.
+
+### Direct-mode confinement prerequisites
+
+#### `bwrap-ro` — install Bubblewrap
+
+```bash
+apt-get install -y bubblewrap   # Debian 12/13; tested bubblewrap 0.12.0-1~deb13u1
+```
+
+That is the entire installation story for the working rank. It additionally needs
+unprivileged user namespaces, which `unshare -Urn true` verifies. Nothing else requires root.
+
+#### `landlock` — install nothing
+
+No user namespaces, subuid/subgid, cgroups or daemon are required; the ruleset is applied
+by the shipped trusted helper `pr-review-sandbox-helper`. It needs a kernel ≥ 5.13 with
+Landlock present in the boot LSM list.
+
+#### Proxmox LXC host prerequisite for Landlock
+
+On the **PVE host** — **this cannot be performed from inside the LXC container** — do the following:
+
+1. Append `lsm=landlock,lockdown,yama,integrity,apparmor` to the existing kernel command
+   line in `/etc/kernel/cmdline` (keep the existing entries; do not replace them):
+   ```bash
+   # On the PVE host, not in the container:
+   sed -i 's/$/ lsm=landlock,lockdown,yama,integrity,apparmor/' /etc/kernel/cmdline
+   ```
+2. Refresh the boot configuration:
+   ```bash
+   proxmox-boot-tool refresh
+   ```
+3. Reboot the PVE host.
+4. Verify:
+   ```bash
+   dmesg | grep landlock   # expect: landlock: Up and running.
+   ```
+
+#### Landlock unavailability diagnostics
+
+The code maps each kernel observation to one specific typed reason:
+
+| Observation | Meaning | Action |
+|---|---|---|
+| `EOPNOTSUPP` (`disabled_at_boot`) | Landlock is compiled in but disabled at boot | The host `lsm=` + `proxmox-boot-tool refresh` + reboot step above |
+| `ENOSYS` (`kernel_unsupported`) | Kernel predates 5.13, or `CONFIG_SECURITY_LANDLOCK` is unset | Upgrade the kernel or use `bwrap-ro` |
+| `EPERM` (`blocked`) | seccomp / capability misconfiguration | Review the container's seccomp and privilege policy |
+| ABI < 2 (`abi_too_old`) | Landlock is present but `REFER` cannot be granted | Unavailable for this workload; use `bwrap-ro` |
+
+Runnable checks:
+
+```bash
+bwrap --version
+go test ./pkg/sandbox/ -run 'TestOnHostLandlockRankUnavailableReason' -count=1 -v
+```
+
+The second command **records** the typed on-host reason rather than failing, so it is safe
+to run on a host where Landlock is disabled.
+
+#### Configuration knobs
+
+- `SANDBOX_DIRECT_WORK_ROOT` — job-private work root (default `<WebhookStateDir>/direct`).
+- `SANDBOX_DIRECT_CACHE_DIR` — job-private cache root (default `<WebhookStateDir>/direct/cache`).
+- `SANDBOX_HELPER_PATH` — operator override for the trusted helper. Resolution order is
+  `SANDBOX_HELPER_PATH` → sibling of the server binary → `PATH` → identity-guarded
+  self-exec. The helper ships in the release archives for linux/amd64 and linux/arm64.
+
+Following these steps on any host must end in either a confined run or one specific typed
+unavailable reason per rank — never in an accepted unconfined execution.
 
 ## Optional model fallback
 
