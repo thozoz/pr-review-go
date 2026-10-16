@@ -67,8 +67,8 @@ func TestOfflineDialOutLinux(t *testing.T) {
 	if _, err := exec.LookPath("bwrap"); err != nil {
 		t.Skip("bwrap absent: enforcement probe needs the CT target")
 	}
-	if err := AttestBwrap(context.Background()); err != nil {
-		t.Skipf("userns unavailable, D-11 degraded path applies: %v", err)
+	if err := AttestBwrapRO(context.Background()); err != nil {
+		t.Skipf("bwrap-ro rank unavailable, D-11 degraded path applies: %v", err)
 	}
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go toolchain absent: cannot build the dial probe")
@@ -107,12 +107,16 @@ func TestOfflineDialOutLinux(t *testing.T) {
 		t.Fatalf("control probe unwrapped must observe reachability (exit nonzero), got exit 0 for %s", target)
 	}
 
-	// Enforcement: the identical probe wrapped in the stage-2 network-removal
-	// prefix MUST observe isolation (exit 0) — dial failure, not env content.
+	// Enforcement: the identical probe wrapped in the bwrap-ro read-only-host
+	// argv MUST observe isolation (exit 0) — dial failure, not env content.
 	wrapCtx, wrapCancel := context.WithTimeout(context.Background(), time.Minute)
 	defer wrapCancel()
 	paths := provisionTestJobPaths(t)
-	wrapped, err := directIsolatedArgv(probeDir, paths.CacheDir, paths.TmpDir, []string{"go", "run", "dialprobe.go", target, sockPath}, "", "")
+	wrapped, err := BuildBwrapROStageArgv(
+		[]string{"go", "run", "dialprobe.go", target, sockPath},
+		DirectJobPaths{WorkspaceDir: probeDir, TmpDir: paths.TmpDir, HomeDir: paths.HomeDir, CacheDir: paths.CacheDir},
+		WrapOptions{},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

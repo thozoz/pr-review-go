@@ -5,53 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
-
-// directIsolatedArgv creates a private root with no host home, root, or sockets.
-// Only job-owned directories are writable. Toolchain roots are read-only.
-func directIsolatedArgv(work, cache, tmp string, command []string, socket, helper string) ([]string, error) {
-	if runtime.GOOS != "linux" {
-		return nil, fmt.Errorf("%w: direct execution requires Linux mount isolation", ErrBwrapUnavailable)
-	}
-	argv := []string{"bwrap", "--unshare-all", "--die-with-parent", "--new-session"}
-	for _, path := range []string{"/usr/bin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/include", "/usr/share", "/bin", "/lib", "/lib64"} {
-		if _, err := os.Stat(path); err == nil {
-			argv = append(argv, "--ro-bind", path, path)
-		}
-	}
-	goroot, err := filepath.EvalSymlinks(runtime.GOROOT())
-	if err != nil {
-		return nil, fmt.Errorf("trusted Go toolchain unavailable: %w", err)
-	}
-	if goroot == "/" || strings.HasPrefix(goroot, filepath.Clean(work)+"/") {
-		return nil, fmt.Errorf("unsafe Go toolchain mount")
-	}
-	argv = append(argv, "--ro-bind", goroot, goroot, "--proc", "/proc", "--dev", "/dev")
-	for _, mount := range [][2]string{{work, "/work"}, {cache, "/cache"}, {tmp, "/tmp"}} {
-		source, err := filepath.EvalSymlinks(mount[0])
-		if err != nil {
-			return nil, err
-		}
-		if source == "/" {
-			return nil, fmt.Errorf("host root mount refused")
-		}
-		argv = append(argv, "--bind", source, mount[1])
-	}
-	if socket != "" {
-		if helper == "" {
-			return nil, fmt.Errorf("trusted preparation helper unavailable")
-		}
-		argv = append(argv, "--ro-bind", socket, BwrapGatewaySocketPath, "--ro-bind", helper, "/sandbox-helper")
-	}
-	argv = append(argv, "--clearenv", "--setenv", "PATH", goroot+"/bin:/usr/bin:/bin", "--setenv", "HOME", "/tmp", "--setenv", "PWD", "/work",
-		"--setenv", "GOPROXY", "off", "--setenv", "GOTOOLCHAIN", "local", "--setenv", "GOVCS", "off", "--setenv", "GOWORK", "off", "--setenv", "GOENV", "off",
-		"--setenv", "GOROOT", goroot, "--setenv", "GO111MODULE", "on",
-		"--setenv", "GOCACHE", "/cache/go-build", "--setenv", "GOPATH", "/cache/go", "--setenv", "GOMODCACHE", "/cache/go/pkg/mod", "--setenv", "TMPDIR", "/tmp", "--chdir", "/work")
-	return append(argv, command...), nil
-}
 
 // DirectJobPaths is one job's fully resolved, canonical, job-private tree.
 // Workspace/tmp/home are ephemeral (they live under the configured work
@@ -254,6 +210,16 @@ func (p *DirectJobPaths) Cleanup() {
 // confinement namespace. The helper's loopback relay can reach only this
 // job's restricted UDS gateway. The argv comes from the single resolved spec,
 // so stage-0 is never left unwrapped (CONFINE-01).
+//
+// Same-path semantics: the job workspace is bound at its own host path, so the
+// in-sandbox -work value equals the host workspace path (no /work remap).
+//
+// Runtime destinations: with `--ro-bind / /` bwrap cannot create mount-point
+// parents under the read-only host root, so both the helper and the gateway
+// socket are bound into the argv's private tmpfs (BwrapROHelperPath and
+// BwrapGatewaySocketPath). The gateway control tree therefore lives under the
+// job root (ROOT-01) and is never itself bound into the sandbox — only the
+// socket file is, read-only.
 func directPrepare(ctx context.Context, timeout time.Duration, paths DirectJobPaths, spec ConfinementSpec) (*StageResult, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -267,7 +233,7 @@ func directPrepare(ctx context.Context, timeout time.Duration, paths DirectJobPa
 	if err != nil {
 		return nil, err
 	}
-	control, err := os.MkdirTemp("", "pr-review-gateway-*")
+	control, err := os.MkdirTemp(paths.Root, "control-*")
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +245,7 @@ func directPrepare(ctx context.Context, timeout time.Duration, paths DirectJobPa
 	}
 	defer gw.Close()
 	argv, err := spec.WrapArgv(
-		[]string{"/sandbox-helper", "prepare", "-socket", BwrapGatewaySocketPath, "-work", "/work"},
+		[]string{BwrapROHelperPath, "prepare", "-socket", BwrapGatewaySocketPath, "-work", paths.WorkspaceDir},
 		paths,
 		WrapOptions{GatewaySocketPath: socket, HelperPath: helper},
 	)

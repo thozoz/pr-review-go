@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -108,15 +108,20 @@ func TestConfinementRankIsSingleLayer(t *testing.T) {
 	}
 }
 
-// TestConfinementSpecArgvDerivesFromJobPaths proves both ranks consume the
-// same DirectJobPaths value: the bwrap-ro argv binds exactly the job's
-// workspace, cache and tmp onto /work, /cache and /tmp, plus the stage-0
-// gateway socket and helper (T-08-08).
+// TestConfinementSpecArgvDerivesFromJobPaths proves the bwrap-ro rank consumes
+// the DirectJobPaths value directly: the host root is read-only, /dev, /proc
+// and /tmp are carved out, the job's four roots are bound at their own paths,
+// the working directory is pinned into the writable workspace, network removal
+// is retained, and stage-0 adds exactly the two runtime binds into the private
+// tmpfs (T-08-08, CONFINE-02).
 func TestConfinementSpecArgvDerivesFromJobPaths(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("bwrap-ro argv requires Linux mount isolation")
+	}
 	paths := provisionTestJobPaths(t)
-	opts := WrapOptions{GatewaySocketPath: "/tmp/gw.sock", HelperPath: "/tmp/helper"}
+	opts := WrapOptions{GatewaySocketPath: "/host/ctl/gw.sock", HelperPath: "/host/ctl/helper"}
 	argv, err := bwrapROConfinementSpec().WrapArgv(
-		[]string{"/sandbox-helper", "prepare", "-socket", BwrapGatewaySocketPath, "-work", "/work"},
+		[]string{BwrapROHelperPath, "prepare", "-socket", BwrapGatewaySocketPath, "-work", paths.WorkspaceDir},
 		paths,
 		opts,
 	)
@@ -124,28 +129,34 @@ func TestConfinementSpecArgvDerivesFromJobPaths(t *testing.T) {
 		t.Fatalf("stage-0 wrap: %v", err)
 	}
 
-	resolved := func(p string) string {
-		t.Helper()
-		got, err := filepath.EvalSymlinks(p)
-		if err != nil {
-			t.Fatalf("EvalSymlinks(%q): %v", p, err)
+	for _, p := range []string{paths.WorkspaceDir, paths.TmpDir, paths.HomeDir, paths.CacheDir} {
+		if !containsTriple(argv, "--bind", p, p) {
+			t.Errorf("argv must bind job path %q at its own path: %q", p, argv)
 		}
-		return got
 	}
-	for _, tc := range []struct{ source, target string }{
-		{resolved(paths.WorkspaceDir), "/work"},
-		{resolved(paths.CacheDir), "/cache"},
-		{resolved(paths.TmpDir), "/tmp"},
-	} {
-		if !containsTriple(argv, "--bind", tc.source, tc.target) {
-			t.Errorf("argv must bind job path %q onto %q: %q", tc.source, tc.target, argv)
-		}
+	if !containsTriple(argv, "--ro-bind", "/", "/") {
+		t.Errorf("argv must bind the host root read-only: %q", argv)
+	}
+	if !containsPair(argv, "--dev", "/dev") {
+		t.Errorf("argv must carve out /dev: %q", argv)
+	}
+	if !containsPair(argv, "--proc", "/proc") {
+		t.Errorf("argv must carve out /proc: %q", argv)
+	}
+	if !containsPair(argv, "--tmpfs", "/tmp") {
+		t.Errorf("argv must carve out a private /tmp: %q", argv)
+	}
+	if !containsTriple(argv, "--chdir", paths.WorkspaceDir, "--clearenv") {
+		t.Errorf("argv must pin --chdir into the writable workspace: %q", argv)
+	}
+	if !containsElement(argv, "--unshare-net") {
+		t.Errorf("argv must retain network removal: %q", argv)
 	}
 	if !containsTriple(argv, "--ro-bind", opts.GatewaySocketPath, BwrapGatewaySocketPath) {
 		t.Errorf("argv must bind gateway socket %q onto %q: %q", opts.GatewaySocketPath, BwrapGatewaySocketPath, argv)
 	}
-	if !containsTriple(argv, "--ro-bind", opts.HelperPath, "/sandbox-helper") {
-		t.Errorf("argv must bind helper %q onto /sandbox-helper: %q", opts.HelperPath, argv)
+	if !containsTriple(argv, "--ro-bind", opts.HelperPath, BwrapROHelperPath) {
+		t.Errorf("argv must bind helper %q onto %q: %q", opts.HelperPath, BwrapROHelperPath, argv)
 	}
 }
 
@@ -214,12 +225,12 @@ func TestConfinementUnavailableLabelIsDistinct(t *testing.T) {
 }
 
 // TestOneConfinementDecisionFunction structurally forbids a second decision
-// path: raw AttestBwrap/directIsolatedArgv calls may only appear in the rank
-// probe/argv-builder files, and direct.go must route through
-// ResolveConfinementRank (T-08-10).
+// path: the real-shape rank probe and the argv builder may only appear in
+// their own files, and direct.go must route through ResolveConfinementRank
+// (T-08-10).
 func TestOneConfinementDecisionFunction(t *testing.T) {
 	allowedAttest := map[string]bool{"bwrap.go": true, "confinement.go": true}
-	allowedIsolated := map[string]bool{"direct_isolation.go": true, "confinement.go": true}
+	allowedRankFiles := map[string]bool{"bwrap_ro.go": true, "confinement.go": true}
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -235,11 +246,18 @@ func TestOneConfinementDecisionFunction(t *testing.T) {
 			t.Fatalf("read %s: %v", name, err)
 		}
 		src := string(raw)
+		// AttestBwrapRO( does not match the AttestBwrap( substring, so the
+		// legacy v1.0 probe keeps its own allow-list.
 		if strings.Contains(src, "AttestBwrap(") && !allowedAttest[name] {
 			t.Errorf("%s must not call AttestBwrap( directly; route through ResolveConfinementRank", name)
 		}
-		if strings.Contains(src, "directIsolatedArgv(") && !allowedIsolated[name] {
-			t.Errorf("%s must not call directIsolatedArgv( directly; route through ResolveConfinementRank", name)
+		for _, builder := range []string{"BuildBwrapROStageArgv(", "AttestBwrapRO("} {
+			if strings.Contains(src, builder) && !allowedRankFiles[name] {
+				t.Errorf("%s must not call %s directly; route through ResolveConfinementRank", name, builder)
+			}
+		}
+		if strings.Contains(src, "directIsolatedArgv(") {
+			t.Errorf("%s references the deleted builder directIsolatedArgv(", name)
 		}
 	}
 
@@ -247,10 +265,13 @@ func TestOneConfinementDecisionFunction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read direct.go: %v", err)
 	}
-	if strings.Contains(string(directSrc), "AttestBwrap(") || strings.Contains(string(directSrc), "directIsolatedArgv(") {
-		t.Error("direct.go must route every stage through the single resolved ConfinementSpec")
+	direct := string(directSrc)
+	for _, banned := range []string{"AttestBwrap(", "BuildBwrapROStageArgv(", "AttestBwrapRO("} {
+		if strings.Contains(direct, banned) {
+			t.Errorf("direct.go must route every stage through the single resolved ConfinementSpec (found %s)", banned)
+		}
 	}
-	if !strings.Contains(string(directSrc), "ResolveConfinementRank") {
+	if !strings.Contains(direct, "ResolveConfinementRank") {
 		t.Error("direct.go must call ResolveConfinementRank in both exec call sites")
 	}
 }

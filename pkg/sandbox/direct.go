@@ -208,6 +208,30 @@ func directEnvKeyDropped(key string) bool {
 	return false
 }
 
+// directRootEnvPins returns the thirteen job-private toolchain root pins in
+// their canonical order. It is the SINGLE source for those pins: the process
+// env built by buildDirectStageEnv and the bwrap-ro wrapper's --setenv block
+// both derive from this function, so the two cannot drift (T-09-06). A drift
+// would let a build write to a pinned path that the sandbox never bound
+// read-write, or vice versa.
+func directRootEnvPins(paths DirectJobPaths) [][2]string {
+	return [][2]string{
+		{"HOME", paths.HomeDir},
+		{"TMPDIR", paths.TmpDir},
+		{"GOTMPDIR", paths.TmpDir},
+		{"GOCACHE", paths.GoBuildCache},
+		{"GOPATH", paths.GoPath},
+		{"GOMODCACHE", paths.GoModCache},
+		{"XDG_CACHE_HOME", paths.CacheDir},
+		{"npm_config_cache", paths.NpmCacheDir},
+		{"PNPM_HOME", paths.PnpmHome},
+		{"YARN_CACHE_FOLDER", paths.YarnCacheDir},
+		{"PIP_CACHE_DIR", paths.PipCacheDir},
+		{"POETRY_CACHE_DIR", paths.PoetryCacheDir},
+		{"CARGO_HOME", paths.CargoHome},
+	}
+}
+
 // buildDirectStageEnv builds the stage exec env from the current process env
 // MINUS secrets, Go override keys and every toolchain root key, PLUS the
 // pinned offline list and — when paths is non-nil — the job-private root pins.
@@ -230,21 +254,10 @@ func buildDirectStageEnv(offline []string, paths *DirectJobPaths) []string {
 	if paths == nil {
 		return out
 	}
-	return append(out,
-		"HOME="+paths.HomeDir,
-		"TMPDIR="+paths.TmpDir,
-		"GOTMPDIR="+paths.TmpDir,
-		"GOCACHE="+paths.GoBuildCache,
-		"GOPATH="+paths.GoPath,
-		"GOMODCACHE="+paths.GoModCache,
-		"XDG_CACHE_HOME="+paths.CacheDir,
-		"npm_config_cache="+paths.NpmCacheDir,
-		"PNPM_HOME="+paths.PnpmHome,
-		"YARN_CACHE_FOLDER="+paths.YarnCacheDir,
-		"PIP_CACHE_DIR="+paths.PipCacheDir,
-		"POETRY_CACHE_DIR="+paths.PoetryCacheDir,
-		"CARGO_HOME="+paths.CargoHome,
-	)
+	for _, pin := range directRootEnvPins(*paths) {
+		out = append(out, pin[0]+"="+pin[1])
+	}
+	return out
 }
 
 // VerifyDir runs the build and test stages for the detected project type in
