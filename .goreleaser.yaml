@@ -38,6 +38,7 @@ builds:
 
 archives:
   - ids: [pr-review-go, pr-review-server, pr-review-sandbox-helper]
+    allow_different_binary_count: true
     formats: [tar.gz]
     format_overrides:
       - goos: windows
