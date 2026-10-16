@@ -19,8 +19,16 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: pr-review-sandbox-helper <command> [options]\nCommands: relay, export, retrieve, prepare\n")
+		fmt.Fprintf(os.Stderr, "Usage: pr-review-sandbox-helper <command> [options]\nCommands: relay, export, retrieve, prepare, landlock-run\n")
 		os.Exit(1)
+	}
+
+	// landlock-run is dispatched BEFORE the signal context is created: the
+	// applier pins its thread with runtime.LockOSThread and then execs, so no
+	// goroutine (including signal.NotifyContext's) may exist first. It also
+	// never returns on success.
+	if os.Args[1] == "landlock-run" {
+		os.Exit(runLandlockRun(os.Args[2:]))
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -301,5 +304,323 @@ func TestInLoopCommandRoutesThroughConfinementDispatch(t *testing.T) {
 	}
 	if stdout != "" || stderr != "" {
 		t.Fatalf("no output may be produced before confinement resolves: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+// TestLandlockRankWrapArgvContract pins the exact landlock argv contract:
+// helper landlock-run --ro / --rw <workspace> --rw <cache> --rw <tmp>
+// --rw <home> -- <cmd...>. The helper must receive exactly the roots the
+// server pinned, and an unresolvable helper or root must refuse the stage.
+func TestLandlockRankWrapArgvContract(t *testing.T) {
+	paths := provisionTestJobPaths(t)
+	helper := "/opt/pr-review-sandbox-helper"
+	command := []string{"go", "build", "./..."}
+
+	argv, err := landlockConfinementSpec().WrapArgv(command, paths, WrapOptions{HelperPath: helper})
+	if err != nil {
+		t.Fatalf("landlock wrap: %v", err)
+	}
+	want := []string{
+		helper, "landlock-run", "--ro", "/",
+		"--rw", paths.WorkspaceDir,
+		"--rw", paths.CacheDir,
+		"--rw", paths.TmpDir,
+		"--rw", paths.HomeDir,
+		"--", "go", "build", "./...",
+	}
+	if strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("landlock argv = %q, want %q", argv, want)
+	}
+	tail := argv[len(argv)-len(command):]
+	for i := range command {
+		if tail[i] != command[i] {
+			t.Fatalf("command tail was rewritten: got %q, want %q", tail, command)
+		}
+	}
+	if strings.Contains(strings.Join(argv, " "), "bwrap") {
+		t.Errorf("landlock argv must not stack bwrap: %q", argv)
+	}
+
+	t.Run("unresolvable-helper-refuses", func(t *testing.T) {
+		t.Setenv(SandboxHelperPathEnv, filepath.Join(t.TempDir(), "missing-helper"))
+		got, err := landlockConfinementSpec().WrapArgv(command, paths, WrapOptions{})
+		if !errors.Is(err, ErrConfinementUnavailable) {
+			t.Fatalf("want ErrConfinementUnavailable, got %v", err)
+		}
+		if got != nil {
+			t.Fatalf("failed wrap must return a nil argv, got %q", got)
+		}
+	})
+
+	t.Run("missing-root-refuses", func(t *testing.T) {
+		broken := paths
+		broken.WorkspaceDir = ""
+		got, err := landlockConfinementSpec().WrapArgv(command, broken, WrapOptions{HelperPath: helper})
+		if !errors.Is(err, ErrConfinementUnavailable) {
+			t.Fatalf("want ErrConfinementUnavailable, got %v", err)
+		}
+		if got != nil {
+			t.Fatalf("failed wrap must return a nil argv, got %q", got)
+		}
+	})
+}
+
+// TestLandlockProbeFakeHelper drives the real probe shape against an executable
+// fake helper that exits with a chosen code, proving the 70–76 mapping at probe
+// time: 70/71/72 are rank-unavailable, 74 can never select the rank, and the
+// probe argv is exactly the production contract.
+func TestLandlockProbeFakeHelper(t *testing.T) {
+	tmp := t.TempDir()
+	helperPath := filepath.Join(tmp, "pr-review-sandbox-helper")
+	if err := os.WriteFile(helperPath, []byte("#!/bin/sh\nexit \"${FAKE_LANDLOCK_EXIT:-0}\"\n"), 0o755); err != nil {
+		t.Fatalf("write fake helper: %v", err)
+	}
+	scratch := filepath.Join(tmp, "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatalf("scratch: %v", err)
+	}
+
+	var captured []string
+	runFake := func(code int) func(context.Context, []string) (int, string, error) {
+		return func(ctx context.Context, argv []string) (int, string, error) {
+			captured = append([]string{}, argv...)
+			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			cmd.Env = append(os.Environ(), "FAKE_LANDLOCK_EXIT="+strconv.Itoa(code))
+			stderr := NewLimitedCollector(DefaultMaxRetainedBytes)
+			cmd.Stderr = stderr
+			exit := 0
+			err := cmd.Run()
+			if err != nil {
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
+					exit = exitErr.ExitCode()
+					err = nil
+				}
+			}
+			return exit, stderr.Formatted("probe"), err
+		}
+	}
+	base := landlockProbeDeps{
+		resolve:   func() (string, error) { return helperPath, nil },
+		mkScratch: func() (string, func(), error) { return scratch, func() {}, nil },
+	}
+
+	t.Run("exit-0-selects-the-rank", func(t *testing.T) {
+		deps := base
+		deps.run = runFake(0)
+		if err := probeLandlockRankWith(context.Background(), deps); err != nil {
+			t.Fatalf("exit 0 must select the rank, got %v", err)
+		}
+		want := []string{helperPath, "landlock-run", "--ro", "/", "--rw", scratch, "--", "/bin/true"}
+		if strings.Join(captured, "\x00") != strings.Join(want, "\x00") {
+			t.Fatalf("probe argv = %q, want %q", captured, want)
+		}
+	})
+
+	for _, code := range []int{HelperExitUnavailable, HelperExitRuleset, HelperExitDomainEstablish} {
+		code := code
+		t.Run(fmt.Sprintf("exit-%d-is-unavailable", code), func(t *testing.T) {
+			deps := base
+			deps.run = runFake(code)
+			err := probeLandlockRankWith(context.Background(), deps)
+			if !errors.Is(err, ErrConfinementUnavailable) {
+				t.Fatalf("exit %d: want ErrConfinementUnavailable, got %v", code, err)
+			}
+			if !strings.Contains(err.Error(), strconv.Itoa(code)) {
+				t.Errorf("exit %d: error must name the code: %v", code, err)
+			}
+		})
+	}
+
+	for _, code := range []int{HelperExitPositiveControl, HelperExitUsage, HelperExitExec} {
+		code := code
+		t.Run(fmt.Sprintf("exit-%d-is-misconfiguration", code), func(t *testing.T) {
+			deps := base
+			deps.run = runFake(code)
+			if err := probeLandlockRankWith(context.Background(), deps); !errors.Is(err, ErrConfinementUnavailable) {
+				t.Fatalf("exit %d: want ErrConfinementUnavailable, got %v", code, err)
+			}
+		})
+	}
+
+	t.Run("exit-74-never-selects", func(t *testing.T) {
+		deps := base
+		deps.run = runFake(HelperExitNegativeControl)
+		err := probeLandlockRankWith(context.Background(), deps)
+		if err == nil {
+			t.Fatal("an unenforced domain (exit 74) must never select the rank")
+		}
+		if !errors.Is(err, ErrConfinementUnavailable) {
+			t.Fatalf("want ErrConfinementUnavailable, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "read-only root was writable") {
+			t.Errorf("error must state the denial: %v", err)
+		}
+	})
+
+	t.Run("resolve-failure", func(t *testing.T) {
+		deps := base
+		deps.resolve = func() (string, error) { return "", errors.New("no helper") }
+		if err := probeLandlockRankWith(context.Background(), deps); !errors.Is(err, ErrConfinementUnavailable) {
+			t.Fatalf("want ErrConfinementUnavailable, got %v", err)
+		}
+	})
+
+	t.Run("runner-error", func(t *testing.T) {
+		deps := base
+		deps.run = func(context.Context, []string) (int, string, error) {
+			return -1, "", errors.New("spawn failed")
+		}
+		if err := probeLandlockRankWith(context.Background(), deps); !errors.Is(err, ErrConfinementUnavailable) {
+			t.Fatalf("want ErrConfinementUnavailable, got %v", err)
+		}
+	})
+}
+
+// TestHelperExitMapsToUnavailableAtExecution proves a landlock helper pre-exec
+// exit becomes StatusUnavailable and never a build/test verdict (T-10-06).
+func TestHelperExitMapsToUnavailableAtExecution(t *testing.T) {
+	for _, code := range []int{70, 71, 72, 73, 74, 75, 76} {
+		report := &VerificationReport{Status: StatusBuildFailed, Reason: "stale"}
+		res := &StageResult{ExitCode: code, Passed: false}
+		if !applyHelperExitToReport(report, RankLandlock, res) {
+			t.Fatalf("exit %d: expected the mapping to claim the result", code)
+		}
+		if report.Status != StatusUnavailable {
+			t.Fatalf("exit %d: status = %q, want %q", code, report.Status, StatusUnavailable)
+		}
+		if !strings.Contains(report.Reason, strconv.Itoa(code)) {
+			t.Errorf("exit %d: reason must name the code: %q", code, report.Reason)
+		}
+		if report.Status == StatusBuildFailed || report.Status == StatusTestFailed {
+			t.Errorf("exit %d: a helper exit must never be a build/test failure", code)
+		}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		report *VerificationReport
+		rank   ConfinementRank
+		res    *StageResult
+	}{
+		{"nil-report", nil, RankLandlock, &StageResult{ExitCode: 70}},
+		{"nil-result", &VerificationReport{}, RankLandlock, nil},
+		{"passing-stage", &VerificationReport{}, RankLandlock, &StageResult{ExitCode: 0, Passed: true}},
+		{"bwrap-rank", &VerificationReport{}, RankBwrapRO, &StageResult{ExitCode: 70}},
+		{"non-contract-code", &VerificationReport{}, RankLandlock, &StageResult{ExitCode: 1}},
+		{"timeout-code", &VerificationReport{}, RankLandlock, &StageResult{ExitCode: 124}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if applyHelperExitToReport(tc.report, tc.rank, tc.res) {
+				t.Fatal("mapping must not claim this result")
+			}
+		})
+	}
+}
+
+// TestNoServerCallsLandlockApplier is the structural proof that the server
+// never calls restrict_self (T-10-01): the applier tokens may appear only in
+// non-test files under cmd/pr-review-sandbox-helper/.
+func TestNoServerCallsLandlockApplier(t *testing.T) {
+	root := filepath.Join("..", "..")
+	allowedPrefix := filepath.Join("cmd", "pr-review-sandbox-helper") + string(filepath.Separator)
+	tokens := []string{
+		"SYS_LANDLOCK_RESTRICT_SELF",
+		"SYS_LANDLOCK_ADD_RULE",
+		"SYS_LANDLOCK_CREATE_RULESET",
+		"PR_SET_NO_NEW_PRIVS",
+		"applyLandlockDomain",
+	}
+
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", ".planning", "node_modules", "dist", "vendor":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".go") || strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return nil
+		}
+		if strings.HasPrefix(rel, allowedPrefix) {
+			return nil
+		}
+		raw, readErr := os.ReadFile(p)
+		if readErr != nil {
+			return nil
+		}
+		for _, token := range tokens {
+			if strings.Contains(string(raw), token) {
+				t.Errorf("%s references %s; only cmd/pr-review-sandbox-helper/ may contain the applier", rel, token)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+}
+
+// TestGoreleaserHelperBuildIsLinuxOnly is the reproducible config proof (no
+// goreleaser binary is installed): the helper must stay a linux-only,
+// CGO-free amd64+arm64 artifact that ships in the release archives.
+func TestGoreleaserHelperBuildIsLinuxOnly(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", ".goreleaser.yaml"))
+	if err != nil {
+		t.Fatalf("read .goreleaser.yaml: %v", err)
+	}
+	src := string(raw)
+
+	const marker = "id: pr-review-sandbox-helper"
+	start := strings.Index(src, marker)
+	if start < 0 {
+		t.Fatalf(".goreleaser.yaml must declare a %s build", marker)
+	}
+	rest := src[start:]
+	// The block ends at the next build id or the next top-level key.
+	next := len(rest)
+	for _, sep := range []string{"\n  - id:", "\narchives:"} {
+		if idx := strings.Index(rest[len(marker):], sep); idx >= 0 {
+			if pos := len(marker) + idx; pos < next {
+				next = pos
+			}
+		}
+	}
+	block := rest[:next]
+
+	for _, want := range []string{
+		"main: ./cmd/pr-review-sandbox-helper",
+		"CGO_ENABLED=0",
+		"goos: [linux]",
+		"goarch: [amd64, arm64]",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("pr-review-sandbox-helper build block must contain %q:\n%s", want, block)
+		}
+	}
+	for _, unwanted := range []string{"darwin", "windows"} {
+		if strings.Contains(block, unwanted) {
+			t.Errorf("pr-review-sandbox-helper build block must not target %s:\n%s", unwanted, block)
+		}
+	}
+
+	archivesStart := strings.Index(src, "archives:")
+	if archivesStart < 0 {
+		t.Fatal(".goreleaser.yaml must declare archives")
+	}
+	archivesSection := src[archivesStart:]
+	if idx := strings.Index(archivesSection, "\nchecksum:"); idx >= 0 {
+		archivesSection = archivesSection[:idx]
+	}
+	if !strings.Contains(archivesSection, "pr-review-sandbox-helper") {
+		t.Errorf("archives.ids must include pr-review-sandbox-helper:\n%s", archivesSection)
 	}
 }

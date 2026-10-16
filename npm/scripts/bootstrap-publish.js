@@ -41,7 +41,7 @@ function main() {
 
   const artifacts = [];
   for (const row of mapping) {
-   for (const binary of ['pr-review-go', 'pr-review-server']) {
+   for (const binary of mapping.binariesFor(row.goos)) {
     const binName = binary + (row.platform === 'win32' ? '.exe' : '');
     const outPath = path.join(stagingDir, `${row.goos}_${row.goarch}`, binName);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });

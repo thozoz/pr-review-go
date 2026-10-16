@@ -25,11 +25,14 @@ builds:
       - -X github.com/thozoz/pr-review-go/pkg/version.Commit={{ .ShortCommit }}
       - -X github.com/thozoz/pr-review-go/pkg/version.Date={{ .Date }}
 
+  # Linux-only: the landlock rank exists only on Linux. landlock_run_other.go
+  # keeps the source building everywhere, but there is no reason to ship a
+  # helper that can never enforce anything (CONFINE-06).
   - id: pr-review-sandbox-helper
     main: ./cmd/pr-review-sandbox-helper
     binary: pr-review-sandbox-helper
     env: [CGO_ENABLED=0]
-    goos: [linux, darwin, windows]
+    goos: [linux]
     goarch: [amd64, arm64]
     ldflags: [-s -w]
 

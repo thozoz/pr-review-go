@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -110,8 +111,12 @@ func bwrapROConfinementSpec() ConfinementSpec {
 // landlockConfinementSpec builds the landlock rank: the trusted helper's
 // landlock-run subcommand owns enforcement (the server never calls
 // restrict_self, because Landlock domains are per-thread and irreversible).
-// This rank remaps no filesystem and removes no network interface, so
+// This rank remaps no filesystem, so its roots are HOST paths — the same-path
+// contract Phase 9 established — and it removes no network interface, so
 // NetworkIsolated is false; Phase 11 supplies the host-root env here.
+//
+// WrapArgv resolves the helper itself when WrapOptions.HelperPath is empty, so
+// VerifyDirGated's build and test call sites can keep passing WrapOptions{}.
 func landlockConfinementSpec() ConfinementSpec {
 	return ConfinementSpec{
 		Rank:            RankLandlock,
@@ -119,10 +124,39 @@ func landlockConfinementSpec() ConfinementSpec {
 		WrapArgv: func(argv []string, paths DirectJobPaths, opts WrapOptions) ([]string, error) {
 			helper := strings.TrimSpace(opts.HelperPath)
 			if helper == "" {
-				return nil, fmt.Errorf("%w: landlock rank requires the trusted helper path", ErrConfinementUnavailable)
+				resolved, err := ResolveSandboxHelperPath()
+				if err != nil {
+					return nil, err
+				}
+				helper = resolved
 			}
-			wrapped := make([]string, 0, len(argv)+2)
-			wrapped = append(wrapped, helper, "landlock-run")
+
+			// The helper receives exactly the roots the server already pinned
+			// in the stage environment: the read-only host root plus the four
+			// job roots. A root that is empty, "/" or relative would move the
+			// rank's meaning, so it is refused rather than guessed.
+			roots := []string{paths.WorkspaceDir, paths.CacheDir, paths.TmpDir, paths.HomeDir}
+			deduped := make([]string, 0, len(roots))
+			seen := make(map[string]bool, len(roots))
+			for _, root := range roots {
+				if root == "" || root == "/" || !filepath.IsAbs(root) {
+					return nil, fmt.Errorf(
+						"%w: landlock rank requires an absolute non-root job root, got %q",
+						ErrConfinementUnavailable, root)
+				}
+				if seen[root] {
+					continue
+				}
+				seen[root] = true
+				deduped = append(deduped, root)
+			}
+
+			wrapped := make([]string, 0, len(argv)+3+2*len(deduped)+1)
+			wrapped = append(wrapped, helper, "landlock-run", "--ro", "/")
+			for _, root := range deduped {
+				wrapped = append(wrapped, "--rw", root)
+			}
+			wrapped = append(wrapped, "--")
 			return append(wrapped, argv...), nil
 		},
 		Env: func(baseEnv []string, paths DirectJobPaths) []string {
@@ -131,12 +165,28 @@ func landlockConfinementSpec() ConfinementSpec {
 	}
 }
 
-// probeLandlockRank is the landlock rank probe. Phase 10/11 replaces this
-// body once the trusted helper grows its landlock-run subcommand; until then
-// the rank is honestly unavailable rather than silently degraded.
-func probeLandlockRank(ctx context.Context) error {
-	_ = ctx
-	return fmt.Errorf("%w: landlock: helper landlock-run subcommand not yet available", ErrConfinementUnavailable)
+// applyHelperExitToReport maps a landlock helper's pre-exec exit code onto the
+// run's fail-closed unavailable verdict. It returns true when it claimed the
+// stage result: a returned 70–76 code means the target never ran, so it must
+// never reach mapDirectStageFailure and become a build/test failure (T-10-06).
+//
+// HelperExitNegativeControl (74) is reported here as StatusUnavailable because
+// Phase 10 has no StatusConfinementDenied; Phase 11's reclassification is the
+// only planned change to this function's output.
+func applyHelperExitToReport(report *VerificationReport, rank ConfinementRank, res *StageResult) bool {
+	if report == nil || res == nil || res.Passed || rank != RankLandlock {
+		return false
+	}
+	reason, ok := helperExitUnavailable(res.ExitCode)
+	if !ok {
+		return false
+	}
+	report.Status = StatusUnavailable
+	report.Reason = fmt.Sprintf("%s (helper exit %d)", reason, res.ExitCode)
+	report.Summary = "UNAVAILABLE: " + report.Reason
+	// WorkspaceDir/CommitSHA/DetectedType/ConfinementRank/
+	// ConfinementNetworkIsolated are already set on report by the caller.
+	return true
 }
 
 // confinementResolverOverride is the test seam: when set, ResolveConfinementRank

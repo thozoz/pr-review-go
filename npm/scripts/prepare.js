@@ -4,7 +4,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const packageArtifacts = require('./lib/package-artifacts');
-const mapping = require('./lib/mapping');
 
 const EXCLUDED_TYPES = new Set(['Archive', 'Checksum', 'UploadableFile']);
 
@@ -25,14 +24,24 @@ function main() {
   const filtered = allArtifacts.filter((a) => {
     if (!a.goos || !a.goarch) return false;
     if (EXCLUDED_TYPES.has(a.type)) return false;
-    if (a.extra && a.extra.ID !== undefined && !['pr-review-go', 'pr-review-server'].includes(a.extra.ID)) return false;
+    if (a.extra && a.extra.ID !== undefined) {
+      if (!['pr-review-go', 'pr-review-server', 'pr-review-sandbox-helper'].includes(a.extra.ID)) return false;
+      // The helper is a Linux-only host artifact. Publishing it for another
+      // GOOS would ship a binary that can never enforce anything.
+      if (a.extra.ID === 'pr-review-sandbox-helper' && a.goos !== 'linux') {
+        throw new Error(
+          `prepare.js: pr-review-sandbox-helper artifact must be linux-only, got goos=${a.goos} goarch=${a.goarch}`
+        );
+      }
+    }
     return true;
   });
 
-  if (filtered.length !== mapping.length * 2) {
+  const expectedCount = packageArtifacts.expectedArtifactNames().length;
+  if (filtered.length !== expectedCount) {
     throw new Error(
-      `prepare.js: expected exactly ${mapping.length * 2} matching artifacts, found ${filtered.length}: ${JSON.stringify(
-        filtered.map((a) => ({ goos: a.goos, goarch: a.goarch, type: a.type }))
+      `prepare.js: expected exactly ${expectedCount} matching artifacts, found ${filtered.length}: ${JSON.stringify(
+        filtered.map((a) => ({ goos: a.goos, goarch: a.goarch, type: a.type, id: a.extra && a.extra.ID }))
       )}`
     );
   }

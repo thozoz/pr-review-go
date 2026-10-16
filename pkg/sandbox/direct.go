@@ -425,6 +425,9 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			report.DroppedBytes += installRes.DroppedBytes
 		}
 		if !installRes.Passed {
+			if applyHelperExitToReport(report, spec.Rank, installRes) {
+				return report, nil
+			}
 			report.FailedStage = "install"
 			report.Status = StatusIncomplete
 			report.Reason = fmt.Sprintf("dependency installation failed: %s", strings.Join(proj.installArgs, " "))
@@ -445,6 +448,9 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			report.DroppedBytes += buildRes.DroppedBytes
 		}
 		if !buildRes.Passed {
+			if applyHelperExitToReport(report, spec.Rank, buildRes) {
+				return report, nil
+			}
 			report.FailedStage = "build"
 			mapDirectStageFailure(report, "build", buildRes,
 				"build stage exceeded execution timeout",
@@ -470,6 +476,9 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 		report.DroppedBytes += testRes.DroppedBytes
 	}
 	if !testRes.Passed {
+		if applyHelperExitToReport(report, spec.Rank, testRes) {
+			return report, nil
+		}
 		report.FailedStage = "test"
 		mapDirectStageFailure(report, "test", testRes,
 			"test stage exceeded execution timeout",
