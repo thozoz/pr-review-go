@@ -67,7 +67,10 @@ func DirectRunnerForConfig(cfg *config.Config) *DirectRunner {
 	if cfg.SandboxMode != config.SandboxModeDirect {
 		return nil
 	}
-	return NewDirectRunner(cfg.SandboxTimeoutExecution)
+	return NewDirectRunnerWithRoots(
+		cfg.SandboxTimeoutExecution,
+		DirectRoots{WorkRoot: cfg.SandboxDirectWorkRoot, CacheRoot: cfg.SandboxDirectCacheDir},
+	)
 }
 
 // SlotManagerForConfig returns a Linux slot manager, or nil when isolated

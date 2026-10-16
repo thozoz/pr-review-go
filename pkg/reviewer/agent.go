@@ -354,6 +354,8 @@ func (a *ReviewerAgent) buildAgentInitialUserPrompt(
 		b.WriteString("### Real Sandbox Environment Verification:\n")
 	case sandbox.StatusBuildFailed, sandbox.StatusTestFailed:
 		b.WriteString("### Real Sandbox Environment Verification (Failed):\n")
+	case sandbox.StatusConfinementDenied:
+		b.WriteString("### Real Sandbox Environment Verification (Confinement Denied):\n")
 	default:
 		b.WriteString("### Sandbox Verification (Skipped / Unavailable):\n")
 	}

@@ -489,6 +489,23 @@ CRITICAL RULES:
 - Set suggested_code only when it is a small, exact, safe replacement for one changed line. Otherwise omit it.
 - Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
 
+	case sandbox.StatusConfinementDenied:
+		return `You are an elite, highly rigorous AI Code Reviewer.
+Your role is to analyze Pull Requests by combining two critical signals:
+1. Existing Discussion History (prior PR comments, reviewer feedback, author clarifications).
+2. The Git Diff.
+
+NOTE: The sandbox ran the code, but the filesystem-confinement layer DENIED an operation the code attempted. This is a sandbox environment condition, NOT evidence that the PR is broken. Do not report the denial as a code defect, and do not claim tests passed. This outcome is not retryable.
+
+CRITICAL RULES:
+- Never hallucinate false bugs. A confinement denial tells you nothing about whether the code is correct.
+- Do not claim builds or tests passed, and do not claim the PR failed to compile or failed its tests because of the denial.
+- If an existing discussion thread shows a concern was already acknowledged, discussed, or dismissed by the author/reviewer, DO NOT repeat it as a new issue.
+- If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.
+- Focus strictly on real defects: race conditions, concurrency bugs, nil/null pointer exceptions, resource leaks, breaking API contracts, security flaws, and performance regressions.
+- Set suggested_code only when it is a small, exact, safe replacement for one changed line. Otherwise omit it.
+- Output MUST be valid JSON conforming to the schema below. Do not wrap in markdown or add conversational filler.`
+
 	default:
 		return `You are an elite, highly rigorous AI Code Reviewer.
 Your role is to analyze Pull Requests by combining two critical signals:
@@ -529,6 +546,8 @@ func buildUserPrompt(pr *github.PRDetails, diff string, comments []github.Commen
 		b.WriteString("### Real Sandbox Environment Verification (Resource Exhausted):\n")
 	case sandbox.StatusIncomplete:
 		b.WriteString("### Sandbox Verification (Incomplete):\n")
+	case sandbox.StatusConfinementDenied:
+		b.WriteString("### Real Sandbox Environment Verification (Confinement Denied):\n")
 	case sandbox.StatusUnsupportedLanguage:
 		b.WriteString("### Sandbox Verification (Unsupported Language):\n")
 	default:
