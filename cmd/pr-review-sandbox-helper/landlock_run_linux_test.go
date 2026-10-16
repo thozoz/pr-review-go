@@ -163,7 +163,7 @@ func TestHelperLandlockRunSubprocess(t *testing.T) {
 
 	t.Run("scratch-rw-root", func(t *testing.T) {
 		scratch := t.TempDir()
-		cmd := exec.Command(helper, "landlock-run", "--rw", scratch, "--", "/bin/true")
+		cmd := exec.Command(helper, "landlock-run", "--ro", "/", "--rw", scratch, "--", "/bin/true")
 		out, err := cmd.CombinedOutput()
 		code := 0
 		if err != nil {
