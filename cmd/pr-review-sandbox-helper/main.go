@@ -242,6 +242,18 @@ func runPrepare(ctx context.Context, args []string) {
 	// 3. Execute trusted go mod download with strictly sanitized environment (D-05, SAFE-01)
 	downloadCmd := exec.CommandContext(ctx, "go", "mod", "download")
 	downloadCmd.Dir = *workDir
+	// The confinement rank that launched this helper already set the job's
+	// same-path cache, home and tmp directories in this process's environment
+	// (the bwrap-ro wrapper's --clearenv/--setenv block), so prefer those over
+	// the podman layout's fixed /cache mounts. The rank-provided values are
+	// trusted: they come from the server-built ConfinementSpec, never from the
+	// untrusted project. PATH and GOROOT are already read the same way.
+	helperEnvOr := func(key, fallback string) string {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+		return fallback
+	}
 	downloadCmd.Env = []string{
 		"GOPROXY=" + fmt.Sprintf("http://%s", relayAddr),
 		"GOSUMDB=" + fmt.Sprintf("sum.golang.org http://%s/sumdb/sum.golang.org", relayAddr),
@@ -249,11 +261,11 @@ func runPrepare(ctx context.Context, args []string) {
 		"GOTOOLCHAIN=local",
 		"GOWORK=off",
 		"GOENV=off",
-		"GOCACHE=/cache/go-build",
-		"GOMODCACHE=/cache/go/pkg/mod",
-		"GOPATH=/cache/go",
-		"HOME=/tmp",
-		"TMPDIR=/tmp",
+		"GOCACHE=" + helperEnvOr("GOCACHE", "/cache/go-build"),
+		"GOMODCACHE=" + helperEnvOr("GOMODCACHE", "/cache/go/pkg/mod"),
+		"GOPATH=" + helperEnvOr("GOPATH", "/cache/go"),
+		"HOME=" + helperEnvOr("HOME", "/tmp"),
+		"TMPDIR=" + helperEnvOr("TMPDIR", "/tmp"),
 		"PATH=" + os.Getenv("PATH"),
 		"GOROOT=" + os.Getenv("GOROOT"),
 		"GO111MODULE=on",

@@ -92,16 +92,15 @@ func resolveConfinementRankWith(ctx context.Context, p confinementProbes) (Confi
 		ErrConfinementUnavailable, bwrapErr, landlockErr)
 }
 
-// bwrapROConfinementSpec builds the bwrap-ro rank: the private-root argv
-// builder in direct_isolation.go plus a no-op env (this rank carries its
-// environment inside the wrapper's --clearenv/--setenv block).
+// bwrapROConfinementSpec builds the bwrap-ro rank: the read-only host root
+// argv builder in bwrap_ro.go plus a no-op env (this rank carries its
+// environment inside the wrapper's --clearenv/--setenv block, which is derived
+// from the same directRootEnvPins source as buildDirectStageEnv).
 func bwrapROConfinementSpec() ConfinementSpec {
 	return ConfinementSpec{
 		Rank:            RankBwrapRO,
 		NetworkIsolated: true,
-		WrapArgv: func(argv []string, paths DirectJobPaths, opts WrapOptions) ([]string, error) {
-			return directIsolatedArgv(paths.WorkspaceDir, paths.CacheDir, paths.TmpDir, argv, opts.GatewaySocketPath, opts.HelperPath)
-		},
+		WrapArgv:        BuildBwrapROStageArgv,
 		Env: func(baseEnv []string, paths DirectJobPaths) []string {
 			return baseEnv
 		},
@@ -130,13 +129,6 @@ func landlockConfinementSpec() ConfinementSpec {
 			return baseEnv
 		},
 	}
-}
-
-// attestBwrapRO is the bwrap-ro rank probe. Phase 9 replaces this body with
-// the real `--ro-bind / /` shape probe in bwrap_ro.go; until then the
-// existing userns+net attestation is the honest proxy.
-func attestBwrapRO(ctx context.Context) error {
-	return AttestBwrap(ctx)
 }
 
 // probeLandlockRank is the landlock rank probe. Phase 10/11 replaces this
@@ -190,7 +182,7 @@ func ResolveConfinementRank(ctx context.Context) (ConfinementSpec, error) {
 	confinementResolveOnce.Do(func() {
 		confinementResolvedSpec, confinementResolvedErr = resolveConfinementRankWith(ctx, confinementProbes{
 			goos:          runtime.GOOS,
-			attestBwrapRO: attestBwrapRO,
+			attestBwrapRO: AttestBwrapRO,
 			probeLandlock: probeLandlockRank,
 		})
 	})

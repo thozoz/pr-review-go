@@ -260,6 +260,13 @@ func TestInLoop_DirectExecSmoke(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go toolchain absent on PATH")
 	}
+	// Rank availability: on a host with no usable confinement rank the command
+	// is refused by design, so this live smoke skips with the typed reason
+	// instead of failing. The fail-closed refusal itself is pinned by
+	// TestInLoopCommandRoutesThroughConfinementDispatch.
+	if _, err := ResolveConfinementRank(context.Background()); err != nil {
+		t.Skipf("no confinement rank available on this host: %v", err)
+	}
 	dir := t.TempDir()
 	writeMarker(t, dir, "go.mod", "module example.com/inloopsmoke\n\ngo 1.22\n")
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
