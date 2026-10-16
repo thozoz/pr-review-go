@@ -266,7 +266,8 @@ func TestInLoop_DirectExecSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stdout, stderr, code, err := InLoopCommand(context.Background(), dir, []string{"go", "build", "./..."}, 2*time.Minute, 0)
+	stdout, stderr, code, err := InLoopCommand(context.Background(), dir, []string{"go", "build", "./..."}, 2*time.Minute, 0,
+		WithDirectRoots(DirectRoots{WorkRoot: t.TempDir(), CacheRoot: t.TempDir()}))
 	if err != nil {
 		t.Fatalf("matrix exec failed: %v (stdout=%q stderr=%q)", err, stdout, stderr)
 	}

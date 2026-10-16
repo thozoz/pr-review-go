@@ -250,9 +250,11 @@ func (p *DirectJobPaths) Cleanup() {
 	_ = removeJobDirs(*p, DirectRoots{WorkRoot: p.workRoot, CacheRoot: p.cacheRoot})
 }
 
-// directPrepare executes only the trusted helper inside the isolated namespace.
-// The helper's loopback relay can reach only this job's restricted UDS gateway.
-func directPrepare(ctx context.Context, timeout time.Duration, work, cache, tmp string) (*StageResult, error) {
+// directPrepare executes only the trusted helper inside the resolved
+// confinement namespace. The helper's loopback relay can reach only this
+// job's restricted UDS gateway. The argv comes from the single resolved spec,
+// so stage-0 is never left unwrapped (CONFINE-01).
+func directPrepare(ctx context.Context, timeout time.Duration, paths DirectJobPaths, spec ConfinementSpec) (*StageResult, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -276,7 +278,11 @@ func directPrepare(ctx context.Context, timeout time.Duration, work, cache, tmp 
 		return nil, err
 	}
 	defer gw.Close()
-	argv, err := directIsolatedArgv(work, cache, tmp, []string{"/sandbox-helper", "prepare", "-socket", BwrapGatewaySocketPath, "-work", "/work"}, socket, helper)
+	argv, err := spec.WrapArgv(
+		[]string{"/sandbox-helper", "prepare", "-socket", BwrapGatewaySocketPath, "-work", "/work"},
+		paths,
+		WrapOptions{GatewaySocketPath: socket, HelperPath: helper},
+	)
 	if err != nil {
 		return nil, err
 	}

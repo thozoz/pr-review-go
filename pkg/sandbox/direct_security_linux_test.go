@@ -71,7 +71,10 @@ func TestDirectAuthorizedGatewayFetch(t *testing.T) {
 	}
 	work := writeDirectModule(t, map[string]string{"go.mod": "module example.com/gatewayproof\n\ngo 1.24\n\nrequire rsc.io/quote v1.5.2\n", "main.go": "package main\nfunc main() {}\n"})
 	paths := provisionTestJobPaths(t)
-	res, err := directPrepare(context.Background(), time.Minute, work, paths.CacheDir, paths.TmpDir)
+	// directPrepare binds the spec's workspace at /work; this fixture supplies
+	// its own module tree, so point the job workspace at it.
+	paths.WorkspaceDir = work
+	res, err := directPrepare(context.Background(), time.Minute, paths, bwrapROConfinementSpec())
 	if err != nil {
 		t.Fatal(err)
 	}

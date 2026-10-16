@@ -177,10 +177,13 @@ var gatedRunCommandBackend func(ctx context.Context, workDir string, argv []stri
 // crosses it (token containment, T-05-02).
 func SetGatedInLoopBackends(runner *sandbox.Runner, containerID string) {
 	gatedRunCommandBackend = func(ctx context.Context, workDir string, argv []string) (string, string, int, error) {
-		if containerID != "" && runner != nil {
+		if runner == nil {
+			return "", "", -1, fmt.Errorf("tool-unavailable: no sandbox runner bound; host fallback refused")
+		}
+		if containerID != "" {
 			return runner.InLoopExecCommand(ctx, containerID, argv, 0, 0)
 		}
-		return sandbox.InLoopCommand(ctx, workDir, argv, 0, 0)
+		return sandbox.InLoopCommand(ctx, workDir, argv, 0, 0, sandbox.WithDirectRoots(runner.DirectRoots()))
 	}
 }
 
