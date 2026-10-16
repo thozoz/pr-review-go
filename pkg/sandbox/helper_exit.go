@@ -24,8 +24,9 @@ package sandbox
 //
 // HelperExitNegativeControl is a SECURITY DENIAL, not an environment failure:
 // it means a root the caller declared read-only was in fact writable, so no
-// domain was enforcing the policy. Phase 10 reports it fail-closed as
-// StatusUnavailable; Phase 11 reclassifies it as StatusConfinementDenied.
+// domain was enforcing the policy. It maps to StatusConfinementDenied through
+// helperExitConfinementDenied, never to StatusUnavailable and never to a
+// build/test failure.
 const (
 	// HelperExitUnavailable (70) — Landlock is absent, disabled, or below the
 	// minimum usable ABI on this host. The rank is unavailable, not broken.
@@ -68,17 +69,17 @@ func HelperExitReason(code int) (string, bool) {
 }
 
 // helperExitUnavailable reports whether a helper exit code means "this rank is
-// unavailable, do not claim a build/test verdict". It intentionally includes
-// 74: Phase 10 has no StatusConfinementDenied yet, and reporting a discovered
-// non-enforcing domain as a build failure would blame the project for a
-// confinement fault. Phase 11 is the only planned change to this split.
+// unavailable, do not claim a build/test verdict". It intentionally excludes
+// 74 (HelperExitNegativeControl): that code is a proven security denial owned
+// by helperExitConfinementDenied, not an environment failure. Codes 70/71/72/
+// 73/75/76 remain unavailable so a pre-exec fault is never blamed on the
+// project (T-10-06).
 func helperExitUnavailable(code int) (string, bool) {
 	switch code {
 	case HelperExitUnavailable,
 		HelperExitRuleset,
 		HelperExitDomainEstablish,
 		HelperExitPositiveControl,
-		HelperExitNegativeControl,
 		HelperExitUsage,
 		HelperExitExec:
 		reason, ok := helperExitReasons[code]
@@ -86,4 +87,13 @@ func helperExitUnavailable(code int) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// helperExitConfinementDenied reports whether a helper exit code proves the
+// confinement domain was not enforcing. Exit 74 is the negative control: a root
+// the caller declared read-only was in fact writable, which means no domain was
+// applied. That must become StatusConfinementDenied — never StatusUnavailable
+// and never a build/test verdict (CONFINE-04).
+func helperExitConfinementDenied(code int) bool {
+	return code == HelperExitNegativeControl
 }

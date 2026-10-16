@@ -403,6 +403,9 @@ func TestLandlockProbeFakeHelper(t *testing.T) {
 	base := landlockProbeDeps{
 		resolve:   func() (string, error) { return helperPath, nil },
 		mkScratch: func() (string, func(), error) { return scratch, func() {}, nil },
+		// The ABI query runs first and must succeed here, otherwise the real
+		// kernel would short-circuit the fake helper on this host.
+		queryABI: func() (int, error) { return 7, nil },
 	}
 
 	t.Run("exit-0-selects-the-rank", func(t *testing.T) {
@@ -458,6 +461,54 @@ func TestLandlockProbeFakeHelper(t *testing.T) {
 		}
 	})
 
+	for _, reason := range []LandlockProbeReason{
+		LandlockReasonUnsupported,
+		LandlockReasonDisabled,
+		LandlockReasonBlocked,
+		LandlockReasonInvalid,
+		LandlockReasonTooOld,
+	} {
+		reason := reason
+		t.Run("abi-query-"+string(reason)+"-never-spawns", func(t *testing.T) {
+			deps := base
+			deps.queryABI = func() (int, error) {
+				return 0, newLandlockProbeError(reason, 95, 0, "")
+			}
+			deps.run = func(context.Context, []string) (int, string, error) {
+				t.Fatal("the helper must not be spawned when the ABI query fails")
+				return 0, "", nil
+			}
+			deps.resolve = func() (string, error) {
+				t.Fatal("the helper must not be resolved when the ABI query fails")
+				return "", nil
+			}
+			err := probeLandlockRankWith(context.Background(), deps)
+			if !errors.Is(err, ErrConfinementUnavailable) {
+				t.Fatalf("want ErrConfinementUnavailable, got %v", err)
+			}
+			if got, ok := LandlockProbeErrorReason(err); !ok || got != reason {
+				t.Fatalf("typed reason = (%q, %v), want (%q, true); err=%v", got, ok, reason, err)
+			}
+		})
+	}
+
+	t.Run("too-old-abi-never-spawns", func(t *testing.T) {
+		deps := base
+		deps.queryABI = func() (int, error) { return 1, nil }
+		deps.run = func(context.Context, []string) (int, string, error) {
+			t.Fatal("the helper must not be spawned for a too-old ABI")
+			return 0, "", nil
+		}
+		deps.resolve = func() (string, error) {
+			t.Fatal("the helper must not be resolved for a too-old ABI")
+			return "", nil
+		}
+		err := probeLandlockRankWith(context.Background(), deps)
+		if got, ok := LandlockProbeErrorReason(err); !ok || got != LandlockReasonTooOld {
+			t.Fatalf("typed reason = (%q, %v), want (%q, true); err=%v", got, ok, LandlockReasonTooOld, err)
+		}
+	})
+
 	t.Run("resolve-failure", func(t *testing.T) {
 		deps := base
 		deps.resolve = func() (string, error) { return "", errors.New("no helper") }
@@ -477,10 +528,40 @@ func TestLandlockProbeFakeHelper(t *testing.T) {
 	})
 }
 
-// TestHelperExitMapsToUnavailableAtExecution proves a landlock helper pre-exec
-// exit becomes StatusUnavailable and never a build/test verdict (T-10-06).
-func TestHelperExitMapsToUnavailableAtExecution(t *testing.T) {
-	for _, code := range []int{70, 71, 72, 73, 74, 75, 76} {
+// TestHelperExitMapsToDeniedOrUnavailableAtExecution proves the split: exit 74
+// (the negative control) becomes StatusConfinementDenied, while 70–73/75–76
+// become StatusUnavailable, and none can ever become a build/test verdict
+// (T-10-06, CONFINE-04).
+func TestHelperExitMapsToDeniedOrUnavailableAtExecution(t *testing.T) {
+	// Exit 74 is a proven security denial, never an unavailable rank.
+	{
+		report := &VerificationReport{Status: StatusBuildFailed, Reason: "stale"}
+		res := &StageResult{ExitCode: HelperExitNegativeControl, Passed: false}
+		if !applyHelperExitToReport(report, RankLandlock, res) {
+			t.Fatal("exit 74: expected the mapping to claim the result")
+		}
+		if report.Status != StatusConfinementDenied {
+			t.Fatalf("exit 74: status = %q, want %q", report.Status, StatusConfinementDenied)
+		}
+		if !strings.Contains(report.Reason, "74") {
+			t.Errorf("exit 74: reason must name the code: %q", report.Reason)
+		}
+		if !strings.Contains(report.Reason, "not enforcing") {
+			t.Errorf("exit 74: reason must name the non-enforcing domain: %q", report.Reason)
+		}
+		if report.ConfinementDeniedPath != "" {
+			t.Errorf("exit 74: the pre-exec proof has no path, got %q", report.ConfinementDeniedPath)
+		}
+		if !strings.Contains(report.Summary, "CONFINEMENT-DENIED") {
+			t.Errorf("exit 74: summary must carry the denial label: %q", report.Summary)
+		}
+		if report.Status == StatusUnavailable || report.Status == StatusBuildFailed || report.Status == StatusTestFailed {
+			t.Errorf("exit 74: a proven denial must never be unavailable or a build/test failure: %q", report.Status)
+		}
+	}
+
+	// 70–73/75–76 stay unavailable.
+	for _, code := range []int{70, 71, 72, 73, 75, 76} {
 		report := &VerificationReport{Status: StatusBuildFailed, Reason: "stale"}
 		res := &StageResult{ExitCode: code, Passed: false}
 		if !applyHelperExitToReport(report, RankLandlock, res) {
@@ -515,6 +596,134 @@ func TestHelperExitMapsToUnavailableAtExecution(t *testing.T) {
 				t.Fatal("mapping must not claim this result")
 			}
 		})
+	}
+}
+
+// TestVerifyDirGatedExit74IsConfinementDenied proves the end-to-end path: the
+// landlock rank runs a fake helper that exits 74, and the run ends in
+// StatusConfinementDenied with ConfinementRank "landlock" — never a build or
+// test verdict (CONFINE-04).
+func TestVerifyDirGatedExit74IsConfinementDenied(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain absent on PATH")
+	}
+	dir := writeDirectModule(t, map[string]string{
+		"go.mod":  "module example.com/exit74\n\ngo 1.24\n",
+		"main.go": "package main\n\nfunc main() {}\n",
+	})
+
+	helperPath := filepath.Join(t.TempDir(), "pr-review-sandbox-helper")
+	if err := os.WriteFile(helperPath, []byte("#!/bin/sh\nexit 74\n"), 0o755); err != nil {
+		t.Fatalf("write fake helper: %v", err)
+	}
+	t.Setenv(SandboxHelperPathEnv, helperPath)
+
+	setConfinementResolverOverrideForTest(func(context.Context) (ConfinementSpec, error) {
+		return landlockConfinementSpec(), nil
+	})
+	defer resetConfinementRankForTest()
+
+	report, err := newTestDirectRunner(t, 30*time.Second).VerifyDirGated(context.Background(), dir, directTestSHA, false)
+	if err != nil {
+		t.Fatalf("VerifyDirGated: %v", err)
+	}
+	if report.Status != StatusConfinementDenied {
+		t.Fatalf("status = %q, want %q (reason=%q)", report.Status, StatusConfinementDenied, report.Reason)
+	}
+	if report.ConfinementRank != string(RankLandlock) {
+		t.Fatalf("rank = %q, want %q", report.ConfinementRank, RankLandlock)
+	}
+	if len(report.Results) != 1 {
+		t.Fatalf("results = %d, want exactly one (the target never ran)", len(report.Results))
+	}
+	if report.Results[0].ExitCode != HelperExitNegativeControl {
+		t.Fatalf("exit = %d, want %d", report.Results[0].ExitCode, HelperExitNegativeControl)
+	}
+}
+
+// TestOnHostLandlockRankUnavailableReason records the real host state and
+// never fails on the expected EOPNOTSUPP: on this LXC Landlock is compiled in
+// but disabled at boot, so a recorded Disabled reason is a pass (T-11-03).
+// It only ever performs the read-only version query; no domain is applied.
+func TestOnHostLandlockRankUnavailableReason(t *testing.T) {
+	abi, err := queryLandlockABI()
+	if err != nil {
+		reason, ok := LandlockProbeErrorReason(err)
+		if !ok {
+			t.Fatalf("the on-host ABI error must be typed: %v", err)
+		}
+		switch reason {
+		case LandlockReasonUnsupported,
+			LandlockReasonDisabled,
+			LandlockReasonBlocked,
+			LandlockReasonInvalid,
+			LandlockReasonTooOld,
+			LandlockReasonNotLinux:
+		default:
+			t.Fatalf("unexpected on-host Landlock reason %q", reason)
+		}
+		msg := LandlockProbeReasonMessage(reason, "")
+		if strings.TrimSpace(msg) == "" {
+			t.Fatal("the reason message must be non-empty and actionable")
+		}
+		t.Logf("on-host Landlock ABI query: abi=%d reason=%s err=%v", abi, reason, err)
+		return
+	}
+	if abi < MinLandlockABI {
+		t.Fatalf("a successful query must report a supported ABI, got %d", abi)
+	}
+	t.Logf("on-host Landlock ABI query succeeded: abi=%d", abi)
+}
+
+// serverABIProbeIsQueryOnly reports whether a source file's use of the
+// create_ruleset syscall is the read-only version query: it must reference the
+// version cookie and none of the applier tokens.
+func serverABIProbeIsQueryOnly(src string) bool {
+	if !strings.Contains(src, "LANDLOCK_CREATE_RULESET_VERSION") {
+		return false
+	}
+	for _, banned := range []string{
+		"LANDLOCK_RULE_PATH_BENEATH",
+		"SYS_LANDLOCK_ADD_RULE",
+		"SYS_LANDLOCK_RESTRICT_SELF",
+		"PR_SET_NO_NEW_PRIVS",
+		"applyLandlockDomain",
+	} {
+		if strings.Contains(src, banned) {
+			return false
+		}
+	}
+	return true
+}
+
+// TestServerABIProbeIsQueryOnly is the structural proof that the server-side
+// ABI probe only ever asks for the version cookie and never builds a ruleset or
+// applies a domain (T-11-01).
+func TestServerABIProbeIsQueryOnly(t *testing.T) {
+	raw, err := os.ReadFile("landlock_abi_linux.go")
+	if err != nil {
+		t.Fatalf("read landlock_abi_linux.go: %v", err)
+	}
+	src := string(raw)
+	if !strings.Contains(src, "LANDLOCK_CREATE_RULESET_VERSION") {
+		t.Error("landlock_abi_linux.go must query LANDLOCK_CREATE_RULESET_VERSION")
+	}
+	for _, banned := range []string{
+		"LANDLOCK_RULE_PATH_BENEATH",
+		"SYS_LANDLOCK_ADD_RULE",
+		"SYS_LANDLOCK_RESTRICT_SELF",
+		"PR_SET_NO_NEW_PRIVS",
+		"applyLandlockDomain",
+	} {
+		if strings.Contains(src, banned) {
+			t.Errorf("landlock_abi_linux.go must not contain %s", banned)
+		}
+	}
+	if got := strings.Count(src, "SYS_LANDLOCK_CREATE_RULESET"); got != 1 {
+		t.Errorf("landlock_abi_linux.go must have exactly one SYS_LANDLOCK_CREATE_RULESET call site, found %d", got)
+	}
+	if !strings.Contains(src, "unix.LANDLOCK_CREATE_RULESET_VERSION") {
+		t.Error("the single call site must pass the version cookie")
 	}
 }
 
@@ -558,9 +767,15 @@ func TestNoServerCallsLandlockApplier(t *testing.T) {
 			return nil
 		}
 		for _, token := range tokens {
-			if strings.Contains(string(raw), token) {
-				t.Errorf("%s references %s; only cmd/pr-review-sandbox-helper/ may contain the applier", rel, token)
+			if !strings.Contains(string(raw), token) {
+				continue
 			}
+			// The read-only ABI version query is permitted outside the
+			// helper, but only when the same file is provably query-only.
+			if token == "SYS_LANDLOCK_CREATE_RULESET" && serverABIProbeIsQueryOnly(string(raw)) {
+				continue
+			}
+			t.Errorf("%s references %s; only cmd/pr-review-sandbox-helper/ may contain the applier", rel, token)
 		}
 		return nil
 	})

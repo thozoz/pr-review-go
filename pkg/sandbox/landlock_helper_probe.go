@@ -10,13 +10,14 @@ import (
 	"time"
 )
 
-// landlockProbeDeps is the probe seam: resolution, execution and scratch
-// provisioning are injectable so every failure mode is testable without a
-// Landlock-capable kernel.
+// landlockProbeDeps is the probe seam: resolution, execution, scratch
+// provisioning and the read-only ABI query are injectable so every failure
+// mode is testable without a Landlock-capable kernel.
 type landlockProbeDeps struct {
 	resolve   func() (string, error)
 	run       func(ctx context.Context, argv []string) (exitCode int, stderr string, err error)
 	mkScratch func() (string, func(), error)
+	queryABI  func() (int, error)
 }
 
 // defaultLandlockProbeDeps is the production probe environment. The helper is
@@ -24,7 +25,8 @@ type landlockProbeDeps struct {
 // helper from stalling rank resolution.
 func defaultLandlockProbeDeps() landlockProbeDeps {
 	return landlockProbeDeps{
-		resolve: ResolveSandboxHelperPath,
+		resolve:  ResolveSandboxHelperPath,
+		queryABI: queryLandlockABI,
 		run: func(ctx context.Context, argv []string) (int, string, error) {
 			runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
@@ -65,11 +67,31 @@ func probeLandlockRank(ctx context.Context) error {
 
 // probeLandlockRankWith runs the probe against the supplied dependency seam.
 //
+// The read-only ABI query runs FIRST, before the helper is resolved or spawned:
+// a host whose kernel has no usable Landlock reports the typed reason
+// (ENOSYS/EOPNOTSUPP/EPERM/too-old) immediately instead of a helper exit that
+// conflates four different operator remediations (T-11-03).
+//
 // Mapping is deliberately conservative over the whole 70–76 contract: 70/71/72
 // are the honest "this host cannot confine" codes, 73/75/76 mean the probe
 // itself is misconfigured, and 74 means a root declared read-only was writable
 // — an unenforced domain must never select the rank.
 func probeLandlockRankWith(ctx context.Context, deps landlockProbeDeps) error {
+	if deps.queryABI == nil {
+		deps.queryABI = queryLandlockABI
+	}
+	abi, abiErr := deps.queryABI()
+	if abiErr != nil {
+		// Multi-%w keeps both sentinels reachable: errors.Is finds
+		// ErrConfinementUnavailable and errors.As finds *LandlockProbeError,
+		// so callers can act on the typed reason without parsing text.
+		return fmt.Errorf("%w: %w", ErrConfinementUnavailable, abiErr)
+	}
+	if reason, ok := LandlockABIVersionReason(abi); !ok {
+		return fmt.Errorf("%w: %w", ErrConfinementUnavailable,
+			newLandlockProbeError(reason, 0, abi, ""))
+	}
+
 	helper, err := deps.resolve()
 	if err != nil {
 		return fmt.Errorf("%w: landlock probe cannot resolve %s: %v", ErrConfinementUnavailable, HelperBinaryName, err)
@@ -93,22 +115,23 @@ func probeLandlockRankWith(ctx context.Context, deps landlockProbeDeps) error {
 			ErrConfinementUnavailable, helper, runErr)
 	}
 
+	abiSuffix := fmt.Sprintf(" (observed Landlock ABI %d)", abi)
 	switch exitCode {
 	case 0:
 		return nil
 	case HelperExitUnavailable, HelperExitRuleset, HelperExitDomainEstablish:
 		reason, _ := HelperExitReason(exitCode)
-		return fmt.Errorf("%w: landlock probe reported exit %d: %s%s",
-			ErrConfinementUnavailable, exitCode, reason, probeStderrSuffix(stderr))
+		return fmt.Errorf("%w: landlock probe reported exit %d: %s%s%s",
+			ErrConfinementUnavailable, exitCode, reason, probeStderrSuffix(stderr), abiSuffix)
 	case HelperExitPositiveControl, HelperExitUsage, HelperExitExec:
-		return fmt.Errorf("%w: landlock probe reported exit %d, which means the probe invocation is misconfigured%s",
-			ErrConfinementUnavailable, exitCode, probeStderrSuffix(stderr))
+		return fmt.Errorf("%w: landlock probe reported exit %d, which means the probe invocation is misconfigured%s%s",
+			ErrConfinementUnavailable, exitCode, probeStderrSuffix(stderr), abiSuffix)
 	case HelperExitNegativeControl:
-		return fmt.Errorf("%w: landlock probe reported exit %d: the read-only root was writable; the domain is not enforcing%s",
-			ErrConfinementUnavailable, exitCode, probeStderrSuffix(stderr))
+		return fmt.Errorf("%w: landlock probe reported exit %d: the read-only root was writable; the domain is not enforcing%s%s",
+			ErrConfinementUnavailable, exitCode, probeStderrSuffix(stderr), abiSuffix)
 	default:
-		return fmt.Errorf("%w: landlock probe reported an unmapped exit code %d%s",
-			ErrConfinementUnavailable, exitCode, probeStderrSuffix(stderr))
+		return fmt.Errorf("%w: landlock probe reported an unmapped exit code %d%s%s",
+			ErrConfinementUnavailable, exitCode, probeStderrSuffix(stderr), abiSuffix)
 	}
 }
 

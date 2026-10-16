@@ -902,11 +902,17 @@ const (
 
 // isRetryableVerifyStatus reports whether a failed verification is worth a
 // model self-correction attempt: actionable build/test/timeout output.
-// Unavailable, unsupported, and incomplete outcomes never improve on retry.
+// Unavailable, unsupported, incomplete, and confinement-denied outcomes never
+// improve on retry.
 func isRetryableVerifyStatus(status sandbox.VerificationStatus) bool {
 	switch status {
 	case sandbox.StatusBuildFailed, sandbox.StatusTestFailed, sandbox.StatusTimeout:
 		return true
+	case sandbox.StatusConfinementDenied:
+		// A sandbox denial is not model-retryable: retrying cannot make the
+		// sandbox grant a path, and feeding it back would invite the model to
+		// "fix" a non-defect.
+		return false
 	default:
 		return false
 	}
@@ -1305,6 +1311,21 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 		}
 		if report.Status == sandbox.StatusPassed {
 			break
+		}
+		if report.Status == sandbox.StatusConfinementDenied {
+			// A sandbox denial is a sandbox environment finding, not a code
+			// defect: name the sandbox as the owner, report the attributable
+			// path when one exists, and never retry.
+			msg := "🔒 Sandbox dosya erişimini reddetti — hiçbir değişiklik push edilmedi; bu bir kod hatası değil, sandbox ortamı bulgusudur." +
+				"\n\nFilesystem confinement denied a filesystem operation; nothing was pushed. This is a sandbox environment finding, not a code defect."
+			if report.ConfinementDeniedPath != "" {
+				msg += fmt.Sprintf("\n\npath: %s", report.ConfinementDeniedPath)
+			}
+			if report.ConfinementAdvisory != "" {
+				msg += fmt.Sprintf("\n\nconfinement advisory: %s", report.ConfinementAdvisory)
+			}
+			say(msg)
+			return e.failEditJob(ctx, job, fmt.Sprintf("confinement denied: %s", report.Reason))
 		}
 		if !isRetryableVerifyStatus(report.Status) || attempts >= editVerifyMaxAttempts {
 			msg := fmt.Sprintf("❌ Doğrulama geçilemedi (%s) — push yapılmadı.\n\nVerification did not pass (%s); nothing was pushed.", report.Status, report.Status)
