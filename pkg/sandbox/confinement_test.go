@@ -839,3 +839,32 @@ func TestGoreleaserHelperBuildIsLinuxOnly(t *testing.T) {
 		t.Errorf("archives.ids must include pr-review-sandbox-helper:\n%s", archivesSection)
 	}
 }
+
+// TestConfinementRankNetworkGuarantee pins the per-rank network claim against
+// the code. docs/SANDBOX.md F-17 and README.md both state that `bwrap-ro`
+// removes the network while `landlock` does not; this asserts the
+// NetworkIsolated field behind that wording directly from the rank specs so the
+// documented claim cannot drift from the implementation. It uses only the
+// package-internal spec constructors — no kernel probe, no
+// ResolveConfinementRank, no syscalls — so it is hermetic on every platform.
+func TestConfinementRankNetworkGuarantee(t *testing.T) {
+	bwrap := bwrapROConfinementSpec()
+	if bwrap.Rank != RankBwrapRO {
+		t.Errorf("bwrapROConfinementSpec().Rank = %q, want %q", bwrap.Rank, RankBwrapRO)
+	}
+	if !bwrap.NetworkIsolated {
+		t.Error("bwrapROConfinementSpec().NetworkIsolated must be true: the bwrap-ro rank retains --unshare-net (docs/SANDBOX.md F-17)")
+	}
+
+	landlock := landlockConfinementSpec()
+	if landlock.Rank != RankLandlock {
+		t.Errorf("landlockConfinementSpec().Rank = %q, want %q", landlock.Rank, RankLandlock)
+	}
+	if landlock.NetworkIsolated {
+		t.Error("landlockConfinementSpec().NetworkIsolated must be false: the landlock rank removes no network interface (docs/SANDBOX.md F-17)")
+	}
+
+	if bwrap.NetworkIsolated == landlock.NetworkIsolated {
+		t.Error("the two ranks must not report the same network posture, or the per-rank F-17 claim is unprovable")
+	}
+}
