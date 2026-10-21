@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -1111,6 +1112,68 @@ func editCommandBackend(cfg *config.Config) func(context.Context, string, []stri
 	}
 }
 
+// readVerifiedEditSnapshot reads the changed files for the push strictly
+// through one os.OpenRoot handle rooted at sourceDir. It rejects traversal,
+// symlinks and non-regular files, and verifies every opened descriptor with
+// assistant.VerifyFileHandleInRoot before staging its content, so a
+// sandbox-writable work copy can never smuggle a host file or a symlink
+// target into the pushed commit (08-REVIEW CR-02).
+func readVerifiedEditSnapshot(sourceDir string, changed []string) (map[string]string, error) {
+	root, err := os.OpenRoot(sourceDir)
+	if err != nil {
+		return nil, fmt.Errorf("open verified snapshot root: %w", err)
+	}
+	defer root.Close()
+	canonicalRoot := sourceDir
+	if evaled, err := filepath.EvalSymlinks(sourceDir); err == nil {
+		canonicalRoot = evaled
+	}
+	files := make(map[string]string, len(changed))
+	for _, p := range changed {
+		rel := filepath.Clean(filepath.FromSlash(p))
+		if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return nil, fmt.Errorf("refusing to push out-of-jail path %q", p)
+		}
+		li, err := root.Lstat(rel)
+		if err != nil {
+			return nil, fmt.Errorf("refusing to push %q: %w", p, err)
+		}
+		if li.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing to push %q: symlink not allowed", p)
+		}
+		if !li.Mode().IsRegular() {
+			return nil, fmt.Errorf("refusing to push %q: not a regular file", p)
+		}
+		f, err := root.Open(rel)
+		if err != nil {
+			return nil, fmt.Errorf("refusing to push %q: %w", p, err)
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("refusing to push %q: %w", p, err)
+		}
+		if !fi.Mode().IsRegular() {
+			_ = f.Close()
+			return nil, fmt.Errorf("refusing to push %q: not a regular file", p)
+		}
+		if err := assistant.VerifyFileHandleInRoot(f, canonicalRoot); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("refusing to push %q: %w", p, err)
+		}
+		b, readErr := io.ReadAll(f)
+		closeErr := f.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read verified snapshot path %q: %w", p, readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close verified snapshot path %q: %w", p, closeErr)
+		}
+		files[p] = string(b)
+	}
+	return files, nil
+}
+
 func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error {
 	if e.server == nil {
 		return e.failEditJob(ctx, job, "server unavailable")
@@ -1345,19 +1408,14 @@ func (e *ServerJobExecutor) executeEditJob(ctx context.Context, job *Job) error 
 	}
 	// Green-time byte snapshot: read each changed file exactly once into
 	// memory; the work copy is never re-walked after this point (T-05-03).
-	files := make(map[string]string, len(editResult.FilesChanged))
-	for _, p := range editResult.FilesChanged {
-		rel := filepath.Clean(filepath.FromSlash(p))
-		if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-			return e.failEditJob(ctx, job, fmt.Sprintf("refusing to push out-of-jail path %q", p))
-		}
-		b, rerr := os.ReadFile(filepath.Join(snap.SourceDir, rel))
-		if rerr != nil {
-			log.Printf("[jobs] Edit green-snapshot read failed for %s path %s: %v", job.ID, p, rerr)
-			say("❌ Doğrulanmış dosyalar okunamadı — push yapılmadı.\n\nVerified files could not be read; nothing was pushed.")
-			return e.failEditJob(ctx, job, rerr.Error())
-		}
-		files[p] = string(b)
+	// Reads are confined to snap.SourceDir through an os.OpenRoot handle and
+	// every descriptor is identity-verified before its bytes are staged
+	// (08-REVIEW CR-02).
+	files, rerr := readVerifiedEditSnapshot(snap.SourceDir, editResult.FilesChanged)
+	if rerr != nil {
+		log.Printf("[jobs] Edit green-snapshot read failed for %s: %v", job.ID, rerr)
+		say("❌ Doğrulanmış dosyalar okunamadı — push yapılmadı.\n\nVerified files could not be read; nothing was pushed.")
+		return e.failEditJob(ctx, job, rerr.Error())
 	}
 	if len(files) == 0 {
 		say("ℹ️ Düzenleme dosya değişikliği üretmedi — push yapılmadı.\n\nThe edit produced no file changes; nothing was pushed.")

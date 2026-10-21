@@ -9,6 +9,14 @@ import (
 	"strings"
 )
 
+// VerifyFileHandleInRoot verifies that the open file descriptor points within
+// canonicalWorkDir and does not access restricted paths. It is the exported
+// seam used by the server's push snapshot reader, which must validate a
+// descriptor it opened through its own os.Root (08-REVIEW CR-02).
+func VerifyFileHandleInRoot(f *os.File, canonicalWorkDir string) error {
+	return verifyFileHandle(f, canonicalWorkDir)
+}
+
 // verifyFileHandle verifies on Unix platforms that the open file descriptor points
 // within canonicalWorkDir and does not access restricted paths.
 func verifyFileHandle(f *os.File, canonicalWorkDir string) error {

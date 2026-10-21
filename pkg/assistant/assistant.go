@@ -155,7 +155,32 @@ func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolC
 	}
 }
 
-// readWorkspaceFile opens and reads a file strictly within workDir.
+// workspaceFileDisplayMaxBytes caps the read_file observation handed to the
+// model. It is a DISPLAY bound only: callers that must not lose bytes (the
+// str_replace read-modify-write path) use readWorkspaceFileFull instead.
+const workspaceFileDisplayMaxBytes = 30000
+
+// readWorkspaceFile opens and reads a file strictly within workDir for a
+// display-only observation. Content past the 30KB display cap is replaced by
+// an explicit truncation marker; callers that write the result back must use
+// readWorkspaceFileFull so they never persist a marker into a file.
+func readWorkspaceFile(workDir, userPath string) (string, error) {
+	content, truncated, err := readWorkspaceFileFull(workDir, userPath, workspaceFileDisplayMaxBytes)
+	if err != nil {
+		return "", err
+	}
+	if truncated {
+		return content + "\n...[file truncated, exceeded 30KB]...", nil
+	}
+	return content, nil
+}
+
+// readWorkspaceFileFull opens and reads a file strictly within workDir, up to
+// maxBytes. Unlike readWorkspaceFile it never injects a display truncation
+// marker: it returns the exact bytes read plus a truncated flag, so a
+// read-modify-write caller can refuse an oversized file instead of writing a
+// marker back into it (08-REVIEW CR-01).
+//
 // It uses os.OpenRoot to confine file operations to the workspace root,
 // preventing path traversal and symlink escapes outside the workspace.
 // Once opened, verifyFileHandle inspects the underlying open handle for
@@ -169,14 +194,18 @@ func (a *Assistant) executeTool(ctx context.Context, workDir string, step *ToolC
 // traversal (using openat/O_NOFOLLOW on Unix and windows.Openat/O_NOFOLLOW_ANY on Windows).
 // Consequently, residual race windows remain if a concurrent hostile local process performs
 // high-frequency ancestor directory renames during path traversal.
-func readWorkspaceFile(workDir, userPath string) (string, error) {
+func readWorkspaceFileFull(workDir, userPath string, maxBytes int) (content string, truncated bool, err error) {
+	content, truncated, err = "", false, nil
+	if maxBytes <= 0 {
+		return "", false, fmt.Errorf("invalid read limit %d", maxBytes)
+	}
 	if userPath == "" {
-		return "", fmt.Errorf("empty path")
+		return "", false, fmt.Errorf("empty path")
 	}
 
 	canonicalWorkDir, err := filepath.Abs(workDir)
 	if err != nil {
-		return "", fmt.Errorf("invalid workspace: %w", err)
+		return "", false, fmt.Errorf("invalid workspace: %w", err)
 	}
 	if evaled, err := filepath.EvalSymlinks(canonicalWorkDir); err == nil {
 		canonicalWorkDir = evaled
@@ -184,29 +213,29 @@ func readWorkspaceFile(workDir, userPath string) (string, error) {
 
 	// Lexical pre-checks
 	if strings.ContainsRune(userPath, 0) {
-		return "", fmt.Errorf("invalid path: contains null byte")
+		return "", false, fmt.Errorf("invalid path: contains null byte")
 	}
 	if filepath.IsAbs(userPath) || filepath.VolumeName(userPath) != "" ||
 		strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") {
-		return "", fmt.Errorf("absolute paths are not permitted")
+		return "", false, fmt.Errorf("absolute paths are not permitted")
 	}
 
 	cleanRel := filepath.Clean(userPath)
 	slashRel := filepath.ToSlash(cleanRel)
 	if slashRel == "." {
-		return "", fmt.Errorf("cannot read directory as file")
+		return "", false, fmt.Errorf("cannot read directory as file")
 	}
 	if slashRel == ".." || strings.HasPrefix(slashRel, "../") {
-		return "", fmt.Errorf("path outside workspace")
+		return "", false, fmt.Errorf("path outside workspace")
 	}
 	if isGitPath(slashRel) {
-		return "", fmt.Errorf(".git paths are restricted")
+		return "", false, fmt.Errorf(".git paths are restricted")
 	}
 
 	// Open workspace root for confined filesystem access
 	root, err := os.OpenRoot(canonicalWorkDir)
 	if err != nil {
-		return "", fmt.Errorf("failed to open workspace: %w", err)
+		return "", false, fmt.Errorf("failed to open workspace: %w", err)
 	}
 	defer root.Close()
 
@@ -214,46 +243,55 @@ func readWorkspaceFile(workDir, userPath string) (string, error) {
 	f, err := root.Open(cleanRel)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", err
+			return "", false, err
 		}
 		// Root escape, symlink loop, or permission error is an access denial
-		return "", fmt.Errorf("access denied (%w)", err)
+		return "", false, fmt.Errorf("access denied (%w)", err)
 	}
 	defer f.Close()
 
 	// Verify opened file attributes
 	fi, err := f.Stat()
 	if err != nil {
-		return "", fmt.Errorf("failed to stat file: %w", err)
+		return "", false, fmt.Errorf("failed to stat file: %w", err)
 	}
 	if fi.IsDir() {
-		return "", fmt.Errorf("cannot read directory as file")
+		return "", false, fmt.Errorf("cannot read directory as file")
 	}
 	if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("access denied: not a regular file")
+		return "", false, fmt.Errorf("access denied: not a regular file")
 	}
 
 	// Post-open handle verification: query the OS kernel for the true target
 	// of the already-opened handle/descriptor to guarantee it is within canonicalWorkDir
 	// and does not point to restricted locations (e.g. .git).
 	if err := verifyFileHandle(f, canonicalWorkDir); err != nil {
-		return "", fmt.Errorf("access denied: %w", err)
+		return "", false, fmt.Errorf("access denied: %w", err)
 	}
 
-	// Read directly from the opened handle (limit to 30KB + 1 to detect truncation).
+	// Read directly from the opened handle (limit + 1 to detect truncation).
 	// This avoids any second path resolution (check-then-open TOCTOU).
-	const maxBytes = 30000
-	limited := io.LimitReader(f, maxBytes+1)
+	limited := io.LimitReader(f, int64(maxBytes)+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
-		return "", fmt.Errorf("error reading file: %w", err)
+		return "", false, fmt.Errorf("error reading file: %w", err)
 	}
 
 	if len(data) > maxBytes {
-		return string(data[:maxBytes]) + "\n...[file truncated, exceeded 30KB]...", nil
+		return string(data[:maxBytes]), true, nil
 	}
-	return string(data), nil
+	return string(data), false, nil
 }
+
+// workspaceListingMaxEntries bounds one directory listing observation. When the
+// bound is hit, the listing carries workspaceListingTruncatedNotice so the
+// model never mistakes a capped listing for an empty or complete tree
+// (08-REVIEW WR-05).
+const workspaceListingMaxEntries = 100
+
+// workspaceListingTruncatedNotice is the explicit marker appended to a capped
+// listing. grep/glob consume it and surface their own incompleteness notice.
+const workspaceListingTruncatedNotice = "...[file listing truncated at 100 entries]..."
 
 // listWorkspaceFiles lists files strictly within workDir under userPath.
 func listWorkspaceFiles(workDir, userPath string) (string, error) {
@@ -306,15 +344,13 @@ func listWorkspaceFiles(workDir, userPath string) (string, error) {
 
 	fsys := root.FS()
 	var files []string
+	truncated := false
 	err = fs.WalkDir(fsys, subPath, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if path == subPath {
 				return walkErr
 			}
 			return nil
-		}
-		if len(files) > 100 {
-			return fs.SkipAll
 		}
 
 		slash := filepath.ToSlash(path)
@@ -326,6 +362,10 @@ func listWorkspaceFiles(workDir, userPath string) (string, error) {
 		}
 
 		if path != "." {
+			if len(files) >= workspaceListingMaxEntries {
+				truncated = true
+				return fs.SkipAll
+			}
 			rel := filepath.FromSlash(path)
 			files = append(files, rel)
 		}
@@ -334,7 +374,14 @@ func listWorkspaceFiles(workDir, userPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.Join(files, "\n"), nil
+	out := strings.Join(files, "\n")
+	if truncated {
+		if out != "" {
+			out += "\n"
+		}
+		out += workspaceListingTruncatedNotice
+	}
+	return out, nil
 }
 
 func isGitPath(slashRel string) bool {
