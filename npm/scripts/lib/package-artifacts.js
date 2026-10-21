@@ -5,6 +5,19 @@ const path = require('node:path');
 
 const mapping = require('./mapping');
 
+// expectedArtifactNames is the single computed expectation for the full
+// release artifact set: every mapping row crossed with that row's binary list.
+// It replaces the old hard-coded mapping.length * 2 so the goreleaser artifact
+// set and the npm packager can never drift (14 entries today: 12 + the two
+// linux helpers).
+function expectedArtifactNames() {
+  return mapping.flatMap((row) =>
+    row.binaries.map(
+      (binary) => `${row.goos}/${row.goarch}/${binary}${row.platform === 'win32' ? '.exe' : ''}`
+    )
+  );
+}
+
 function findRow(artifact) {
   return mapping.find((row) => row.goos === artifact.goos && row.goarch === artifact.goarch);
 }
@@ -13,9 +26,10 @@ function packageArtifacts({ artifacts, version, npmRoot, repoRoot }) {
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/.test(version)) {
     throw new Error('packageArtifacts: version is required');
   }
-  if (!Array.isArray(artifacts) || artifacts.length !== mapping.length * 2) {
+  const expectedNames = expectedArtifactNames();
+  if (!Array.isArray(artifacts) || artifacts.length !== expectedNames.length) {
     throw new Error(
-      `packageArtifacts: expected exactly ${mapping.length * 2} artifacts, got ${Array.isArray(artifacts) ? artifacts.length : typeof artifacts}`
+      `packageArtifacts: expected exactly ${expectedNames.length} artifacts, got ${Array.isArray(artifacts) ? artifacts.length : typeof artifacts}`
     );
   }
 
@@ -26,12 +40,18 @@ function packageArtifacts({ artifacts, version, npmRoot, repoRoot }) {
         `packageArtifacts: no mapping row matches artifact goos=${artifact.goos} goarch=${artifact.goarch}`
       );
     }
+    // A helper artifact for darwin/windows is a hard error, not a silent extra.
+    const baseName = path.basename(artifact.path).replace(/\.exe$/i, '');
+    if (!row.binaries.includes(baseName)) {
+      throw new Error(
+        `packageArtifacts: artifact ${baseName} is not a ${row.goos}/${row.goarch} binary (expected one of: ${row.binaries.join(', ')})`
+      );
+    }
     return { artifact, row };
   });
 
   const found = matched.map(({ artifact }) => `${artifact.goos}/${artifact.goarch}/${path.basename(artifact.path)}`);
-  const expected = mapping.flatMap((row) => ['pr-review-go', 'pr-review-server'].map((binary) => `${row.goos}/${row.goarch}/${binary}${row.platform === 'win32' ? '.exe' : ''}`));
-  const missing = expected.filter((entry) => !found.includes(entry));
+  const missing = expectedNames.filter((entry) => !found.includes(entry));
   if (missing.length > 0) {
     throw new Error(
       `packageArtifacts: missing artifacts for mapping rows: ${missing.join(', ')} (found: ${found.join(', ')})`
@@ -79,3 +99,4 @@ function packageArtifacts({ artifacts, version, npmRoot, repoRoot }) {
 }
 
 module.exports = packageArtifacts;
+module.exports.expectedArtifactNames = expectedArtifactNames;

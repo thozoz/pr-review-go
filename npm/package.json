@@ -1,0 +1,8 @@
+{
+  "name": "pr-review-go-packaging",
+  "private": true,
+  "description": "Build-time packaging scripts for the @thozoz/pr-review-go npm platform packages. Not published.",
+  "scripts": {
+    "test": "node scripts/lib/mapping.test.js && node scripts/lib/package-artifacts.test.js && node scripts/lib/publish-all.test.js"
+  }
+}

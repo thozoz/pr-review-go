@@ -468,6 +468,11 @@ func TestPromptAndReportFormattingForAllVerificationStatuses(t *testing.T) {
 			expectedSys:    "Live sandbox verification was skipped or unavailable",
 			expectedHeader: "### Sandbox Verification (Skipped / Unavailable):\n",
 		},
+		{
+			status:         sandbox.StatusConfinementDenied,
+			expectedSys:    "filesystem-confinement layer DENIED",
+			expectedHeader: "### Real Sandbox Environment Verification (Confinement Denied):\n",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1228,5 +1233,33 @@ func TestStaleUntouched_ZeroEditDeleteResolveCalls(t *testing.T) {
 	}
 }
 
+// TestReviewerPromptsHandleConfinementDenied proves a confinement denial
+// reaches the model as a sandbox-environment finding, not as evidence the PR
+// is broken (T-11-07).
+func TestReviewerPromptsHandleConfinementDenied(t *testing.T) {
+	sys := buildSystemPrompt(sandbox.StatusConfinementDenied)
+	for _, want := range []string{"confinement", "sandbox", "not"} {
+		if !strings.Contains(strings.ToLower(sys), want) {
+			t.Errorf("system prompt for a confinement denial must contain %q", want)
+		}
+	}
+	low := strings.ToLower(sys)
+	if !strings.Contains(low, "not evidence that the pr is broken") {
+		t.Error("the prompt must state the denial is not evidence the PR is broken")
+	}
+	// It must not reuse the build/test-failed framing that asserts a real
+	// code failure.
+	for _, banned := range []string{
+		"executed in a real isolated runner and failed",
+		"proved real failure",
+	} {
+		if strings.Contains(low, banned) {
+			t.Errorf("system prompt for a confinement denial must not claim %q", banned)
+		}
+	}
 
-
+	user := buildUserPrompt(&github.PRDetails{Title: "t", Author: "a", BaseRef: "main", HeadRef: "f"}, "", nil, nil, "STATUS", sandbox.StatusConfinementDenied)
+	if !strings.Contains(user, "Confinement Denied") {
+		t.Errorf("user prompt heading must name the denial: %q", user)
+	}
+}

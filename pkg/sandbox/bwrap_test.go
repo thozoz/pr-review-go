@@ -21,12 +21,12 @@ func TestBwrapProbeUnavailable(t *testing.T) {
 }
 
 // TestBwrapStage1HasSocketBind proves stage 1 carries the per-job gateway
-// socket bind at /run/sandbox/gateway.sock exactly once.
+// socket bind at BwrapGatewaySocketPath exactly once.
 func TestBwrapStage1HasSocketBind(t *testing.T) {
 	argv := buildStage1Argv(t.TempDir(), t.TempDir(), t.TempDir(), "/tmp/depgw-job1.sock")
 	joined := strings.Join(argv, " ")
-	if n := strings.Count(joined, "/run/sandbox/gateway.sock"); n != 1 {
-		t.Fatalf("expected /run/sandbox/gateway.sock exactly once in stage-1 argv, got %d: %q", n, joined)
+	if n := strings.Count(joined, BwrapGatewaySocketPath); n != 1 {
+		t.Fatalf("expected %s exactly once in stage-1 argv, got %d: %q", BwrapGatewaySocketPath, n, joined)
 	}
 	if !strings.Contains(joined, "gateway.sock") {
 		t.Fatalf("expected gateway.sock substring in stage-1 argv: %q", joined)

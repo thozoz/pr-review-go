@@ -49,6 +49,14 @@ type Config struct {
 	SandboxSlotDir          string        `json:"sandbox_slot_dir"`
 	SandboxControlDir       string        `json:"sandbox_control_dir"`
 
+	// Direct-mode job-private roots (ROOT-01). SandboxDirectWorkRoot holds the
+	// ephemeral per-job workspace/tmp/home tree; SandboxDirectCacheDir holds
+	// the durable per-job toolchain cache tree. Both default under
+	// WebhookStateDir and neither may point into the shared host temporary
+	// directory. Env SANDBOX_DIRECT_WORK_ROOT / SANDBOX_DIRECT_CACHE_DIR.
+	SandboxDirectWorkRoot string `json:"sandbox_direct_work_root"`
+	SandboxDirectCacheDir string `json:"sandbox_direct_cache_dir"`
+
 	// Webhook admission and durable state controls
 	WebhookStateDir        string        `json:"webhook_state_dir"`
 	WebhookWorkers         int           `json:"webhook_workers"`
@@ -276,6 +284,14 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	// Direct-mode job roots default under WebhookStateDir, so this must run
+	// after ValidateWebhook has defaulted that field (ROOT-01).
+	if c.EnableSandbox && c.SandboxMode == SandboxModeDirect {
+		if err := c.ValidateDirectRoots(); err != nil {
+			return err
+		}
+	}
+
 	if err := c.ValidateCapacity(); err != nil {
 		return err
 	}
@@ -433,6 +449,41 @@ func (c *Config) ValidateWebhook() error {
 		return fmt.Errorf("invalid WebhookShutdownTimeout: %v (must be between %v and %v)", c.WebhookShutdownTimeout, MinWebhookShutdownTimeout, MaxWebhookShutdownTimeout)
 	}
 
+	return nil
+}
+
+// ValidateDirectRoots defaults and validates the direct-mode job-private roots
+// (ROOT-01). An empty root defaults under WebhookStateDir; a root that is the
+// shared host temporary directory, or sits beneath it, is rejected fail-closed
+// so a later confinement rank never has to grant host /tmp.
+func (c *Config) ValidateDirectRoots() error {
+	if c.SandboxDirectWorkRoot == "" {
+		c.SandboxDirectWorkRoot = filepath.Join(c.WebhookStateDir, "direct")
+	}
+	if c.SandboxDirectCacheDir == "" {
+		c.SandboxDirectCacheDir = filepath.Join(c.WebhookStateDir, "direct", "cache")
+	}
+	if err := validateDirectRootPath("SandboxDirectWorkRoot", &c.SandboxDirectWorkRoot); err != nil {
+		return err
+	}
+	return validateDirectRootPath("SandboxDirectCacheDir", &c.SandboxDirectCacheDir)
+}
+
+// validateDirectRootPath normalises one direct root to an absolute, cleaned
+// path in place and refuses any value at or beneath the shared host temporary
+// directory.
+func validateDirectRootPath(field string, value *string) error {
+	clean := filepath.Clean(*value)
+	abs, err := filepath.Abs(clean)
+	if err != nil {
+		return fmt.Errorf("invalid %s %q: %v", field, *value, err)
+	}
+	clean = filepath.Clean(abs)
+	tmp := filepath.Clean(os.TempDir())
+	if clean == tmp || strings.HasPrefix(clean, tmp+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid %s %q: must not be the shared host temporary directory", field, clean)
+	}
+	*value = clean
 	return nil
 }
 
@@ -1095,6 +1146,8 @@ func Load() *Config {
 		SandboxImage:            os.Getenv("SANDBOX_IMAGE"),
 		SandboxSlotDir:          os.Getenv("SANDBOX_SLOT_DIR"),
 		SandboxControlDir:       sandboxControlDir,
+		SandboxDirectWorkRoot:   os.Getenv("SANDBOX_DIRECT_WORK_ROOT"),
+		SandboxDirectCacheDir:   os.Getenv("SANDBOX_DIRECT_CACHE_DIR"),
 		WebhookStateDir:         webhookStateDir,
 		WebhookWorkers:          webhookWorkers,
 		WebhookBacklog:          webhookBacklog,

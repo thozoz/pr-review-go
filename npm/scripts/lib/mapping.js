@@ -5,7 +5,12 @@
 // re-deriving it. (The runtime shim in npm/pr-review-go/bin/pr-review-go.js keeps its
 // own small inline copy since it ships standalone inside the published
 // package and cannot require a repo-internal path.)
-module.exports = [
+//
+// `binaries` is the per-row artifact list. The helper is a Linux-only host
+// artifact (the landlock rank exists only on Linux), so it is intentionally
+// absent from the darwin/windows rows; consumers must derive their expected
+// artifact set from `binariesFor()` rather than a hard-coded count.
+const mapping = [
   {
     goos: 'linux',
     goarch: 'amd64',
@@ -13,6 +18,7 @@ module.exports = [
     arch: 'x64',
     dir: 'pr-review-go-linux-x64',
     pkgName: '@thozoz/pr-review-go-linux-x64',
+    binaries: ['pr-review-go', 'pr-review-server', 'pr-review-sandbox-helper'],
   },
   {
     goos: 'linux',
@@ -21,6 +27,7 @@ module.exports = [
     arch: 'arm64',
     dir: 'pr-review-go-linux-arm64',
     pkgName: '@thozoz/pr-review-go-linux-arm64',
+    binaries: ['pr-review-go', 'pr-review-server', 'pr-review-sandbox-helper'],
   },
   {
     goos: 'darwin',
@@ -29,6 +36,7 @@ module.exports = [
     arch: 'x64',
     dir: 'pr-review-go-darwin-x64',
     pkgName: '@thozoz/pr-review-go-darwin-x64',
+    binaries: ['pr-review-go', 'pr-review-server'],
   },
   {
     goos: 'darwin',
@@ -37,6 +45,7 @@ module.exports = [
     arch: 'arm64',
     dir: 'pr-review-go-darwin-arm64',
     pkgName: '@thozoz/pr-review-go-darwin-arm64',
+    binaries: ['pr-review-go', 'pr-review-server'],
   },
   {
     goos: 'windows',
@@ -45,6 +54,7 @@ module.exports = [
     arch: 'x64',
     dir: 'pr-review-go-win32-x64',
     pkgName: '@thozoz/pr-review-go-win32-x64',
+    binaries: ['pr-review-go', 'pr-review-server'],
   },
   {
     goos: 'windows',
@@ -53,5 +63,23 @@ module.exports = [
     arch: 'arm64',
     dir: 'pr-review-go-win32-arm64',
     pkgName: '@thozoz/pr-review-go-win32-arm64',
+    binaries: ['pr-review-go', 'pr-review-server'],
   },
 ];
+
+// binariesFor returns the distinct binary names expected for a GOOS across
+// every row that targets it. This is the function every consumer uses so the
+// table stays the single source of truth.
+function binariesFor(goos) {
+  const names = [];
+  for (const row of mapping) {
+    if (row.goos !== goos) continue;
+    for (const binary of row.binaries) {
+      if (!names.includes(binary)) names.push(binary);
+    }
+  }
+  return names;
+}
+
+module.exports = mapping;
+module.exports.binariesFor = binariesFor;
