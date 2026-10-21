@@ -59,7 +59,7 @@ changelog:
 
 dockers_v2:
   - id: server
-    ids: [pr-review-server]
+    ids: [pr-review-server, pr-review-sandbox-helper]
     dockerfile: Dockerfile.goreleaser
     images: [ghcr.io/thozoz/pr-review-go]
     tags: ['{{ .Version }}', '{{ if not .Prerelease }}latest{{ end }}']

@@ -998,6 +998,39 @@ func TestGoreleaserHelperBuildIsLinuxOnly(t *testing.T) {
 	if !strings.Contains(archivesSection, "pr-review-sandbox-helper") {
 		t.Errorf("archives.ids must include pr-review-sandbox-helper:\n%s", archivesSection)
 	}
+
+	// Issue #25 / CONFINE-06 P1: the Docker release image must ship both the
+	// server and the helper, and the image must carry bubblewrap and Go so the
+	// direct ranks work inside the container.
+	dockersStart := strings.Index(src, "dockers_v2:")
+	if dockersStart < 0 {
+		t.Fatal(".goreleaser.yaml must declare dockers_v2")
+	}
+	dockersSection := src[dockersStart:]
+	if !strings.Contains(dockersSection, "ids: [pr-review-server, pr-review-sandbox-helper]") {
+		t.Errorf("dockers_v2.ids must include pr-review-server and pr-review-sandbox-helper:\n%s", dockersSection)
+	}
+
+	dockerfile, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile.goreleaser"))
+	if err != nil {
+		t.Fatalf("read Dockerfile.goreleaser: %v", err)
+	}
+	dockerSrc := string(dockerfile)
+	for _, want := range []string{
+		"bubblewrap",
+		" go ",
+		"${TARGETPLATFORM}/pr-review-sandbox-helper",
+		"/usr/local/bin/pr-review-sandbox-helper",
+		// The COPY must wildcard the platform directory: GoReleaser stages the
+		// helper beside the server so both land in /usr/local/bin, while the
+		// release workflow's Docker smoke test stages only the server and would
+		// fail on a literal helper COPY source.
+		"COPY ${TARGETPLATFORM}/pr-review-* /usr/local/bin/",
+	} {
+		if !strings.Contains(dockerSrc, want) {
+			t.Errorf("Dockerfile.goreleaser must contain %q:\n%s", want, dockerSrc)
+		}
+	}
 }
 
 // TestConfinementRankNetworkGuarantee pins the per-rank network claim against
