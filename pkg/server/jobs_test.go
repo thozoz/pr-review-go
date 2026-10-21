@@ -3540,3 +3540,117 @@ func TestReadVerifiedEditSnapshotRejectsNonRegular(t *testing.T) {
 		}
 	}
 }
+
+func TestIssueComment_AllJobKindsPopulateHeadSHA(t *testing.T) {
+	const (
+		expectedHead = "2222222222222222222222222222222222222222"
+		expectedBase = "1111111111111111111111111111111111111111"
+	)
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/collaborators/") && strings.HasSuffix(r.URL.Path, "/permission") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"permission": "write"})
+			return
+		}
+		if strings.Contains(r.URL.Path, "/pulls/") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 1,
+				"head": map[string]any{
+					"sha": expectedHead,
+					"ref": "feat",
+				},
+				"base": map[string]any{
+					"sha": expectedBase,
+					"ref": "main",
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := ghclient.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatalf("failed to create test client: %v", err)
+	}
+
+	commands := []struct {
+		name    string
+		command string
+		kind    string
+	}{
+		{"labels", "/labels", "labels"},
+		{"describe", "/describe", "describe"},
+		{"summarize", "/summarize", "summary"},
+		{"docs", "/add_docs", "docs"},
+		{"ask", "/ask what does this do?", "assistant"},
+		{"changelog", "/update_changelog", "changelog"},
+		{"improve", "/improve", "improve"},
+	}
+
+	for _, tc := range commands {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			store, err := OpenJobStore(filepath.Join(stateDir, "jobs.db"), StoreOptions{})
+			if err != nil {
+				t.Fatalf("OpenJobStore failed: %v", err)
+			}
+			defer store.Close()
+
+			cfg := &config.Config{
+				GitHubToken:     "test-token",
+				LLMAPIKey:       "test-key",
+				LLMModel:        "test-model",
+				LLMBaseURL:      "http://example.invalid",
+				WebhookSecret:   testSecret,
+				WebhookStateDir: stateDir,
+			}
+			srv := NewServer(cfg)
+			srv.gh = ghClient
+			srv.SetStore(store)
+			defer srv.Stop()
+
+			payloadJSON := fmt.Sprintf(`{
+				"action": "created",
+				"issue": {"number": 1, "pull_request": {"url": "https://api.github.com/repos/org/repo/pulls/1"}},
+				"comment": {"id": 1001, "body": %q, "user": {"login": "dev"}},
+				"repository": {"id": 12345, "name": "repo", "owner": {"login": "org"}}
+			}`, tc.command)
+			payload := []byte(payloadJSON)
+
+			req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+			req.Header.Set("X-GitHub-Delivery", "deliv-"+tc.name)
+			req.Header.Set("X-GitHub-Event", "issue_comment")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Hub-Signature-256", signPayload(testSecret, payload))
+
+			rr := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+			}
+
+			queued, err := store.ListQueuedJobs(context.Background())
+			if err != nil {
+				t.Fatalf("ListQueuedJobs failed: %v", err)
+			}
+			if len(queued) != 1 {
+				t.Fatalf("expected 1 queued job, got %d", len(queued))
+			}
+			job := queued[0]
+			if job.Kind != tc.kind {
+				t.Errorf("job.Kind = %q, want %q", job.Kind, tc.kind)
+			}
+			if job.HeadSHA != expectedHead {
+				t.Errorf("job.HeadSHA = %q, want %q", job.HeadSHA, expectedHead)
+			}
+			if job.BaseSHA != expectedBase {
+				t.Errorf("job.BaseSHA = %q, want %q", job.BaseSHA, expectedBase)
+			}
+		})
+	}
+}
