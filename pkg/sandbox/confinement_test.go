@@ -216,7 +216,7 @@ func TestResolveConfinementRankAllUnavailableIsFailClosed(t *testing.T) {
 		"go.mod":  "module example.com/confinementfailclosed\n\ngo 1.24\n",
 		"main.go": "package main\n\nfunc main() {}\n",
 	})
-	d := NewDirectRunnerWithRoots(time.Minute, DirectRoots{WorkRoot: t.TempDir(), CacheRoot: t.TempDir()})
+	d := NewDirectRunnerWithRoots(time.Minute, DirectRoots{WorkRoot: directTestRoot(t), CacheRoot: directTestRoot(t)})
 	report, err := d.VerifyDirGated(context.Background(), dir, directTestSHA, false)
 	if err != nil {
 		t.Fatalf("VerifyDirGated returned a caller error: %v", err)
@@ -333,7 +333,7 @@ func TestInLoopCommandRoutesThroughConfinementDispatch(t *testing.T) {
 		"main.go": "package main\n\nfunc main() {}\n",
 	})
 	stdout, stderr, code, err := InLoopCommand(context.Background(), dir, []string{"go", "build", "./..."}, time.Minute, 0,
-		WithDirectRoots(DirectRoots{WorkRoot: t.TempDir(), CacheRoot: t.TempDir()}))
+		WithDirectRoots(DirectRoots{WorkRoot: directTestRoot(t), CacheRoot: directTestRoot(t)}))
 	if !errors.Is(err, ErrConfinementUnavailable) {
 		t.Fatalf("in-loop command must fail closed through the resolver, got code=%d err=%v", code, err)
 	}

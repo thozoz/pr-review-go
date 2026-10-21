@@ -69,15 +69,12 @@ func runLandlockRun(args []string) int {
 	// run on a thread with no domain.
 	runtime.LockOSThread()
 
-	// 4. Query the Landlock ABI version.
+	// 4. Query the Landlock ABI version. Every query failure (absent syscall,
+	// disabled LSM, kernel rejection) is the same typed unavailable result;
+	// the raw error is preserved in the reason (10-REVIEW IN-02).
 	abi, err := queryLandlockABI()
 	if err != nil {
-		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) ||
-			errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EPERM) {
-			fmt.Fprintf(os.Stderr, "landlock-run: Landlock is unavailable on this host: %v\n", err)
-			return sandbox.HelperExitUnavailable
-		}
-		fmt.Fprintf(os.Stderr, "landlock-run: Landlock ABI query failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "landlock-run: Landlock is unavailable on this host (ABI query failed): %v\n", err)
 		return sandbox.HelperExitUnavailable
 	}
 	if !sandbox.LandlockRankSupported(abi) {
@@ -191,7 +188,8 @@ func createLandlockRuleset(mask uint64) (int, error) {
 	binary.LittleEndian.PutUint64(buf[16:24], 0)  // Scoped
 	defer runtime.KeepAlive(&buf)
 
-	var attempts []string
+	var attempted []uintptr
+	var lastErrno error
 	for _, size := range []uintptr{24, 16, 8} {
 		r1, _, errno := unix.Syscall(
 			unix.SYS_LANDLOCK_CREATE_RULESET,
@@ -202,12 +200,14 @@ func createLandlockRuleset(mask uint64) (int, error) {
 		if errno == 0 {
 			return int(r1), nil
 		}
-		attempts = append(attempts, fmt.Sprintf("size %d: %v", size, errno))
+		lastErrno = errno
 		if !errors.Is(errno, unix.E2BIG) && !errors.Is(errno, unix.EINVAL) {
 			return -1, fmt.Errorf("landlock_create_ruleset failed: %v", errno)
 		}
+		attempted = append(attempted, size)
 	}
-	return -1, fmt.Errorf("landlock_create_ruleset rejected every attribute size (%v)", attempts)
+	// Format the diagnostic only on the exhausted path, never per attempt.
+	return -1, fmt.Errorf("landlock_create_ruleset rejected every attribute size %v (last error: %v)", attempted, lastErrno)
 }
 
 // addLandlockPathRule grants allowed beneath root. The O_PATH fd is closed

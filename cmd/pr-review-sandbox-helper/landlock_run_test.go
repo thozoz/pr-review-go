@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -109,5 +112,38 @@ func TestLandlockUnsupportedExit(t *testing.T) {
 				t.Errorf("%s: reason must not claim an unobserved errno %s: %q", goos, errno, reason)
 			}
 		}
+	}
+}
+
+// TestValidateLandlockRootsResolvesSymlinks pins 10-REVIEW IN-01: an --ro root
+// reachable through a symlink alias of an --rw root must be refused, matching
+// the applier's symlink resolution.
+func TestValidateLandlockRootsResolvesSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on Windows")
+	}
+	base := t.TempDir()
+	rw := filepath.Join(base, "rw")
+	if err := os.Mkdir(rw, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(rw, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := validateLandlockRoots([]string{alias}, []string{rw}); err == nil {
+		t.Fatal("an --ro symlink alias of an --rw root must be refused")
+	}
+	// Distinct real trees stay acceptable.
+	other := filepath.Join(base, "other")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLandlockRoots([]string{other}, []string{rw}); err != nil {
+		t.Fatalf("disjoint roots must be accepted: %v", err)
+	}
+	// The host root exemption survives resolution.
+	if err := validateLandlockRoots([]string{"/"}, []string{rw}); err != nil {
+		t.Fatalf("/ as --ro must stay exempt: %v", err)
 	}
 }

@@ -60,7 +60,11 @@ func validDirectJobID(jobID string) bool {
 }
 
 // canonicalDirectRoot creates root if needed, then resolves it to a canonical
-// absolute path (symlinks evaluated) and refuses the filesystem root.
+// absolute path (symlinks evaluated), refuses the filesystem root, and refuses
+// any root at or beneath the symlink-resolved shared host temporary directory.
+// The temporary-directory refusal repeats the operator-config guard at the
+// enforcement boundary, so an unvalidated DirectRoots value can never smuggle
+// the shared /tmp into a confinement grant (08-REVIEW WR-02).
 func canonicalDirectRoot(root string) (string, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", err
@@ -72,6 +76,13 @@ func canonicalDirectRoot(root string) (string, error) {
 	canonical = filepath.Clean(canonical)
 	if canonical == "/" || canonical == filepath.VolumeName(canonical)+string(os.PathSeparator) {
 		return "", fmt.Errorf("refusing unsafe direct root %q", root)
+	}
+	tmp := filepath.Clean(os.TempDir())
+	if resolved, err := filepath.EvalSymlinks(tmp); err == nil {
+		tmp = filepath.Clean(resolved)
+	}
+	if canonical == tmp || strictlyBeneath(canonical, tmp) {
+		return "", fmt.Errorf("refusing direct root %q: must not be the shared host temporary directory", root)
 	}
 	return canonical, nil
 }

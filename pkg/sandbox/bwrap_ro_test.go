@@ -463,3 +463,24 @@ func TestNoReadWriteRootBindInDirectPath(t *testing.T) {
 		}
 	}
 }
+
+// TestBwrapROFixedEnvValueFailsClosed pins 09-REVIEW IN-04: every declared key
+// maps to a non-empty offline value, and an unrecognized key panics instead of
+// silently emitting an empty --setenv.
+func TestBwrapROFixedEnvValueFailsClosed(t *testing.T) {
+	for _, key := range bwrapROFixedEnvKeys {
+		if got := bwrapROFixedEnvValue(key); got == "" {
+			t.Errorf("bwrapROFixedEnvValue(%q) must not be empty", key)
+		}
+	}
+	assertPanics := func(key string) {
+		defer func() {
+			if recover() == nil {
+				t.Errorf("bwrapROFixedEnvValue(%q) must panic for an unrecognized key", key)
+			}
+		}()
+		_ = bwrapROFixedEnvValue(key)
+	}
+	assertPanics("UNRECOGNIZED_KEY")
+	assertPanics("")
+}

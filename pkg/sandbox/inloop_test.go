@@ -274,7 +274,7 @@ func TestInLoop_DirectExecSmoke(t *testing.T) {
 	}
 
 	stdout, stderr, code, err := InLoopCommand(context.Background(), dir, []string{"go", "build", "./..."}, 2*time.Minute, 0,
-		WithDirectRoots(DirectRoots{WorkRoot: t.TempDir(), CacheRoot: t.TempDir()}))
+		WithDirectRoots(DirectRoots{WorkRoot: directTestRoot(t), CacheRoot: directTestRoot(t)}))
 	if err != nil {
 		t.Fatalf("matrix exec failed: %v (stdout=%q stderr=%q)", err, stdout, stderr)
 	}
@@ -343,5 +343,39 @@ func TestInLoop_AdvisoryOnlyNoPushCallSites(t *testing.T) {
 	}
 	if len(hits) > 0 {
 		t.Fatalf("push call sites inside pkg/sandbox: %v", hits)
+	}
+}
+
+// TestInLoop_WorkDirValidated pins 09-REVIEW IN-05: a caller-supplied work
+// directory is canonicalized and must exist as a directory before any rank
+// sees it; a relative escape, missing path or regular file is refused.
+func TestInLoop_WorkDirValidated(t *testing.T) {
+	roots := WithDirectRoots(DirectRoots{WorkRoot: directTestRoot(t), CacheRoot: directTestRoot(t)})
+
+	filePath := filepath.Join(t.TempDir(), "not-a-dir.txt")
+	if err := os.WriteFile(filePath, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		workDir string
+	}{
+		{"empty", ""},
+		{"missing", filepath.Join(t.TempDir(), "does-not-exist")},
+		{"regular-file", filePath},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, code, err := InLoopCommand(context.Background(), tc.workDir, []string{"go", "test", "./..."}, time.Minute, 0, roots)
+			if err == nil {
+				t.Fatalf("workDir %q must be refused", tc.workDir)
+			}
+			if code != -1 {
+				t.Fatalf("refusal code = %d, want -1", code)
+			}
+			if !strings.Contains(err.Error(), "work directory") {
+				t.Fatalf("refusal must name the work directory: %v", err)
+			}
+		})
 	}
 }

@@ -116,7 +116,10 @@ func BuildBwrapROStageArgv(command []string, paths DirectJobPaths, opts WrapOpti
 }
 
 // bwrapROFixedEnvValue returns the fixed offline value for one key in
-// bwrapROFixedEnvKeys. Only keys in that list are accepted.
+// bwrapROFixedEnvKeys. Only keys in that list are accepted. An unrecognized key
+// panics: silently emitting an empty --setenv would pin a blank environment
+// value and weaken the offline guarantee, so a newly added key must be wired
+// here in the same change (09-REVIEW IN-04).
 func bwrapROFixedEnvValue(key string) string {
 	switch key {
 	case "GOPROXY":
@@ -132,7 +135,7 @@ func bwrapROFixedEnvValue(key string) string {
 	case "GO111MODULE":
 		return "on"
 	default:
-		return ""
+		panic(fmt.Sprintf("bwrapROFixedEnvValue: unrecognized fixed env key %q", key))
 	}
 }
 

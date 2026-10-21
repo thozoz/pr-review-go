@@ -388,7 +388,14 @@ func (c *Config) ValidateWebhook() error {
 	if c.WebhookStateDir == "" {
 		configDir, err := os.UserConfigDir()
 		if err != nil || configDir == "" {
-			configDir = os.TempDir()
+			// Fail closed: silently falling back to the shared host temp
+			// directory would put durable webhook state where any local
+			// process can read or replace it (08-REVIEW WR-02).
+			reason := "os.UserConfigDir returned an empty path"
+			if err != nil {
+				reason = err.Error()
+			}
+			return fmt.Errorf("WebhookStateDir is unset and user config dir is unavailable (%s); set WEBHOOK_STATE_DIR to a private path", reason)
 		}
 		c.WebhookStateDir = filepath.Join(configDir, "pr-review-go", "state")
 	}
@@ -471,7 +478,10 @@ func (c *Config) ValidateDirectRoots() error {
 
 // validateDirectRootPath normalises one direct root to an absolute, cleaned
 // path in place and refuses any value at or beneath the shared host temporary
-// directory.
+// directory. Both the candidate and the temporary directory are
+// symlink-resolved first, so a root reachable through a symlink alias is
+// caught fail-closed rather than passing a lexical prefix check
+// (08-REVIEW WR-02).
 func validateDirectRootPath(field string, value *string) error {
 	clean := filepath.Clean(*value)
 	abs, err := filepath.Abs(clean)
@@ -479,7 +489,13 @@ func validateDirectRootPath(field string, value *string) error {
 		return fmt.Errorf("invalid %s %q: %v", field, *value, err)
 	}
 	clean = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		clean = filepath.Clean(resolved)
+	}
 	tmp := filepath.Clean(os.TempDir())
+	if resolved, err := filepath.EvalSymlinks(tmp); err == nil {
+		tmp = filepath.Clean(resolved)
+	}
 	if clean == tmp || strings.HasPrefix(clean, tmp+string(os.PathSeparator)) {
 		return fmt.Errorf("invalid %s %q: must not be the shared host temporary directory", field, clean)
 	}
