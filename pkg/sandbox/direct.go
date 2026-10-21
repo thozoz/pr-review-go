@@ -90,7 +90,7 @@ func detectDirectProject(dir string) *directProject {
 			lang:        "go",
 			buildArgs:   []string{"go", "build", "./..."},
 			testOptions: [][]string{{"go", "test", "-race", "./..."}},
-			offline:     []string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"},
+			offline:     []string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off", "GO111MODULE=on"},
 		}
 		if hasUnvendoredDependencies(dir) {
 			proj.installArgs = []string{"go", "mod", "download"}
@@ -172,8 +172,15 @@ var directSecretEnvPrefixes = []string{"GH_TOKEN", "GITHUB_TOKEN", "GITHUB_", "L
 // directGoEnvOverrides lists Go toolchain env keys that must never be
 // inherited into stage exec: the pinned offline list is authoritative, and
 // neither the caller environment nor a go.env file may re-enable fetch
-// (GOPROXY) or weaken verification (GOFLAGS, sumdb bypasses).
-var directGoEnvOverrides = []string{"GOFLAGS", "GOPROXY", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB"}
+// (GOPROXY/GOTOOLCHAIN/GOWORK), weaken verification (GOFLAGS, GOVCS, sumdb
+// bypasses), redirect the Go env file (GOENV) or flip module mode
+// (GO111MODULE). Dropping first matters because a duplicated key would let the
+// child's first-match getenv resolve to the server's inherited value
+// (11-REVIEW WR-02 / T-261021-01).
+var directGoEnvOverrides = []string{
+	"GOFLAGS", "GOPROXY", "GOTOOLCHAIN", "GOWORK", "GOVCS", "GOENV", "GO111MODULE",
+	"GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB",
+}
 
 // directRootEnvKeys lists the toolchain root env keys that must never be
 // inherited from the server process (ROOT-02, T-08-02): every one of them is
@@ -379,12 +386,6 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 	}
 
 	env := buildDirectStageEnv(proj.offline, &paths)
-	if proj.lang == "node" {
-		report.Status = StatusIncomplete
-		report.Reason = "Node dependency preparation is unsupported: installers and lifecycle scripts are disabled"
-		report.Summary = "INCOMPLETE: " + report.Reason
-		return report, nil
-	}
 
 	// Lock Python scope to Go-first with honest-incomplete (D-03, D-05):
 	// any Python project whose install would need network returns StatusIncomplete.
@@ -425,7 +426,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			report.DroppedBytes += installRes.DroppedBytes
 		}
 		if !installRes.Passed {
-			if applyHelperExitToReport(report, spec.Rank, installRes) {
+			if applyHelperExitToReport(report, spec.Rank, "install", installRes) {
 				return report, nil
 			}
 			// Denial classification has exactly one owner per run: this outer
@@ -455,7 +456,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 			report.DroppedBytes += buildRes.DroppedBytes
 		}
 		if !buildRes.Passed {
-			if applyHelperExitToReport(report, spec.Rank, buildRes) {
+			if applyHelperExitToReport(report, spec.Rank, "build", buildRes) {
 				return report, nil
 			}
 			if applyDenialClassification(report, spec.Rank, paths, "build", buildRes) {
@@ -487,7 +488,7 @@ func (d *DirectRunner) VerifyDirGated(ctx context.Context, dir, commitSHA string
 		report.DroppedBytes += testRes.DroppedBytes
 	}
 	if !testRes.Passed {
-		if applyHelperExitToReport(report, spec.Rank, testRes) {
+		if applyHelperExitToReport(report, spec.Rank, "test", testRes) {
 			return report, nil
 		}
 		if applyDenialClassification(report, spec.Rank, paths, "test", testRes) {
