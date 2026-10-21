@@ -38,3 +38,10 @@ func isMountedFromReader(r io.Reader, dir string) (bool, error) {
 func firstNonEmpty(vals ...string) string {
 	return sandbox.FirstNonEmpty(vals...)
 }
+
+// writeSandboxEnvFile creates or updates an operator environment file with the
+// resolved sandbox configuration and 0600 permissions. It delegates to
+// pkg/sandbox so the atomic persistence contract stays in one place.
+func writeSandboxEnvFile(filePath, image, slotDir, controlDir string) error {
+	return sandbox.WriteSandboxEnvFile(filePath, image, slotDir, controlDir)
+}
