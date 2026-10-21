@@ -289,12 +289,143 @@ func RunSetupWithDeps(cfg *config.Config, opts SetupOptions, out, errOut io.Writ
 		}
 	}
 
+	// Persist the resolved configuration when the operator asked for it.
+	if opts.WriteEnvPath != "" {
+		if err := WriteSandboxEnvFile(opts.WriteEnvPath, resolvedImage, slotDir, controlDir); err != nil {
+			return fail("failed to write sandbox environment to %s: %v", opts.WriteEnvPath, err)
+		}
+		fmt.Fprintf(out, "      wrote sandbox environment to %s (permissions 0600).\n", opts.WriteEnvPath)
+	}
+
 	fmt.Fprintln(out, "── setup complete ──")
 	fmt.Fprintln(out, "Export and restart the server with:")
 	fmt.Fprintf(out, "  ENABLE_SANDBOX=true\n  SANDBOX_MODE=podman\n  SANDBOX_IMAGE=%s   # prefer the pinned digest above\n  SANDBOX_SLOT_DIR=%s\n  SANDBOX_CONTROL_DIR=%s\n",
 		resolvedImage, slotDir, controlDir)
 	fmt.Fprintln(out, "Without these, the server stays fail-closed (StatusUnavailable + honest notice, no host execution).")
 	return 0
+}
+
+// WriteSandboxEnvFile creates or updates an operator environment file with the
+// resolved sandbox configuration. It preserves comments, blank lines, and
+// unrelated variables, updates the five sandbox variables in place, appends
+// any that are missing, and persists atomically at 0600 permissions.
+func WriteSandboxEnvFile(filePath, image, slotDir, controlDir string) error {
+	if strings.TrimSpace(filePath) == "" {
+		return fmt.Errorf("env file path is empty")
+	}
+	values := map[string]string{
+		"ENABLE_SANDBOX":      "true",
+		"SANDBOX_MODE":        "podman",
+		"SANDBOX_IMAGE":       image,
+		"SANDBOX_SLOT_DIR":    slotDir,
+		"SANDBOX_CONTROL_DIR": controlDir,
+	}
+	for key, value := range values {
+		if strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("refusing to write %s: value contains a newline", key)
+		}
+	}
+
+	existing, exists, err := readEnvFile(filePath)
+	if err != nil {
+		return err
+	}
+	content := renderSandboxEnv(existing, exists, values)
+
+	dir := filepath.Dir(filePath)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(filePath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary env file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("set temporary env file permissions: %w", err)
+	}
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary env file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary env file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary env file: %w", err)
+	}
+	if err := os.Rename(tmpName, filePath); err != nil {
+		return fmt.Errorf("rename temporary env file into place: %w", err)
+	}
+	if err := os.Chmod(filePath, 0o600); err != nil {
+		return fmt.Errorf("enforce 0600 permissions on %s: %w", filePath, err)
+	}
+	return nil
+}
+
+// readEnvFile returns the file contents and whether the file existed.
+func readEnvFile(filePath string) (string, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("read env file %s: %w", filePath, err)
+	}
+	return string(data), true, nil
+}
+
+// renderSandboxEnv merges the five sandbox variables into existing content.
+func renderSandboxEnv(existing string, exists bool, values map[string]string) string {
+	keys := []string{
+		"ENABLE_SANDBOX",
+		"SANDBOX_MODE",
+		"SANDBOX_IMAGE",
+		"SANDBOX_SLOT_DIR",
+		"SANDBOX_CONTROL_DIR",
+	}
+	seen := make(map[string]bool, len(keys))
+	lines := make([]string, 0, 16)
+	if !exists {
+		lines = append(lines, "# pr-review-go sandbox configuration")
+	} else if existing != "" {
+		for _, line := range strings.Split(strings.TrimSuffix(existing, "\n"), "\n") {
+			if key, ok := envKeyFromLine(line); ok {
+				if value, known := values[key]; known {
+					lines = append(lines, key+"="+value)
+					seen[key] = true
+					continue
+				}
+			}
+			lines = append(lines, line)
+		}
+	}
+	for _, key := range keys {
+		if !seen[key] {
+			lines = append(lines, key+"="+values[key])
+		}
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// envKeyFromLine extracts KEY from a KEY=VALUE line, tolerating an optional
+// leading "export ". Comments and non-assignment lines return ok=false.
+func envKeyFromLine(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return "", false
+	}
+	trimmed = strings.TrimPrefix(trimmed, "export ")
+	eq := strings.IndexByte(trimmed, '=')
+	if eq <= 0 {
+		return "", false
+	}
+	key := strings.TrimSpace(trimmed[:eq])
+	if key == "" {
+		return "", false
+	}
+	return key, true
 }
 
 // blkidFSType probes the filesystem type of a file without mounting it.
