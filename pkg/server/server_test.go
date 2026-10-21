@@ -479,3 +479,194 @@ func TestAdmitDecision_AutomaticTriggerCannotAdmitDecision(t *testing.T) {
 		}
 	}
 }
+
+func TestNetworkOptInFlagStrip(t *testing.T) {
+	cases := []struct {
+		body        string
+		wantKind    string
+		wantPayload string
+		wantOptIn   bool
+	}{
+		{"/review --with-network", "review", "", true},
+		{"/review --with-network please check", "review", "", true},
+		{"/improve --commit fix race --with-network", "edit", "fix race", true},
+		{"/improve --with-network", "improve", "", true},
+		{"@pr-review add retry --with-network", "edit", "add retry", true},
+		{"@pr-review --with-network", "edit", "", true},
+		{"/review --with-networkx", "review", "", false},
+		{"/review use internet please", "review", "", false},
+		{"/review", "review", "", false},
+		{"/improve --commit fix race", "edit", "fix race", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.body, func(t *testing.T) {
+			if got := hasStandaloneNetworkFlag(tc.body); got != tc.wantOptIn {
+				t.Errorf("hasStandaloneNetworkFlag(%q) = %v, want %v", tc.body, got, tc.wantOptIn)
+			}
+			kind, payload := parseCommentCommand(withoutNetworkFlag(tc.body))
+			if kind != tc.wantKind {
+				t.Errorf("parse stripped(%q) kind = %q, want %q", tc.body, kind, tc.wantKind)
+			}
+			if payload != tc.wantPayload {
+				t.Errorf("parse stripped(%q) payload = %q, want %q", tc.body, payload, tc.wantPayload)
+			}
+		})
+	}
+}
+
+func TestNetworkOptInStatusLineOnce(t *testing.T) {
+	if !strings.Contains(NetworkFetchStatusLine, "Network fetch: ON") {
+		t.Fatalf("status line literal changed: %q", NetworkFetchStatusLine)
+	}
+	once := appendNetworkFetchLine("🔄 Review running...", true)
+	if got := strings.Count(once, NetworkFetchStatusLine); got != 1 {
+		t.Fatalf("expected status line once, got %d in %q", got, once)
+	}
+	twice := appendNetworkFetchLine(once, true)
+	if twice != once {
+		t.Fatalf("status line must render once, second append changed text: %q", twice)
+	}
+	if off := appendNetworkFetchLine("🔄 Review running...", false); strings.Contains(off, NetworkFetchStatusLine) {
+		t.Fatalf("offline jobs must not carry the status line: %q", off)
+	}
+}
+
+func postIssueCommentWebhookWithAPI(t *testing.T, srv *Server, apiURL, deliveryID, body, user string) *httptest.ResponseRecorder {
+	t.Helper()
+	client, err := ghclient.NewTestClient(apiURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.gh = client
+	payload := []byte(fmt.Sprintf(`{"action":"created","issue":{"number":7,"pull_request":{"url":"https://api.github.com/repos/org/repo/pulls/7"}},"comment":{"id":%d,"body":%q,"user":{"login":%q}},"repository":{"id":12345,"name":"repo","owner":{"login":"org"}}}`,
+		time.Now().UnixNano()%100000+1000, body, user))
+	req := httptest.NewRequest("POST", "/api/v1/github_webhooks", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Delivery", deliveryID)
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Hub-Signature-256", signPayload("secret", payload))
+	rr := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rr, req)
+	return rr
+}
+
+func newNetworkOptInServer(t *testing.T) *Server {
+	t.Helper()
+	cfg := &config.Config{
+		GitHubToken:     "test-token",
+		LLMAPIKey:       "test-key",
+		LLMModel:        "test-model",
+		LLMBaseURL:      "http://example.invalid",
+		WebhookSecret:   "secret",
+		WebhookStateDir: t.TempDir(),
+	}
+	srv := NewServer(cfg)
+	t.Cleanup(srv.Stop)
+	return srv
+}
+
+func TestNetworkOptInDenyOnUntrusted(t *testing.T) {
+	// Untrusted author carrying --with-network gets {"status":"ignored"} and
+	// no NetworkFetch job: admission denies fail-closed before any job.
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/permission") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"permission": "read"})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer api.Close()
+
+	srv := newNetworkOptInServer(t)
+	dispatched := make(chan string, 1)
+	srv.dispatchHook = func(action, owner, repo string, prNum int) {
+		dispatched <- action
+	}
+	rr := postIssueCommentWebhookWithAPI(t, srv, api.URL, "deliv-net-deny-1", "/review --with-network", "untrusted")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("webhook status = %d, want 200", rr.Code)
+	}
+	if got := strings.TrimSpace(rr.Body.String()); got != `{"status":"ignored"}` {
+		t.Fatalf("untrusted opt-in response = %q, want ignored", got)
+	}
+	select {
+	case act := <-dispatched:
+		t.Fatalf("untrusted opt-in dispatched action: %s", act)
+	default:
+	}
+	jobs, err := srv.store.ListQueuedJobs(context.Background())
+	if err != nil {
+		t.Fatalf("list queued: %v", err)
+	}
+	for _, j := range jobs {
+		if j.NetworkFetch {
+			t.Fatalf("untrusted author must never produce a NetworkFetch job: %+v", j)
+		}
+	}
+}
+
+func TestNetworkOptInTrustedSetsFlag(t *testing.T) {
+	newPermAPI := func(permission string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/permission") {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"permission": permission})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+	}
+
+	t.Run("trusted opt-in sets NetworkFetch", func(t *testing.T) {
+		api := newPermAPI("write")
+		defer api.Close()
+		srv := newNetworkOptInServer(t)
+		rr := postIssueCommentWebhookWithAPI(t, srv, api.URL, "deliv-net-allow-1", "/review --with-network", "member")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("webhook status = %d, want 200", rr.Code)
+		}
+		if got := strings.TrimSpace(rr.Body.String()); got != `{"status":"accepted"}` {
+			t.Fatalf("trusted opt-in response = %q, want accepted", got)
+		}
+		jobs, err := srv.store.InspectJobs(context.Background())
+		if err != nil || len(jobs) == 0 {
+			t.Fatalf("expected queued job, got %v err=%v", jobs, err)
+		}
+		var found *Job
+		for _, j := range jobs {
+			if j.Author == "member" {
+				found = j
+			}
+		}
+		if found == nil {
+			t.Fatalf("no job for trusted author in %+v", jobs)
+		}
+		if !found.NetworkFetch {
+			t.Fatalf("trusted --with-network must set NetworkFetch true: %+v", found)
+		}
+		if found.Kind != "review" {
+			t.Fatalf("kind = %q, want review", found.Kind)
+		}
+	})
+
+	t.Run("trusted without flag stays offline", func(t *testing.T) {
+		api := newPermAPI("write")
+		defer api.Close()
+		srv := newNetworkOptInServer(t)
+		rr := postIssueCommentWebhookWithAPI(t, srv, api.URL, "deliv-net-plain-1", "/review", "member")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("webhook status = %d, want 200", rr.Code)
+		}
+		jobs, err := srv.store.InspectJobs(context.Background())
+		if err != nil || len(jobs) == 0 {
+			t.Fatalf("expected queued job, got %v err=%v", jobs, err)
+		}
+		for _, j := range jobs {
+			if j.NetworkFetch {
+				t.Fatalf("plain command must stay offline: %+v", j)
+			}
+		}
+	})
+}

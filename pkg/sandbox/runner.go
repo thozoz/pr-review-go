@@ -381,8 +381,98 @@ func (r *Runner) VerifyProject(ctx context.Context, dir string) (*VerificationRe
 	return report, nil
 }
 
+// depGatewaySocketPrefix is the per-job gateway socket filename prefix:
+// lease.ControlDir/depgw-<jobID>.sock. The socket exists only while the
+// fetch-gated stage 1 runs (created by StartDependencyGateway inside
+// PrepareDependencies, removed by its Close); stage 2 never references it.
+const depGatewaySocketPrefix = "depgw-"
+
+// fetchGateOK is the stage-split fetch gate (T-07-02/T-07-07): the per-job
+// gateway socket is bound in stage 1 only when the job opted in AND the
+// opt-in was execution-reverified (07-01 CanWriteRepository, 5s fail-closed).
+// A stale opt-in without reverify, or any automatic job, yields false so no
+// socket is ever created for it.
+func fetchGateOK(networkFetch, trustedReverified bool) bool {
+	return networkFetch && trustedReverified
+}
+
+// sweepStaleDepGatewaySockets best-effort removes per-job gateway sockets
+// left in lease.ControlDir (e.g. after a crashed fetch stage) so an opt-in
+// never outlives its job. Only files matching depgw-*.sock are touched.
+func sweepStaleDepGatewaySockets(lease *SlotLease) {
+	if lease == nil || lease.ControlDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(lease.ControlDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), depGatewaySocketPrefix) || !strings.HasSuffix(e.Name(), ".sock") {
+			continue
+		}
+		_ = os.Remove(filepath.Join(lease.ControlDir, e.Name()))
+	}
+}
+
+// isOfflineCacheMiss reports whether a failed offline stage (GOPROXY=off,
+// warm cache only) failed because the module cache missed, rather than
+// because PR code is broken. Only consulted on the !fetchOK path, where a
+// cache miss means the fetch gate denied the download: the verdict is
+// StatusIncomplete (could not prepare), never a code-failure verdict.
+func isOfflineCacheMiss(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	for _, marker := range []string{
+		"module lookup disabled",
+		"missing go.sum entry",
+		"cannot find module",
+		"no required module provides",
+		"updates to go.mod needed",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// RunSnapshotWithNetwork executes a verified snapshot with an explicit
+// network-fetch decision. networkFetch is the job-scoped opt-in flag;
+// trustedReverified must carry the execution-time reverify result (07-01).
+// The fetch gate opens only when BOTH hold; stage 2 always runs fixed
+// go build ./... then go test -race ./... with NO gateway socket on either
+// backend even when opted in.
+func (r *Runner) RunSnapshotWithNetwork(ctx context.Context, snapshot *Snapshot, networkFetch, trustedReverified bool) (*VerificationReport, error) {
+	return r.runSnapshotGated(ctx, snapshot, fetchGateOK(networkFetch, trustedReverified))
+}
+
 // RunSnapshot executes a verified snapshot through the protected Podman tracer path.
+// Default-off wrapper: callers without an execution-reverified opt-in
+// (automatic jobs, assistant/docs flows) always run fully offline.
 func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*VerificationReport, error) {
+	return r.runSnapshotGated(ctx, snapshot, false)
+}
+
+// runPrepGated runs the fetch-gated dependency preparation stage. When
+// fetchOK is false no gateway socket is created: stale per-job sockets are
+// swept and a nil result reports "skipped, warm cache only". When true the
+// DepPreparer runs WITH the per-job gateway socket executing only the fixed
+// go mod download under prepCtx bounded by SandboxTimeoutPrep (default 3m);
+// the gateway itself caps bodies at MaxBodyBytes (500 MiB default).
+func (r *Runner) runPrepGated(ctx context.Context, jobID string, lease *SlotLease, fetchOK bool) (*StageResult, error) {
+	if !fetchOK {
+		sweepStaleDepGatewaySockets(lease)
+		return nil, nil
+	}
+	if r.DepPreparer == nil {
+		return nil, nil
+	}
+	prepCtx, cancel := context.WithTimeout(ctx, r.prepTimeout())
+	defer cancel()
+	return r.DepPreparer.PrepareDependencies(prepCtx, jobID, lease)
+}
+
+func (r *Runner) runSnapshotGated(ctx context.Context, snapshot *Snapshot, fetchOK bool) (*VerificationReport, error) {
 	report := &VerificationReport{
 		Results: make([]ExecutionResult, 0),
 	}
@@ -423,7 +513,7 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 	// Direct mode skips slot leasing, attestation, and containers: the
 	// snapshot source directory is verified in place on the trusted host.
 	if r.Direct != nil {
-		return r.runDirectSnapshot(ctx, snapshot)
+		return r.runDirectSnapshot(ctx, snapshot, fetchOK)
 	}
 
 	// On non-Linux platforms (macOS/Windows), build/test isolation is unavailable (D-02)
@@ -500,19 +590,19 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 		return report, nil
 	}
 
-	// 5. Dependency preparation stage (D-05, D-06, D-07, D-12)
-	if r.DepPreparer != nil {
-		prepCtx, cancelPrep := context.WithTimeout(ctx, r.prepTimeout())
-		defer cancelPrep()
-
-		prepRes, err := r.DepPreparer.PrepareDependencies(prepCtx, jobID, lease)
-		if err != nil {
-			report.Status = StatusUnavailable
-			report.Reason = fmt.Sprintf("dependency preparation error: %v", err)
-			report.Summary = fmt.Sprintf("UNAVAILABLE: %v", err)
-			return report, nil
-		}
-		if prepRes != nil && !prepRes.Passed {
+	// 5. Dependency preparation stage, fetch-gated (D-05, D-06, D-07, D-12,
+	// T-07-02/T-07-07). fetchOK true runs WITH the per-job gateway socket
+	// (fixed go mod download only); fetchOK false creates no socket and
+	// proceeds against the warm cache. The prep result mapping below is
+	// backend-agnostic: podman and bwrap prep results share it verbatim.
+	prepRes, err := r.runPrepGated(ctx, jobID, lease, fetchOK)
+	if err != nil {
+		report.Status = StatusUnavailable
+		report.Reason = fmt.Sprintf("dependency preparation error: %v", err)
+		report.Summary = fmt.Sprintf("UNAVAILABLE: %v", err)
+		return report, nil
+	}
+	if prepRes != nil && !prepRes.Passed {
 			report.FailedStage = "prep"
 			if prepRes.IsTimeout {
 				report.Status = StatusTimeout
@@ -542,10 +632,11 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 				report.Summary = fmt.Sprintf("FAILED: dependency preparation failed: %s", report.Reason)
 			}
 			return report, nil
-		}
 	}
 
-	// 6. Combined 5-minute deadline for build and race-test stages (D-06)
+	// 6. Combined 5-minute deadline for build and race-test stages (D-06).
+	// Stage 2 NEVER carries the gateway socket on either backend, even when
+	// opted in: RunStage takes no socket parameter and mounts none.
 	execCtx, cancelExec := context.WithTimeout(ctx, r.executionTimeout())
 	defer cancelExec()
 
@@ -587,6 +678,13 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 			report.Status = StatusResourceExhausted
 			report.Reason = "memory or cgroup limit exceeded during build"
 			report.Summary = "RESOURCE_EXHAUSTED: `go build ./...` exceeded memory limits."
+		} else if !fetchOK && isOfflineCacheMiss(buildRes.Stderr) {
+			report.Status = StatusIncomplete
+			report.Reason = strings.TrimSpace(buildRes.Stderr)
+			if report.Reason == "" {
+				report.Reason = "module cache miss while offline (fetch gate denied download)"
+			}
+			report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
 		} else {
 			report.Status = StatusBuildFailed
 			report.Reason = "go build ./... failed to compile"
@@ -633,6 +731,13 @@ func (r *Runner) RunSnapshot(ctx context.Context, snapshot *Snapshot) (*Verifica
 			report.Status = StatusResourceExhausted
 			report.Reason = "memory or cgroup limit exceeded during test"
 			report.Summary = "RESOURCE_EXHAUSTED: `go test -race ./...` exceeded memory limits."
+		} else if !fetchOK && isOfflineCacheMiss(testRes.Stderr) {
+			report.Status = StatusIncomplete
+			report.Reason = strings.TrimSpace(testRes.Stderr)
+			if report.Reason == "" {
+				report.Reason = "module cache miss while offline (fetch gate denied download)"
+			}
+			report.Summary = fmt.Sprintf("INCOMPLETE: %s", report.Reason)
 		} else {
 			report.Status = StatusTestFailed
 			report.Reason = "go test -race ./... reported test failures"
