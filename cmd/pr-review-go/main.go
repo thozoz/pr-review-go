@@ -39,6 +39,12 @@ func main() {
 	noSandbox := flag.Bool("no-sandbox", false, "Disable local runner sandbox verification")
 	modelFlag := flag.String("model", "", "LLM model to use")
 	showVersion := flag.Bool("version", false, "Print release version")
+	setupSandbox := flag.Bool("setup-sandbox", false, "Provision sandbox prerequisites (podman, 3 GiB slot, image) and exit")
+	setupImage := flag.String("sandbox-image", "", "Sandbox image to pull/build (default SANDBOX_IMAGE or GHCR latest)")
+	setupSlotDir := flag.String("sandbox-slot-dir", "", "Slot mount directory (default SANDBOX_SLOT_DIR or /var/lib/pr-review/slots/slot-01)")
+	setupSlotSize := flag.String("sandbox-slot-size", "3G", "Backing file size for a new slot (e.g. 3G)")
+	setupBuild := flag.Bool("build-from-source", false, "Build the image locally with --network=host instead of pulling")
+	writeEnv := flag.String("write-env", "", "Write or update the operator environment file with the resolved sandbox configuration (0600)")
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("pr-review-go %s (%s, %s)\n", version.Version, version.Commit, version.Date)
@@ -59,6 +65,19 @@ func main() {
 	}
 	if *noSandbox {
 		cfg.EnableSandbox = false
+	}
+
+	// Sandbox provisioning helper mirrors pr-review-server: it checks podman,
+	// prepares and validates the 3 GiB loop ext4 slot, pulls or builds the
+	// trusted image, optionally persists the resolved config, then exits.
+	if *setupSandbox {
+		os.Exit(sandbox.RunSetup(cfg, sandbox.SetupOptions{
+			Image:           *setupImage,
+			SlotDir:         *setupSlotDir,
+			SlotSize:        *setupSlotSize,
+			BuildFromSource: *setupBuild,
+			WriteEnvPath:    *writeEnv,
+		}, os.Stdout, os.Stderr))
 	}
 
 	// Validate configuration

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/sandbox"
 	"github.com/thozoz/pr-review-go/pkg/server"
 	"github.com/thozoz/pr-review-go/pkg/version"
 )
@@ -30,6 +31,7 @@ func main() {
 	setupSlotDir := flag.String("sandbox-slot-dir", "", "Slot mount directory (default SANDBOX_SLOT_DIR or /var/lib/pr-review/slots/slot-01)")
 	setupSlotSize := flag.String("sandbox-slot-size", "3G", "Backing file size for a new slot (e.g. 3G)")
 	setupBuild := flag.Bool("build-from-source", false, "Build the image locally with --network=host instead of pulling")
+	writeEnv := flag.String("write-env", "", "Write or update the operator environment file with the resolved sandbox configuration (0600)")
 	flag.Parse()
 
 	if *showVersion {
@@ -40,9 +42,16 @@ func main() {
 	cfg := config.Load()
 
 	// Sandbox provisioning helper: checks podman, prepares the 3 GiB loop
-	// ext4 slot, and pulls (or locally builds) the trusted image, then exits.
+	// ext4 slot, validates the mount, and pulls (or locally builds) the
+	// trusted image, then exits. --write-env persists the resolved config.
 	if *setupSandbox {
-		os.Exit(runSetupSandbox(cfg, *setupImage, *setupSlotDir, *setupSlotSize, *setupBuild))
+		os.Exit(runSetupSandbox(cfg, sandbox.SetupOptions{
+			Image:           *setupImage,
+			SlotDir:         *setupSlotDir,
+			SlotSize:        *setupSlotSize,
+			BuildFromSource: *setupBuild,
+			WriteEnvPath:    *writeEnv,
+		}))
 	}
 
 	// Offline queue inspection and resolution tools require stopping the service
