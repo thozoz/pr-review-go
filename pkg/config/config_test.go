@@ -2,6 +2,8 @@ package config
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -665,3 +667,75 @@ func TestValidateSandboxModeRejectsUnknown(t *testing.T) {
 	}
 }
 
+// TestConfigDirectRoots covers ROOT-01: env loading, state-dir-relative
+// defaults, and rejection of a root inside the shared host temporary
+// directory.
+func TestConfigDirectRoots(t *testing.T) {
+	// 1. Both knobs load verbatim from the environment.
+	t.Setenv("GITHUB_TOKEN", "token")
+	t.Setenv("LLM_API_KEY", "key")
+	t.Setenv("LLM_MODEL", "model")
+	t.Setenv("LLM_BASE_URL", "https://example.com")
+	t.Setenv("SANDBOX_MODE", SandboxModeDirect)
+	t.Setenv("SANDBOX_DIRECT_WORK_ROOT", "/var/lib/pr-review/direct")
+	t.Setenv("SANDBOX_DIRECT_CACHE_DIR", "/var/lib/pr-review/cache")
+	cfg := Load()
+	if cfg.SandboxDirectWorkRoot != "/var/lib/pr-review/direct" {
+		t.Errorf("SANDBOX_DIRECT_WORK_ROOT not loaded: %q", cfg.SandboxDirectWorkRoot)
+	}
+	if cfg.SandboxDirectCacheDir != "/var/lib/pr-review/cache" {
+		t.Errorf("SANDBOX_DIRECT_CACHE_DIR not loaded: %q", cfg.SandboxDirectCacheDir)
+	}
+
+	// 2. Empty roots default under WebhookStateDir (never host /tmp).
+	t.Setenv("SANDBOX_DIRECT_WORK_ROOT", "")
+	t.Setenv("SANDBOX_DIRECT_CACHE_DIR", "")
+	// Deliberately not a t.TempDir(): that lives under os.TempDir(), which the
+	// validator rejects by design.
+	const stateDir = "/var/lib/pr-review-test/state"
+	base := &Config{
+		GitHubToken: "t", LLMAPIKey: "k", LLMModel: "m", LLMBaseURL: "u",
+		EnableSandbox: true, SandboxMode: SandboxModeDirect, WebhookStateDir: stateDir,
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("direct-mode Validate with empty roots failed: %v", err)
+	}
+	wantWork := filepath.Join(stateDir, "direct")
+	wantCache := filepath.Join(stateDir, "direct", "cache")
+	if base.SandboxDirectWorkRoot != wantWork {
+		t.Errorf("default work root = %q, want %q", base.SandboxDirectWorkRoot, wantWork)
+	}
+	if base.SandboxDirectCacheDir != wantCache {
+		t.Errorf("default cache root = %q, want %q", base.SandboxDirectCacheDir, wantCache)
+	}
+
+	// 3. A root inside the shared host temporary directory is rejected with
+	// the literal requirement text, naming the offending field.
+	bad := &Config{
+		GitHubToken: "t", LLMAPIKey: "k", LLMModel: "m", LLMBaseURL: "u",
+		EnableSandbox: true, SandboxMode: SandboxModeDirect, WebhookStateDir: stateDir,
+		SandboxDirectCacheDir: filepath.Join(os.TempDir(), "pr-review-direct"),
+	}
+	err := bad.Validate()
+	if err == nil {
+		t.Fatalf("expected shared-tmp cache root to be rejected")
+	}
+	if !strings.Contains(err.Error(), "must not be the shared host temporary directory") {
+		t.Errorf("shared-tmp error text missing: %v", err)
+	}
+	if !strings.Contains(err.Error(), "SandboxDirectCacheDir") {
+		t.Errorf("shared-tmp error must name the offending field: %v", err)
+	}
+
+	// 4. Podman mode is untouched: empty roots stay empty.
+	podman := &Config{
+		GitHubToken: "t", LLMAPIKey: "k", LLMModel: "m", LLMBaseURL: "u",
+		EnableSandbox: true, SandboxMode: SandboxModePodman, WebhookStateDir: stateDir,
+	}
+	if err := podman.Validate(); err != nil {
+		t.Fatalf("podman-mode Validate failed: %v", err)
+	}
+	if podman.SandboxDirectWorkRoot != "" || podman.SandboxDirectCacheDir != "" {
+		t.Errorf("podman mode must not default direct roots: %q %q", podman.SandboxDirectWorkRoot, podman.SandboxDirectCacheDir)
+	}
+}

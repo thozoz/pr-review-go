@@ -1,7 +1,19 @@
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates git tzdata
+# bubblewrap and go are runtime requirements of the direct-mode confinement
+# ranks inside the container: bwrap-ro needs /usr/bin/bwrap, and the offline Go
+# build/test stages need a Go toolchain. pr-review-sandbox-helper is the
+# trusted landlock-run applier and must sit beside pr-review-server so sibling
+# resolution (ResolveSandboxHelperPath) finds it (Issue #25 / CONFINE-06).
+RUN apk add --no-cache bubblewrap ca-certificates git go tzdata
 ARG TARGETPLATFORM
-COPY ${TARGETPLATFORM}/pr-review-server /usr/local/bin/pr-review-server
+# Copy the pre-built binaries from the GoReleaser Docker context. GoReleaser
+# stages every build id selected by dockers_v2 under ${TARGETPLATFORM}/, so the
+# wildcard below installs pr-review-server together with
+# ${TARGETPLATFORM}/pr-review-sandbox-helper, landing the helper at
+# /usr/local/bin/pr-review-sandbox-helper. The wildcard also lets a context
+# that stages only pr-review-server (the release workflow's Docker smoke test)
+# build successfully, instead of failing on a missing helper COPY source.
+COPY ${TARGETPLATFORM}/pr-review-* /usr/local/bin/
 WORKDIR /app
 EXPOSE 3000
 ENTRYPOINT ["pr-review-server"]

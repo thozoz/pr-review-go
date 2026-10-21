@@ -50,7 +50,7 @@ func TestDirectRunner_Passing(t *testing.T) {
 		"main_test.go": "package main\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 5 {\n\t\tt.Fatal(\"bad add\")\n\t}\n}\n",
 	})
 
-	d := NewDirectRunner(2 * time.Minute)
+	d := newTestDirectRunner(t, 2*time.Minute)
 	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -80,7 +80,7 @@ func TestDirectRunner_BuildFailure(t *testing.T) {
 		"main.go": "package main\n\nfunc broken( {\n",
 	})
 
-	d := NewDirectRunner(2 * time.Minute)
+	d := newTestDirectRunner(t, 2*time.Minute)
 	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -104,7 +104,7 @@ func TestDirectRunner_TestFailure(t *testing.T) {
 		"main_test.go": "package main\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 99 {\n\t\tt.Fatal(\"intentional failure\")\n\t}\n}\n",
 	})
 
-	d := NewDirectRunner(2 * time.Minute)
+	d := newTestDirectRunner(t, 2*time.Minute)
 	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -128,7 +128,7 @@ func TestDirectRunner_NodePass(t *testing.T) {
 		"package.json": `{"name":"directnodepass","version":"1.0.0","scripts":{"test":"node -e \"process.exit(0)\""}}`,
 	})
 
-	d := NewDirectRunner(2 * time.Minute)
+	d := newTestDirectRunner(t, 2*time.Minute)
 	report, err := d.VerifyDir(context.Background(), dir, directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -142,7 +142,7 @@ func TestDirectRunner_NodePass(t *testing.T) {
 }
 
 func TestDirectRunner_UnknownDirPassesWithNotice(t *testing.T) {
-	d := NewDirectRunner(time.Minute)
+	d := newTestDirectRunner(t, time.Minute)
 	report, err := d.VerifyDir(context.Background(), t.TempDir(), directTestSHA)
 	if err != nil {
 		t.Fatalf("VerifyDir error: %v", err)
@@ -248,7 +248,7 @@ func TestDirectStageEnvScrubbed(t *testing.T) {
 	t.Setenv("GOSUMDB", "off")
 	t.Setenv("MYAPP_FOO", "innocent")
 
-	env := buildDirectStageEnv([]string{"GOPROXY=off", "GOENV=off"})
+	env := buildDirectStageEnv([]string{"GOPROXY=off", "GOENV=off"}, nil)
 	has := func(key string) (string, bool) {
 		for _, kv := range env {
 			if kv == key || strings.HasPrefix(kv, key+"=") {
@@ -289,79 +289,30 @@ func TestDirectStageEnvScrubbed(t *testing.T) {
 	if _, found := has("PATH"); !found {
 		t.Error("PATH must survive the scrub (toolchain must resolve)")
 	}
-}
-
-// TestDirectBwrapWrapPrefix proves the Linux wrap shape: kernel network
-// removal flags first, original argv as tail, and no socket bind anywhere.
-func TestDirectBwrapWrapPrefix(t *testing.T) {
-	argv := []string{"go", "build", "./..."}
-	wrapped := bwrapNetIsolateArgv(argv)
-	expectedPrefix := []string{
-		"bwrap",
-		"--unshare-user",
-		"--unshare-net",
-		"--die-with-parent",
-		"--new-session",
-		"--unshare-pid",
-		"--clearenv",
-	}
-	if len(wrapped) != len(argv)+len(expectedPrefix) {
-		t.Fatalf("wrapped argv length = %d, want %d", len(wrapped), len(argv)+len(expectedPrefix))
-	}
-	for i, want := range expectedPrefix {
-		if wrapped[i] != want {
-			t.Fatalf("wrapped argv[%d] = %q, want %q (full %q)", i, wrapped[i], want, wrapped)
-		}
-	}
-	for i, want := range argv {
-		if wrapped[i+len(expectedPrefix)] != want {
-			t.Fatalf("wrapped tail[%d] = %q, want %q", i, wrapped[i+len(expectedPrefix)], want)
-		}
-	}
-	joined := strings.Join(wrapped, " ")
-	for _, banned := range []string{"gateway.sock", "depgw-", "--socket"} {
-		if strings.Contains(joined, banned) {
-			t.Errorf("wrapped stage-2 argv must contain no %q (got %q)", banned, joined)
+	// Companion assertion for the nil-paths contract: toolchain root keys are
+	// still dropped from inheritance, and no job-private pin is emitted.
+	for _, k := range directRootEnvKeys {
+		if kv, found := has(k); found {
+			t.Errorf("nil paths must drop inherited root key %q, got %q", k, kv)
 		}
 	}
 }
 
-// TestDirectBwrapUnavailableIsUnavailable proves D-11 honest degradation: on
-// Linux without bwrap the wrap decision fails with the typed sentinel (the
-// caller maps it to StatusUnavailable + REDUCED-GUARANTEE, never a pass),
-// while off-Linux argv passes through for env-only execution.
-func TestDirectBwrapUnavailableIsUnavailable(t *testing.T) {
-	failAttest := func(context.Context) error {
-		return errors.Join(ErrBwrapUnavailable, errors.New("userns probe failed in test"))
+// TestDirectConfinementRefusesNonLinux inverts the deleted passthrough
+// assertion deliberately: CONFINE-01 forbids running unconfined off-Linux, so
+// a host that is not Linux is refused with the typed sentinel and no argv.
+func TestDirectConfinementRefusesNonLinux(t *testing.T) {
+	okProbe := func(context.Context) error { return nil }
+	spec, err := resolveConfinementRankWith(context.Background(), confinementProbes{
+		goos:          "windows",
+		attestBwrapRO: okProbe,
+		probeLandlock: okProbe,
+	})
+	if !errors.Is(err, ErrConfinementUnavailable) {
+		t.Fatalf("non-Linux host must be refused with ErrConfinementUnavailable, got: %v", err)
 	}
-	argv := []string{"go", "test", "-race", "./..."}
-	if _, err := wrapDirectStage2ArgvForOS("linux", failAttest, context.Background(), argv); !errors.Is(err, ErrBwrapUnavailable) {
-		t.Fatalf("linux without bwrap must yield ErrBwrapUnavailable, got: %v", err)
-	}
-	report := BwrapUnavailableReport("userns probe failed in test")
-	if report.Status != StatusUnavailable {
-		t.Fatalf("degraded report must carry StatusUnavailable, got %q", report.Status)
-	}
-	if !strings.Contains(report.Reason, ReducedGuaranteeLabel) || !strings.Contains(report.Summary, ReducedGuaranteeLabel) {
-		t.Fatalf("degraded report must carry the REDUCED-GUARANTEE label, got reason=%q summary=%q", report.Reason, report.Summary)
-	}
-	if report.Status == StatusPassed {
-		t.Fatal("degraded report must never carry StatusPassed")
-	}
-	got, err := wrapDirectStage2ArgvForOS("windows", failAttest, context.Background(), argv)
-	if err != nil {
-		t.Fatalf("non-Linux must not attest, got error: %v", err)
-	}
-	if strings.Join(got, " ") != strings.Join(argv, " ") {
-		t.Fatalf("non-Linux argv must pass through unchanged, got %q", got)
-	}
-	okAttest := func(context.Context) error { return nil }
-	got, err = wrapDirectStage2ArgvForOS("linux", okAttest, context.Background(), argv)
-	if err != nil {
-		t.Fatalf("linux with bwrap must wrap, got error: %v", err)
-	}
-	if len(got) == 0 || got[0] != "bwrap" || !strings.Contains(strings.Join(got, " "), "--unshare-net") {
-		t.Fatalf("linux with bwrap must return the unshare-net wrap, got %q", got)
+	if spec.Rank != "" || spec.WrapArgv != nil || spec.Env != nil || spec.NetworkIsolated {
+		t.Fatalf("refused host must return a zero-value ConfinementSpec, got %+v", spec)
 	}
 }
 
@@ -411,7 +362,7 @@ func TestKeylessStage2(t *testing.T) {
 	}
 
 	checkClean("podman", strings.Join(podmanStageEnv(), " "))
-	checkClean("direct", strings.Join(buildDirectStageEnv([]string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"}), "\n"))
+	checkClean("direct", strings.Join(buildDirectStageEnv([]string{"GOPROXY=off", "GOTOOLCHAIN=local", "GOWORK=off", "GOVCS=off", "GOENV=off"}, nil), "\n"))
 
 	// The in-loop exec path adds no env of its own: execArgs carry no -e at
 	// all, so the container keeps its --network=none keyless env.

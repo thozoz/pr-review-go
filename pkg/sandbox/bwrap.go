@@ -24,7 +24,16 @@ const ReducedGuaranteeLabel = "REDUCED-GUARANTEE: userns unavailable, network is
 
 // BwrapGatewaySocketPath is the in-sandbox path of the per-job dependency
 // gateway socket. It is bound ONLY in stage 1 and MUST be absent in stage 2.
-const BwrapGatewaySocketPath = "/run/sandbox/gateway.sock"
+//
+// The path must be reached through a destination whose parents already exist
+// in the read-only root, which in the bwrap-ro rank means the private tmpfs
+// mounted at /tmp: with `--ro-bind / /` bwrap cannot create mount-point
+// parents, so a /run/sandbox/... destination fails with "Can't mkdir parents
+// ... Read-only file system". The bind stays READ-ONLY; a unix connect()
+// through a read-only bind is not blocked. The podman path
+// (pkg/sandbox/dependencies.go) keeps its own independent literal and must not
+// be changed.
+const BwrapGatewaySocketPath = "/tmp/pr-review-runtime/gateway.sock"
 
 // BwrapStage1Goproxy is the GOPROXY value inside stage 1: the loopback relay
 // that forwards module fetches to the per-job gateway UDS (same
@@ -45,7 +54,7 @@ func ValidateBwrapFetchArgv(argv []string) error {
 
 // buildStage1Argv returns the fixed stage-1 (fetch) bwrap argv: unprivileged
 // userns+net+pid isolation with the per-job gateway socket bound at
-// /run/sandbox/gateway.sock and GOPROXY pointed at the loopback relay,
+// BwrapGatewaySocketPath and GOPROXY pointed at the loopback relay,
 // executing only the fixed triple `go mod download`.
 func buildStage1Argv(workDir, cacheDir, tmpDir, gwSockPath string) []string {
 	argv := []string{

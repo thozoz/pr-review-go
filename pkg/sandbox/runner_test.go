@@ -579,3 +579,33 @@ func TestStaleSocketSweep(t *testing.T) {
 	}
 }
 
+// TestStatusConfinementDeniedValue pins the exact wire value of the new status
+// and proves it is distinct from every other status constant: the JSON value
+// is a contract other components (server and reviewer) depend on.
+func TestStatusConfinementDeniedValue(t *testing.T) {
+	if got := string(StatusConfinementDenied); got != "confinement_denied" {
+		t.Fatalf("StatusConfinementDenied = %q, want \"confinement_denied\"", got)
+	}
+	all := []VerificationStatus{
+		StatusPassed,
+		StatusBuildFailed,
+		StatusTestFailed,
+		StatusTimeout,
+		StatusResourceExhausted,
+		StatusDiskExhausted,
+		StatusUnavailable,
+		StatusUnsupportedLanguage,
+		StatusIncomplete,
+		StatusCancelled,
+	}
+	seen := map[VerificationStatus]bool{StatusConfinementDenied: true}
+	for _, status := range all {
+		if status == StatusConfinementDenied {
+			t.Fatalf("StatusConfinementDenied collides with a pre-existing status")
+		}
+		if seen[status] {
+			t.Fatalf("duplicate status value %q", status)
+		}
+		seen[status] = true
+	}
+}
