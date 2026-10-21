@@ -17,10 +17,18 @@ type Config struct {
 	GitHubToken   string
 	WebhookSecret string
 	Port          int
-	LLMBaseURL    string
-	LLMAPIKey     string
-	LLMModel      string
-	EnableSandbox bool
+	// DashboardPort optionally starts a dedicated standalone HTTP listener for
+	// the operations dashboard on this port. Zero disables the extra listener;
+	// the dashboard is always mounted on the main server. Env PORT_DASHBOARD.
+	DashboardPort int `json:"dashboard_port"`
+	// DashboardToken authenticates manual dashboard dispatch. When it is
+	// empty, dispatch is restricted to loopback callers (fail-closed).
+	// Env DASHBOARD_TOKEN.
+	DashboardToken string `json:"dashboard_token"`
+	LLMBaseURL     string
+	LLMAPIKey      string
+	LLMModel       string
+	EnableSandbox  bool
 	// SandboxMode selects the verification backend: "direct" (default,
 	// containerless host execution for pre-isolated environments) or "podman"
 	// (explicit opt-in to rootless containers). Env SANDBOX_MODE.
@@ -112,21 +120,21 @@ const (
 )
 
 const (
-	DefaultLLMConcurrency       = 2
-	MinLLMConcurrency           = 1
-	MaxLLMConcurrency           = 16
-	DefaultLLMMinInterval       = 1 * time.Second
-	MinLLMMinInterval           = 1 * time.Millisecond
-	MaxLLMMinInterval           = 1 * time.Minute
-	DefaultLLMResponseMaxBytes  = 1048576 // 1 MiB
-	MinLLMResponseMaxBytes      = 65536   // 64 KiB
-	MaxLLMResponseMaxBytes      = 16777216 // 16 MiB
-	DefaultSandboxConcurrency   = 1
-	MinSandboxConcurrency       = 1
-	MaxSandboxConcurrency       = 16
+	DefaultLLMConcurrency      = 2
+	MinLLMConcurrency          = 1
+	MaxLLMConcurrency          = 16
+	DefaultLLMMinInterval      = 1 * time.Second
+	MinLLMMinInterval          = 1 * time.Millisecond
+	MaxLLMMinInterval          = 1 * time.Minute
+	DefaultLLMResponseMaxBytes = 1048576  // 1 MiB
+	MinLLMResponseMaxBytes     = 65536    // 64 KiB
+	MaxLLMResponseMaxBytes     = 16777216 // 16 MiB
+	DefaultSandboxConcurrency  = 1
+	MinSandboxConcurrency      = 1
+	MaxSandboxConcurrency      = 16
 
-	DefaultDiffMaxBytes = 2097152 // 2 MiB
-	MinDiffMaxBytes     = 1024    // 1 KiB
+	DefaultDiffMaxBytes = 2097152  // 2 MiB
+	MinDiffMaxBytes     = 1024     // 1 KiB
 	MaxDiffMaxBytes     = 52428800 // 50 MiB
 	DefaultDiffMaxFiles = 2000
 	MinDiffMaxFiles     = 1
@@ -138,11 +146,11 @@ const (
 	DefaultAgentMaxTurns            = 12
 	MinAgentMaxTurns                = 1
 	MaxAgentMaxTurns                = 32
-	DefaultAgentMaxToolBytes        = 204800 // 200 KiB
-	MinAgentMaxToolBytes            = 16384  // 16 KiB
+	DefaultAgentMaxToolBytes        = 204800  // 200 KiB
+	MinAgentMaxToolBytes            = 16384   // 16 KiB
 	MaxAgentMaxToolBytes            = 1048576 // 1 MiB
-	DefaultAgentFileReadBytes       = 30000  // 30 KB
-	MinAgentFileReadBytes           = 1024   // 1 KB
+	DefaultAgentFileReadBytes       = 30000   // 30 KB
+	MinAgentFileReadBytes           = 1024    // 1 KB
 	MaxAgentFileReadBytes           = 1048576 // 1 MiB
 	DefaultAgentSearchMaxMatches    = 50
 	MinAgentSearchMaxMatches        = 1
@@ -167,9 +175,9 @@ const (
 	MinRetryJobBudget       = 10 * time.Second
 	MaxRetryJobBudget       = 30 * time.Minute
 
-	DefaultDeferMaxWait     = 15 * time.Minute
-	MinDeferMaxWait         = 1 * time.Minute
-	MaxDeferMaxWait         = 2 * time.Hour
+	DefaultDeferMaxWait      = 15 * time.Minute
+	MinDeferMaxWait          = 1 * time.Minute
+	MaxDeferMaxWait          = 2 * time.Hour
 	DefaultDeferPollInterval = 30 * time.Second
 	MinDeferPollInterval     = 1 * time.Second
 	MaxDeferPollInterval     = 5 * time.Minute
@@ -196,12 +204,12 @@ const (
 	DefaultWebhookDeliveryLimit   = 20000
 	MinWebhookDeliveryLimit       = 100
 	MaxWebhookDeliveryLimit       = 1000000
-	DefaultWebhookStateMaxBytes   = 67108864 // 64 MiB
-	MinWebhookStateMaxBytes       = 16777216 // 16 MiB
+	DefaultWebhookStateMaxBytes   = 67108864   // 64 MiB
+	MinWebhookStateMaxBytes       = 16777216   // 16 MiB
 	MaxWebhookStateMaxBytes       = 1073741824 // 1024 MiB
-	DefaultWebhookBodyMaxBytes    = 1048576 // 1 MiB
-	MinWebhookBodyMaxBytes        = 65536 // 64 KiB
-	MaxWebhookBodyMaxBytes        = 26214400 // 25 MiB
+	DefaultWebhookBodyMaxBytes    = 1048576    // 1 MiB
+	MinWebhookBodyMaxBytes        = 65536      // 64 KiB
+	MaxWebhookBodyMaxBytes        = 26214400   // 25 MiB
 	DefaultWebhookOldQueueWarning = 24 * time.Hour
 	MinWebhookOldQueueWarning     = 1 * time.Hour
 	MaxWebhookOldQueueWarning     = 720 * time.Hour
@@ -226,6 +234,12 @@ const (
 
 // Validate checks if required configuration is present and validates EffortLevel
 func (c *Config) Validate() error {
+	// Optional dashboard listener: zero disables it, anything else must be a
+	// usable TCP port. Checked here (before the setup-mode early return) so an
+	// invalid operator value never passes validation silently.
+	if c.DashboardPort < 0 || c.DashboardPort > 65535 {
+		return fmt.Errorf("invalid DashboardPort: %d (must be between 0 and 65535)", c.DashboardPort)
+	}
 	// Set default EffortLevel if empty
 	if c.EffortLevel == "" {
 		c.EffortLevel = "balanced"
@@ -729,6 +743,18 @@ func Load() *Config {
 		}
 	}
 
+	// Optional standalone dashboard listener. An unparsable value becomes -1 so
+	// Validate() rejects it instead of silently falling back to "disabled".
+	dashboardPort := 0
+	if raw := strings.TrimSpace(os.Getenv("PORT_DASHBOARD")); raw != "" {
+		if p, err := strconv.Atoi(raw); err == nil {
+			dashboardPort = p
+		} else {
+			dashboardPort = -1
+		}
+	}
+	dashboardToken := strings.TrimSpace(os.Getenv("DASHBOARD_TOKEN"))
+
 	llmBaseURL := os.Getenv("LLM_BASE_URL")
 	if llmBaseURL == "" {
 		llmBaseURL = "https://api.openai.com/v1"
@@ -1136,60 +1162,62 @@ func Load() *Config {
 	}
 
 	return &Config{
-		GitHubToken:             token,
-		WebhookSecret:           webhookSecret,
-		Port:                    port,
-		LLMBaseURL:              llmBaseURL,
-		LLMAPIKey:               llmAPIKey,
-		LLMModel:                llmModel,
-		EffortLevel:             effort,
-		EnableSandbox:           enableSandbox,
-		SandboxMode:             sandboxMode,
-		AllowRootfulSandbox:     allowRootfulSandbox,
-		AutoActions:             autoActions,
-		GitHubAppSetupToken:     setupToken,
-		PublicURL:               publicURL,
-		GitHubAppID:             appID,
-		GitHubAppPrivateKeyPath: os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
-		SandboxCPUs:             sandboxCPUs,
-		SandboxMemoryBytes:      sandboxMemoryBytes,
-		SandboxPidsLimit:        sandboxPidsLimit,
-		SandboxDiskBytes:        sandboxDiskBytes,
-		SandboxTimeoutSource:    sandboxTimeoutSource,
-		SandboxTimeoutPrep:      sandboxTimeoutPrep,
-		SandboxTimeoutExecution: sandboxTimeoutExecution,
-		SandboxTimeoutCleanup:   sandboxTimeoutCleanup,
-		SandboxImage:            os.Getenv("SANDBOX_IMAGE"),
-		SandboxSlotDir:          os.Getenv("SANDBOX_SLOT_DIR"),
-		SandboxControlDir:       sandboxControlDir,
-		SandboxDirectWorkRoot:   os.Getenv("SANDBOX_DIRECT_WORK_ROOT"),
-		SandboxDirectCacheDir:   os.Getenv("SANDBOX_DIRECT_CACHE_DIR"),
-		WebhookStateDir:         webhookStateDir,
-		WebhookWorkers:          webhookWorkers,
-		WebhookBacklog:          webhookBacklog,
-		WebhookDeliveryTTL:      webhookDeliveryTTL,
-		WebhookDeliveryLimit:    webhookDeliveryLimit,
-		WebhookStateMaxBytes:    webhookStateMaxBytes,
-		WebhookBodyMaxBytes:     webhookBodyMaxBytes,
-		WebhookOldQueueWarning:  webhookOldQueueWarning,
-		WebhookShutdownTimeout:  webhookShutdownTimeout,
-		LLMConcurrency:          llmConcurrency,
-		LLMMinInterval:          llmMinInterval,
-		LLMResponseMaxBytes:     llmResponseMaxBytes,
-		SandboxConcurrency:      sandboxConcurrency,
-		DiffMaxBytes:            diffMaxBytes,
-		DiffMaxFiles:            diffMaxFiles,
-		DiffMaxHunks:            diffMaxHunks,
-		AgentMaxTurns:            agentMaxTurns,
-		AgentMaxToolBytes:        agentMaxToolBytes,
-		AgentFileReadBytes:       agentFileReadBytes,
-		AgentSearchMaxMatches:    agentSearchMaxMatches,
-		AgentModelViolationLimit: agentModelViolationLimit,
-		RetryMaxAttempts:         retryMaxAttempts,
-		RetryBaseDelay:           retryBaseDelay,
-		RetryMaxDelay:            retryMaxDelay,
-		RetryMaxWait:             retryMaxWait,
-		RetryJobBudget:           retryJobBudget,
+		GitHubToken:               token,
+		WebhookSecret:             webhookSecret,
+		Port:                      port,
+		DashboardPort:             dashboardPort,
+		DashboardToken:            dashboardToken,
+		LLMBaseURL:                llmBaseURL,
+		LLMAPIKey:                 llmAPIKey,
+		LLMModel:                  llmModel,
+		EffortLevel:               effort,
+		EnableSandbox:             enableSandbox,
+		SandboxMode:               sandboxMode,
+		AllowRootfulSandbox:       allowRootfulSandbox,
+		AutoActions:               autoActions,
+		GitHubAppSetupToken:       setupToken,
+		PublicURL:                 publicURL,
+		GitHubAppID:               appID,
+		GitHubAppPrivateKeyPath:   os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH"),
+		SandboxCPUs:               sandboxCPUs,
+		SandboxMemoryBytes:        sandboxMemoryBytes,
+		SandboxPidsLimit:          sandboxPidsLimit,
+		SandboxDiskBytes:          sandboxDiskBytes,
+		SandboxTimeoutSource:      sandboxTimeoutSource,
+		SandboxTimeoutPrep:        sandboxTimeoutPrep,
+		SandboxTimeoutExecution:   sandboxTimeoutExecution,
+		SandboxTimeoutCleanup:     sandboxTimeoutCleanup,
+		SandboxImage:              os.Getenv("SANDBOX_IMAGE"),
+		SandboxSlotDir:            os.Getenv("SANDBOX_SLOT_DIR"),
+		SandboxControlDir:         sandboxControlDir,
+		SandboxDirectWorkRoot:     os.Getenv("SANDBOX_DIRECT_WORK_ROOT"),
+		SandboxDirectCacheDir:     os.Getenv("SANDBOX_DIRECT_CACHE_DIR"),
+		WebhookStateDir:           webhookStateDir,
+		WebhookWorkers:            webhookWorkers,
+		WebhookBacklog:            webhookBacklog,
+		WebhookDeliveryTTL:        webhookDeliveryTTL,
+		WebhookDeliveryLimit:      webhookDeliveryLimit,
+		WebhookStateMaxBytes:      webhookStateMaxBytes,
+		WebhookBodyMaxBytes:       webhookBodyMaxBytes,
+		WebhookOldQueueWarning:    webhookOldQueueWarning,
+		WebhookShutdownTimeout:    webhookShutdownTimeout,
+		LLMConcurrency:            llmConcurrency,
+		LLMMinInterval:            llmMinInterval,
+		LLMResponseMaxBytes:       llmResponseMaxBytes,
+		SandboxConcurrency:        sandboxConcurrency,
+		DiffMaxBytes:              diffMaxBytes,
+		DiffMaxFiles:              diffMaxFiles,
+		DiffMaxHunks:              diffMaxHunks,
+		AgentMaxTurns:             agentMaxTurns,
+		AgentMaxToolBytes:         agentMaxToolBytes,
+		AgentFileReadBytes:        agentFileReadBytes,
+		AgentSearchMaxMatches:     agentSearchMaxMatches,
+		AgentModelViolationLimit:  agentModelViolationLimit,
+		RetryMaxAttempts:          retryMaxAttempts,
+		RetryBaseDelay:            retryBaseDelay,
+		RetryMaxDelay:             retryMaxDelay,
+		RetryMaxWait:              retryMaxWait,
+		RetryJobBudget:            retryJobBudget,
 		DeferMaxWait:              deferMaxWait,
 		DeferPollInterval:         deferPollInterval,
 		EnableMermaid:             enableMermaid,

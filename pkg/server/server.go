@@ -294,6 +294,13 @@ func (s *Server) Routes() http.Handler {
 	// Webhook endpoint (only in normal mode)
 	mux.HandleFunc("POST /api/v1/github_webhooks", s.handleWebhook)
 
+	// Operations dashboard: embedded read-only UI, JSON telemetry, and the
+	// fail-closed manual dispatch endpoint (DASH-01..DASH-04).
+	mux.HandleFunc("GET /dashboard", s.handleDashboard)
+	mux.HandleFunc("GET /dashboard/", s.handleDashboard)
+	mux.HandleFunc("GET /api/v1/metrics", s.handleMetrics)
+	mux.HandleFunc("POST /api/v1/dashboard/dispatch", s.handleDashboardDispatch)
+
 	return mux
 }
 

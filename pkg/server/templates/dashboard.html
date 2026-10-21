@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>PR Review Operations Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-2: #1c2330;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --success: #238636;
+    --warning: #d29922;
+    --danger: #da3633;
+    --purple: #8957e5;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 24px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  h1, h2 { margin: 0; font-weight: 600; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 15px; }
+  .header {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 20px;
+  }
+  .header-meta { color: var(--muted); font-size: 12px; }
+  .refresh-controls { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  select, input, button {
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 10px; font-size: 13px; font-family: inherit;
+  }
+  input:focus, select:focus, button:focus { outline: 1px solid var(--accent); outline-offset: 1px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--success); border-color: var(--success); color: #fff; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  .grid { display: grid; gap: 16px; }
+  .stats { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-bottom: 20px; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .stat-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+  .stat-value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat-sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .stat-value.accent { color: var(--accent); }
+  .stat-value.success { color: var(--success); }
+  .stat-value.warning { color: var(--warning); }
+  .stat-value.danger { color: var(--danger); }
+  .stat-value.purple { color: var(--purple); }
+  section { margin-bottom: 20px; }
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .monitor-list { list-style: none; margin: 0; padding: 0; }
+  .monitor-list li {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+  }
+  .monitor-list li:last-child { border-bottom: none; }
+  .monitor-empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+    border: 1px solid var(--border); color: var(--text); background: var(--surface-2);
+  }
+  .badge-completed { background: rgba(35, 134, 54, 0.2); border-color: var(--success); color: #56d364; }
+  .badge-running { background: rgba(210, 153, 34, 0.2); border-color: var(--warning); color: #e3b341; }
+  .badge-queued { background: rgba(88, 166, 255, 0.15); border-color: var(--accent); color: var(--accent); }
+  .badge-failed { background: rgba(218, 54, 51, 0.2); border-color: var(--danger); color: #f85149; }
+  .badge-uncertain { background: rgba(137, 87, 229, 0.2); border-color: var(--purple); color: #bc8cff; }
+  .badge-needs_attention { background: rgba(218, 54, 51, 0.25); border-color: var(--danger); color: #ff7b72; }
+  .badge-superseded { background: var(--surface-2); border-color: var(--border); color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); font-weight: 600; padding: 8px; border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--surface-2); }
+  .table-wrap { overflow-x: auto; }
+  .dispatch-form { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 10px; align-items: end; }
+  @media (max-width: 900px) { .dispatch-form { grid-template-columns: 1fr; } }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .banner { display: none; margin-top: 12px; padding: 10px 12px; border-radius: 6px; font-size: 13px; }
+  .banner.show { display: block; }
+  .banner.success { background: rgba(35, 134, 54, 0.2); border: 1px solid var(--success); }
+  .banner.error { background: rgba(218, 54, 51, 0.2); border: 1px solid var(--danger); }
+  .notice { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .err-detail { color: #f85149; font-size: 12px; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+</style>
+</head>
+<body>
+  <header class="header">
+    <div>
+      <h1>PR Review Operations Dashboard</h1>
+      <div class="header-meta">Live queue, worker state and activity ledger &middot; generated {{.GeneratedAt}}</div>
+    </div>
+    <div class="refresh-controls">
+      <label for="refresh-interval">Auto-refresh</label>
+      <select id="refresh-interval">
+        <option value="5000">5s</option>
+        <option value="10000" selected>10s</option>
+        <option value="30000">30s</option>
+        <option value="0">Pause</option>
+      </select>
+      <button type="button" id="refresh-now">Refresh now</button>
+    </div>
+  </header>
+
+  <div class="grid stats" id="stat-cards">
+    <div class="card">
+      <div class="stat-label">Total PRs Processed</div>
+      <div class="stat-value accent" id="stat-total-prs">{{.TotalPRs}}</div>
+      <div class="stat-sub" id="stat-total-jobs">{{.TotalJobs}} jobs tracked</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Autonomous Commits Pushed</div>
+      <div class="stat-value purple" id="stat-autonomous-commits">{{.AutonomousCommits}}</div>
+      <div class="stat-sub">completed edit / changelog jobs</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Review Decisions</div>
+      <div class="stat-value success" id="stat-approvals">{{index .Decisions "APPROVE"}}</div>
+      <div class="stat-sub"><span id="stat-request-changes">{{index .Decisions "REQUEST_CHANGES"}}</span> request changes &middot; success rate <span id="stat-success-rate">{{printf "%.1f" .SuccessRate}}%</span></div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Workers &amp; Queue Depth</div>
+      <div class="stat-value warning" id="stat-running">{{.RunningJobs}}</div>
+      <div class="stat-sub">
+        <span id="stat-queued">{{.QueuedJobs}}</span> queued &middot;
+        <span id="stat-deferred">{{.DeferredJobs}}</span> deferred &middot;
+        <span id="stat-needs-attention">{{.NeedsAttentionJobs}}</span> need attention
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <h2>Live Queue &amp; Worker Monitor</h2>
+      <span class="muted" id="queue-summary">{{.ActiveWorkers}} active worker(s)</span>
+    </div>
+    <div class="split">
+      <div class="card">
+        <div class="stat-label">Running</div>
+        <ul class="monitor-list" id="running-jobs">
+          {{range .RecentJobs}}{{if eq .Status "running"}}
+          <li>
+            <span class="badge badge-running">running</span>
+            <a href="{{.PRURL}}">{{.Owner}}/{{.Repo}} #{{.PRNumber}}</a>
+            <span class="muted">{{.Kind}}</span>
+            <span class="mono">{{printf "%.7s" .HeadSHA}}</span>
+          </li>
+          {{end}}{{end}}
+        </ul>
+        <div class="monitor-empty" id="running-empty">No jobs running.</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Queued / Deferred</div>
+        <ul class="monitor-list" id="queued-jobs">
+          {{range .RecentJobs}}{{if eq .Status "queued"}}
+          <li>
+            <span class="badge badge-queued">queued</span>
+            <a href="{{.PRURL}}">{{.Owner}}/{{.Repo}} #{{.PRNumber}}</a>
+            <span class="muted">{{.Kind}}</span>
+            <span class="muted">{{.Trigger}}</span>
+          </li>
+          {{end}}{{end}}
+        </ul>
+        <div class="monitor-empty" id="queued-empty">Queue is empty.</div>
+      </div>
+      <div class="card">
+        <div class="stat-label">Needs Attention / Uncertain</div>
+        <ul class="monitor-list" id="attention-jobs">
+          {{range .RecentJobs}}{{if or (eq .Status "needs_attention") (eq .Status "uncertain")}}
+          <li>
+            <span class="badge badge-{{.Status}}">{{.Status}}</span>
+            <a href="{{.PRURL}}">{{.Owner}}/{{.Repo}} #{{.PRNumber}}</a>
+            <span class="muted">{{.Kind}}</span>
+          </li>
+          {{end}}{{end}}
+        </ul>
+        <div class="monitor-empty" id="attention-empty">Nothing needs operator attention.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>Recent Activity Ledger</h2>
+      <span class="muted">up to 50 most recent jobs</span>
+    </div>
+    <div class="table-wrap">
+      <table id="ledger-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Repository</th>
+            <th>PR</th>
+            <th>Action</th>
+            <th>Trigger</th>
+            <th>Author</th>
+            <th>Status</th>
+            <th>Head SHA</th>
+            <th>Error</th>
+          </tr>
+        </thead>
+        <tbody id="ledger-body">
+          {{range .RecentJobs}}
+          <tr>
+            <td class="muted">{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
+            <td>{{.Owner}}/{{.Repo}}</td>
+            <td>{{if .PRURL}}<a href="{{.PRURL}}">#{{.PRNumber}}</a>{{else}}#{{.PRNumber}}{{end}}</td>
+            <td><span class="badge">{{.Kind}}</span></td>
+            <td class="muted">{{.Trigger}}</td>
+            <td>{{.Author}}</td>
+            <td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
+            <td class="mono">{{printf "%.7s" .HeadSHA}}</td>
+            <td class="err-detail" title="{{.Error}}">{{.Error}}</td>
+          </tr>
+          {{else}}
+          <tr><td colspan="9" class="muted">No activity yet.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>Manual PR Dispatch</h2>
+      <span class="muted">ad-hoc review, summary, description or label generation</span>
+    </div>
+    <form class="dispatch-form" id="dispatch-form" autocomplete="off">
+      <div class="field">
+        <label for="dispatch-pr-url">GitHub PR URL</label>
+        <input id="dispatch-pr-url" name="pr_url" type="url" required
+               placeholder="https://github.com/owner/repo/pull/123">
+      </div>
+      <div class="field">
+        <label for="dispatch-action">Action</label>
+        <select id="dispatch-action" name="action">
+          <option value="review" selected>review</option>
+          <option value="summary">summary</option>
+          <option value="describe">describe</option>
+          <option value="labels">labels</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="dispatch-token">Dashboard Token</label>
+        <input id="dispatch-token" name="token" type="password" placeholder="{{if .TokenConfigured}}required{{else}}not required (loopback mode){{end}}">
+      </div>
+      <button class="primary" type="submit" id="dispatch-submit">Dispatch</button>
+    </form>
+    <div class="notice">
+      {{if .TokenConfigured}}
+      This dashboard requires the operator token (Authorization: Bearer, X-Dashboard-Token header, or the token field).
+      {{else}}
+      DASHBOARD_TOKEN is unset: manual dispatch is restricted to loopback callers and fails closed (403) for any other client.
+      {{end}}
+    </div>
+    <div class="banner" id="dispatch-banner" role="status" aria-live="polite"></div>
+  </section>
+
+  <div class="footer">PR Review Go &middot; zero-dependency embedded operations UI &middot; no external scripts or stylesheets</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var REFRESH_MS_KEY = 'pr-review-dashboard-refresh-ms';
+  var refreshSelect = document.getElementById('refresh-interval');
+  var refreshNow = document.getElementById('refresh-now');
+  var timer = null;
+
+  function setText(id, value) {
+    var node = document.getElementById(id);
+    if (node) { node.textContent = String(value); }
+  }
+
+  function num(value) {
+    return (typeof value === 'number' && isFinite(value)) ? value : 0;
+  }
+
+  function statusClass(status) {
+    var known = ['completed', 'running', 'queued', 'failed', 'uncertain', 'needs_attention', 'superseded'];
+    return known.indexOf(status) >= 0 ? 'badge badge-' + status : 'badge';
+  }
+
+  function clearNode(node) {
+    while (node.firstChild) { node.removeChild(node.firstChild); }
+  }
+
+  function formatTime(value) {
+    if (!value) { return ''; }
+    var d = new Date(value);
+    if (isNaN(d.getTime())) { return ''; }
+    return d.toLocaleString();
+  }
+
+  function prLabel(job) {
+    var owner = job.owner || '';
+    var repo = job.repo || '';
+    if (!owner || !repo) { return '# ' + num(job.pr_number); }
+    return owner + '/' + repo;
+  }
+
+  function makeLink(job) {
+    var a = document.createElement('a');
+    a.textContent = '#' + num(job.pr_number);
+    if (job.pr_url) { a.href = job.pr_url; a.target = '_blank'; a.rel = 'noopener noreferrer'; }
+    return a;
+  }
+
+  function renderMonitor(listId, emptyId, jobs) {
+    var list = document.getElementById(listId);
+    var empty = document.getElementById(emptyId);
+    if (!list || !empty) { return; }
+    clearNode(list);
+    if (!jobs.length) { empty.style.display = ''; return; }
+    empty.style.display = 'none';
+    jobs.forEach(function (job) {
+      var li = document.createElement('li');
+      var badge = document.createElement('span');
+      badge.className = statusClass(job.status);
+      badge.textContent = job.status;
+      li.appendChild(badge);
+
+      var link = makeLink(job);
+      li.appendChild(link);
+
+      var repo = document.createElement('span');
+      repo.className = 'muted';
+      repo.textContent = prLabel(job);
+      li.appendChild(repo);
+
+      var kind = document.createElement('span');
+      kind.className = 'muted';
+      kind.textContent = job.kind;
+      li.appendChild(kind);
+
+      if (job.status === 'running' && job.head_sha) {
+        var sha = document.createElement('span');
+        sha.className = 'mono';
+        sha.textContent = job.head_sha.slice(0, 7);
+        li.appendChild(sha);
+      } else if (job.trigger) {
+        var trigger = document.createElement('span');
+        trigger.className = 'muted';
+        trigger.textContent = job.trigger;
+        li.appendChild(trigger);
+      }
+      list.appendChild(li);
+    });
+  }
+
+  function renderLedger(jobs) {
+    var body = document.getElementById('ledger-body');
+    if (!body) { return; }
+    clearNode(body);
+    if (!jobs.length) {
+      var emptyRow = document.createElement('tr');
+      var emptyCell = document.createElement('td');
+      emptyCell.colSpan = 9;
+      emptyCell.className = 'muted';
+      emptyCell.textContent = 'No activity yet.';
+      emptyRow.appendChild(emptyCell);
+      body.appendChild(emptyRow);
+      return;
+    }
+    jobs.forEach(function (job) {
+      var tr = document.createElement('tr');
+
+      var time = document.createElement('td');
+      time.className = 'muted';
+      time.textContent = formatTime(job.created_at);
+      tr.appendChild(time);
+
+      var repo = document.createElement('td');
+      repo.textContent = prLabel(job);
+      tr.appendChild(repo);
+
+      var pr = document.createElement('td');
+      pr.appendChild(makeLink(job));
+      tr.appendChild(pr);
+
+      var kind = document.createElement('td');
+      var kindBadge = document.createElement('span');
+      kindBadge.className = 'badge';
+      kindBadge.textContent = job.kind || '';
+      kind.appendChild(kindBadge);
+      tr.appendChild(kind);
+
+      var trigger = document.createElement('td');
+      trigger.className = 'muted';
+      trigger.textContent = job.trigger || '';
+      tr.appendChild(trigger);
+
+      var author = document.createElement('td');
+      author.textContent = job.author || '';
+      tr.appendChild(author);
+
+      var status = document.createElement('td');
+      var statusBadge = document.createElement('span');
+      statusBadge.className = statusClass(job.status);
+      statusBadge.textContent = job.status || '';
+      status.appendChild(statusBadge);
+      tr.appendChild(status);
+
+      var sha = document.createElement('td');
+      sha.className = 'mono';
+      sha.textContent = (job.head_sha || '').slice(0, 7);
+      tr.appendChild(sha);
+
+      var err = document.createElement('td');
+      err.className = 'err-detail';
+      err.textContent = job.error || '';
+      if (job.error) { err.title = job.error; }
+      tr.appendChild(err);
+
+      body.appendChild(tr);
+    });
+  }
+
+  function applyMetrics(m) {
+    m = m || {};
+    var totalJobs = num(m.total_jobs);
+    var running = num(m.running_jobs);
+    var queued = num(m.queued_jobs);
+    var decisions = m.decisions || {};
+    var recent = Array.isArray(m.recent_jobs) ? m.recent_jobs : [];
+
+    setText('stat-total-prs', num(m.total_prs));
+    setText('stat-total-jobs', totalJobs + ' jobs tracked');
+    setText('stat-autonomous-commits', num(m.autonomous_commits));
+    setText('stat-approvals', num(decisions.APPROVE));
+    setText('stat-request-changes', num(decisions.REQUEST_CHANGES));
+    setText('stat-success-rate', num(m.success_rate).toFixed(1) + '%');
+    setText('stat-running', running);
+    setText('stat-queued', queued);
+    setText('stat-deferred', num(m.deferred_jobs));
+    setText('stat-needs-attention', num(m.needs_attention_jobs));
+    setText('queue-summary', num(m.active_workers) + ' active worker(s)');
+
+    renderMonitor('running-jobs', 'running-empty', recent.filter(function (j) { return j.status === 'running'; }));
+    renderMonitor('queued-jobs', 'queued-empty', recent.filter(function (j) { return j.status === 'queued'; }));
+    renderMonitor('attention-jobs', 'attention-empty', recent.filter(function (j) {
+      return j.status === 'needs_attention' || j.status === 'uncertain';
+    }));
+    renderLedger(recent);
+  }
+
+  function refresh() {
+    return fetch('/api/v1/metrics', {
+      method: 'GET',
+      cache: 'no-store',
+      headers: { 'Accept': 'application/json' }
+    }).then(function (res) {
+      if (!res.ok) { throw new Error('HTTP ' + res.status); }
+      return res.json();
+    }).then(function (data) {
+      applyMetrics(data);
+    }).catch(function (err) {
+      var banner = document.getElementById('dispatch-banner');
+      if (banner) {
+        banner.className = 'banner error show';
+        banner.textContent = 'Metrics refresh failed: ' + err.message;
+      }
+    });
+  }
+
+  function schedule() {
+    if (timer) { window.clearInterval(timer); timer = null; }
+    var ms = parseInt(refreshSelect.value, 10);
+    if (ms > 0) {
+      timer = window.setInterval(refresh, ms);
+    }
+  }
+
+  function syncEmptyStates() {
+    [['running-jobs', 'running-empty'], ['queued-jobs', 'queued-empty'], ['attention-jobs', 'attention-empty']].forEach(function (pair) {
+      var list = document.getElementById(pair[0]);
+      var empty = document.getElementById(pair[1]);
+      if (list && empty) { empty.style.display = list.children.length ? 'none' : ''; }
+    });
+  }
+
+  if (refreshSelect) {
+    var stored = window.localStorage ? window.localStorage.getItem(REFRESH_MS_KEY) : null;
+    if (stored !== null) { refreshSelect.value = stored; }
+    refreshSelect.addEventListener('change', function () {
+      if (window.localStorage) { window.localStorage.setItem(REFRESH_MS_KEY, refreshSelect.value); }
+      schedule();
+    });
+  }
+  if (refreshNow) { refreshNow.addEventListener('click', function () { refresh(); }); }
+
+  var form = document.getElementById('dispatch-form');
+  if (form) {
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      var banner = document.getElementById('dispatch-banner');
+      var button = document.getElementById('dispatch-submit');
+      var prURL = document.getElementById('dispatch-pr-url').value.trim();
+      var action = document.getElementById('dispatch-action').value;
+      var token = document.getElementById('dispatch-token').value;
+      if (banner) { banner.className = 'banner'; banner.textContent = ''; }
+      if (button) { button.disabled = true; }
+
+      var headers = { 'Content-Type': 'application/json' };
+      if (token) { headers['X-Dashboard-Token'] = token; }
+
+      fetch('/api/v1/dashboard/dispatch', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: headers,
+        body: JSON.stringify({ pr_url: prURL, action: action, token: token || undefined })
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (data) {
+          if (!res.ok) { throw new Error(data.error || ('HTTP ' + res.status)); }
+          if (banner) {
+            banner.className = 'banner success show';
+            banner.textContent = data.job_id
+              ? 'Accepted: ' + action + ' queued as ' + data.job_id
+              : 'Accepted: ' + action + ' ' + (data.status || 'queued');
+          }
+          refresh();
+        });
+      }).catch(function (err) {
+        if (banner) {
+          banner.className = 'banner error show';
+          banner.textContent = 'Dispatch failed: ' + err.message;
+        }
+      }).then(function () {
+        if (button) { button.disabled = false; }
+      });
+    });
+  }
+
+  syncEmptyStates();
+  schedule();
+})();
+</script>
+</body>
+</html>
