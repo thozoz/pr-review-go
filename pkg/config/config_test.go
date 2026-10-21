@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -737,5 +738,59 @@ func TestConfigDirectRoots(t *testing.T) {
 	}
 	if podman.SandboxDirectWorkRoot != "" || podman.SandboxDirectCacheDir != "" {
 		t.Errorf("podman mode must not default direct roots: %q %q", podman.SandboxDirectWorkRoot, podman.SandboxDirectCacheDir)
+	}
+}
+
+// TestValidateWebhookFailsClosedWithoutUserConfigDir pins 08-REVIEW WR-02:
+// an unset WebhookStateDir with no user config directory is an error, never a
+// silent fallback to the shared host temporary directory.
+func TestValidateWebhookFailsClosedWithoutUserConfigDir(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+	t.Setenv("AppData", "")
+	if _, err := os.UserConfigDir(); err == nil {
+		t.Skip("this platform still provides a user config dir with HOME/AppData cleared")
+	}
+	cfg := &Config{}
+	err := cfg.ValidateWebhook()
+	if err == nil {
+		t.Fatal("unset WebhookStateDir without a user config dir must fail closed")
+	}
+	if !strings.Contains(err.Error(), "WEBHOOK_STATE_DIR") {
+		t.Errorf("error must name WEBHOOK_STATE_DIR: %v", err)
+	}
+	if cfg.WebhookStateDir != "" {
+		t.Errorf("fail-closed validation must not invent a temp fallback, got %q", cfg.WebhookStateDir)
+	}
+}
+
+// TestValidateDirectRootPathResolvesSymlink pins the second half of
+// 08-REVIEW WR-02: a root that is lexically outside the temp directory but
+// resolves into it through a symlink is refused.
+func TestValidateDirectRootPathResolvesSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on Windows")
+	}
+	target, err := os.MkdirTemp("", "cfg-symlink-target-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(target) })
+	parent, err := os.MkdirTemp(".", ".cfg-symlink-parent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(parent) })
+	link := filepath.Join(parent, "linked-root")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	value := link
+	err = validateDirectRootPath("SandboxDirectWorkRoot", &value)
+	if err == nil {
+		t.Fatal("a symlink resolving into the shared temp directory must be refused")
+	}
+	if !strings.Contains(err.Error(), "shared host temporary directory") {
+		t.Errorf("symlink refusal must use the shared-tmp error text: %v", err)
 	}
 }

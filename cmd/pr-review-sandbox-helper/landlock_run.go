@@ -76,18 +76,37 @@ func parseLandlockRunArgs(args []string) (landlockRunOptions, error) {
 	// than a policy. The host root "/" is exempt: it is always the read-only
 	// root and always an ancestor of every writable job root, and Landlock
 	// resolves that pair by granting the most specific rule.
+	if err := validateLandlockRoots(ro, rw); err != nil {
+		return landlockRunOptions{}, err
+	}
+	return landlockRunOptions{ro: ro, rw: rw, command: command}, nil
+}
+
+// validateLandlockRoots refuses a read-only root that overlaps a read-write
+// root. Both sides are symlink-resolved before the comparison because the
+// applier resolves every root when it opens it: a lexical-only check would let
+// a symlink alias bypass the overlap refusal (10-REVIEW IN-01). A root whose
+// symlinks cannot be resolved falls back to its cleaned lexical form.
+func validateLandlockRoots(ro, rw []string) error {
+	resolve := func(root string) string {
+		if resolved, err := filepath.EvalSymlinks(root); err == nil {
+			return filepath.Clean(resolved)
+		}
+		return filepath.Clean(root)
+	}
 	for _, roRoot := range ro {
-		if roRoot == "/" {
+		resolvedRO := resolve(roRoot)
+		if resolvedRO == "/" {
 			continue
 		}
 		for _, rwRoot := range rw {
-			if landlockRootsOverlap(roRoot, rwRoot) {
-				return landlockRunOptions{}, fmt.Errorf(
+			if landlockRootsOverlap(resolvedRO, resolve(rwRoot)) {
+				return fmt.Errorf(
 					"%s: --ro root %q overlaps --rw root %q; a path cannot be both", landlockRunUsage, roRoot, rwRoot)
 			}
 		}
 	}
-	return landlockRunOptions{ro: ro, rw: rw, command: command}, nil
+	return nil
 }
 
 // landlockRootsOverlap reports whether a and b are the same path or one

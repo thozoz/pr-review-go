@@ -35,8 +35,15 @@ func TestPositiveControlFailsClosed(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(readOnly, 0o755) })
-	if err := positiveControl([]string{readOnly}); err == nil {
-		t.Fatal("a 0555 root must fail the positive control")
+	// Root bypasses DAC directory permissions, so a 0555 directory is still
+	// writable for uid 0. Running as root therefore cannot exercise this
+	// control and must not fail spuriously in containers (10-REVIEW WR-04).
+	if os.Geteuid() != 0 {
+		if err := positiveControl([]string{readOnly}); err == nil {
+			t.Fatal("a 0555 root must fail the positive control")
+		}
+	} else {
+		t.Log("running as root: skipping the 0555 positive-control denial check")
 	}
 }
 

@@ -5,10 +5,40 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+// directTestRoot returns a throwaway directory that is NOT beneath
+// os.TempDir(). Production refuses job roots in the shared host temporary
+// directory, so tests that exercise provisioning must use a root outside it;
+// t.TempDir() cannot be used for these roots by design.
+func directTestRoot(t *testing.T) string {
+	t.Helper()
+	// A short parent outside os.TempDir(): the production guard refuses job
+	// roots under the shared temp directory, and unix-socket control paths
+	// (gateway.sock) must stay under the platform's sun_path limit.
+	parent := "/var/tmp"
+	if runtime.GOOS == "windows" {
+		parent = os.Getenv("ProgramData")
+		if parent == "" {
+			t.Skip("no non-temp test root available on this Windows host")
+		}
+	}
+	dir, err := os.MkdirTemp(parent, "prr-root-")
+	if err != nil {
+		t.Fatalf("create non-temp direct test root under %q: %v", parent, err)
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		t.Fatalf("resolve non-temp direct test root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(abs) })
+	return abs
+}
 
 // provisionTestJobPaths provisions a job tree under two throwaway roots and
 // registers its cleanup. Shared by the root tests and the Linux-only
@@ -16,7 +46,7 @@ import (
 func provisionTestJobPaths(t *testing.T) DirectJobPaths {
 	t.Helper()
 	paths, err := provisionDirectJobDirs(
-		DirectRoots{WorkRoot: t.TempDir(), CacheRoot: t.TempDir()},
+		DirectRoots{WorkRoot: directTestRoot(t), CacheRoot: directTestRoot(t)},
 		"0123456789ab",
 	)
 	if err != nil {
@@ -31,12 +61,12 @@ func provisionTestJobPaths(t *testing.T) DirectJobPaths {
 // fail-closed unconfigured-roots path.
 func newTestDirectRunner(t *testing.T, timeout time.Duration) *DirectRunner {
 	t.Helper()
-	return NewDirectRunnerWithRoots(timeout, DirectRoots{WorkRoot: t.TempDir(), CacheRoot: t.TempDir()})
+	return NewDirectRunnerWithRoots(timeout, DirectRoots{WorkRoot: directTestRoot(t), CacheRoot: directTestRoot(t)})
 }
 
 func TestDirectJobPathsLayout(t *testing.T) {
-	workRoot := t.TempDir()
-	cacheRoot := t.TempDir()
+	workRoot := directTestRoot(t)
+	cacheRoot := directTestRoot(t)
 	paths, err := provisionDirectJobDirs(DirectRoots{WorkRoot: workRoot, CacheRoot: cacheRoot}, "0123456789ab")
 	if err != nil {
 		t.Fatalf("provision: %v", err)
@@ -96,8 +126,8 @@ func TestDirectJobPathsLayout(t *testing.T) {
 func TestDirectJobPathsDoNotUseHostTmp(t *testing.T) {
 	// Root provisioning must be independent of the server's TMPDIR: point
 	// TMPDIR at an unrelated directory and prove no resolved path lands there.
-	workRoot := t.TempDir()
-	cacheRoot := t.TempDir()
+	workRoot := directTestRoot(t)
+	cacheRoot := directTestRoot(t)
 	unrelatedTmp := t.TempDir()
 	t.Setenv("TMPDIR", unrelatedTmp)
 
@@ -139,8 +169,8 @@ func TestDirectJobPathsDoNotUseHostTmp(t *testing.T) {
 }
 
 func TestDirectJobPathsCleanup(t *testing.T) {
-	workRoot := t.TempDir()
-	cacheRoot := t.TempDir()
+	workRoot := directTestRoot(t)
+	cacheRoot := directTestRoot(t)
 	paths, err := provisionDirectJobDirs(DirectRoots{WorkRoot: workRoot, CacheRoot: cacheRoot}, "0123456789ab")
 	if err != nil {
 		t.Fatalf("provision: %v", err)
@@ -168,15 +198,15 @@ func TestDirectJobPathsCleanup(t *testing.T) {
 }
 
 func TestDirectJobPathsRefusesUnsafeRoot(t *testing.T) {
-	if _, err := provisionDirectJobDirs(DirectRoots{CacheRoot: t.TempDir()}, "0123456789ab"); err == nil {
+	if _, err := provisionDirectJobDirs(DirectRoots{CacheRoot: directTestRoot(t)}, "0123456789ab"); err == nil {
 		t.Error("empty WorkRoot must be refused")
 	}
-	if _, err := provisionDirectJobDirs(DirectRoots{WorkRoot: t.TempDir()}, "0123456789ab"); err == nil {
+	if _, err := provisionDirectJobDirs(DirectRoots{WorkRoot: directTestRoot(t)}, "0123456789ab"); err == nil {
 		t.Error("empty CacheRoot must be refused")
 	}
 
-	workRoot := t.TempDir()
-	if _, err := provisionDirectJobDirs(DirectRoots{WorkRoot: workRoot, CacheRoot: t.TempDir()}, "../escape"); err == nil {
+	workRoot := directTestRoot(t)
+	if _, err := provisionDirectJobDirs(DirectRoots{WorkRoot: workRoot, CacheRoot: directTestRoot(t)}, "../escape"); err == nil {
 		t.Error("job id with parent-directory traversal must be refused")
 	}
 	if _, err := os.Stat(filepath.Join(workRoot, "jobs")); !os.IsNotExist(err) {

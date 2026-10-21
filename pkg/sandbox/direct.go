@@ -703,6 +703,29 @@ func InLoopCommand(ctx context.Context, workDir string, argv []string, timeout t
 	if err := ctx.Err(); err != nil {
 		return "", "", -1, err
 	}
+	// Validate the caller-supplied work copy before any rank sees it: the two
+	// ranks treat a relative or symlinked path differently, so canonicalize
+	// once here and refuse anything that is not an existing directory
+	// (09-REVIEW IN-05).
+	if strings.TrimSpace(workDir) == "" {
+		return "", "", -1, fmt.Errorf("in-loop command requires a non-empty work directory")
+	}
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", "", -1, fmt.Errorf("in-loop work directory %q is invalid: %w", workDir, err)
+	}
+	resolvedWorkDir, err := filepath.EvalSymlinks(absWorkDir)
+	if err != nil {
+		return "", "", -1, fmt.Errorf("in-loop work directory %q is invalid: %w", workDir, err)
+	}
+	workDirInfo, err := os.Stat(resolvedWorkDir)
+	if err != nil {
+		return "", "", -1, fmt.Errorf("in-loop work directory %q is invalid: %w", workDir, err)
+	}
+	if !workDirInfo.IsDir() {
+		return "", "", -1, fmt.Errorf("in-loop work directory %q is not a directory", workDir)
+	}
+	workDir = resolvedWorkDir
 	proj := detectDirectProject(workDir)
 	if proj == nil {
 		return "", "", -1, fmt.Errorf("%s: no recognized project in %q", inLoopMatrixMismatch, workDir)
