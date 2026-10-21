@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -123,14 +124,14 @@ type Job struct {
 	// NotBeforeAt parks a deferred attempt in the durable queue until the due
 	// time arrives. Zero value means immediately eligible; old rows unmarshal
 	// unchanged and schema version stays 1.
-	NotBeforeAt     time.Time  `json:"not_before_at,omitempty"`
-	Payload         string     `json:"payload,omitempty"`
+	NotBeforeAt time.Time `json:"not_before_at,omitempty"`
+	Payload     string    `json:"payload,omitempty"`
 	// NetworkFetch opts this job's agent tools into the gateway-mediated
 	// fetch path for this job only. False is the default (offline, D-02);
 	// true is valid only for the job that carried an explicit trusted
 	// opt-in (D-03) and resets to false at terminal state.
-	NetworkFetch    bool       `json:"network_fetch,omitempty"`
-	Error           string     `json:"error,omitempty"`
+	NetworkFetch bool   `json:"network_fetch,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // OutputIntent records intent before external GitHub mutations.
@@ -226,6 +227,50 @@ type StoreOptions struct {
 	OpenTimeout   time.Duration
 }
 
+// JobSummary is the sanitized, read-only projection of a Job used by the
+// operations dashboard. It deliberately excludes Job.Payload, reservations,
+// and every credential-bearing field: metrics surfaces must never leak secrets.
+type JobSummary struct {
+	ID         string     `json:"id"`
+	PRKey      string     `json:"pr_key"`
+	Owner      string     `json:"owner"`
+	Repo       string     `json:"repo"`
+	PRNumber   int        `json:"pr_number"`
+	Kind       string     `json:"kind"`
+	Trigger    string     `json:"trigger"`
+	Author     string     `json:"author"`
+	Status     string     `json:"status"`
+	HeadSHA    string     `json:"head_sha"`
+	PRURL      string     `json:"pr_url"`
+	CreatedAt  time.Time  `json:"created_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Error      string     `json:"error,omitempty"`
+}
+
+// DashboardMetrics is the operational telemetry snapshot served at
+// GET /api/v1/metrics and rendered by GET /dashboard. Every field is a
+// counter or a sanitized job projection; no configuration secrets, webhook
+// payloads, or GitHub/LLM credentials are included.
+type DashboardMetrics struct {
+	TotalPRs           int            `json:"total_prs"`
+	TotalJobs          int            `json:"total_jobs"`
+	ActiveWorkers      int            `json:"active_workers"`
+	RunningJobs        int            `json:"running_jobs"`
+	QueuedJobs         int            `json:"queued_jobs"`
+	DeferredJobs       int            `json:"deferred_jobs"`
+	NeedsAttentionJobs int            `json:"needs_attention_jobs"`
+	AutonomousCommits  int            `json:"autonomous_commits"`
+	Decisions          map[string]int `json:"decisions"`
+	JobsByKind         map[string]int `json:"jobs_by_kind"`
+	JobsByStatus       map[string]int `json:"jobs_by_status"`
+	SuccessRate        float64        `json:"success_rate"`
+	RecentJobs         []*JobSummary  `json:"recent_jobs"`
+}
+
+// MaxDashboardRecentJobs bounds the recent activity ledger returned by
+// GetDashboardMetrics so dashboard polling stays O(50) after sorting.
+const MaxDashboardRecentJobs = 50
+
 // JobStore defines the storage boundary interface.
 type JobStore interface {
 	Close() error
@@ -234,6 +279,9 @@ type JobStore interface {
 	GetJob(ctx context.Context, id string) (*Job, error)
 	ListQueuedJobs(ctx context.Context) ([]*Job, error)
 	UpdateJob(ctx context.Context, job *Job) error
+	// GetDashboardMetrics computes the read-only operations telemetry snapshot
+	// inside a single bbolt read transaction.
+	GetDashboardMetrics(ctx context.Context) (*DashboardMetrics, error)
 	GetPRState(ctx context.Context, key PRKey) (*PRState, error)
 	UpdatePRState(ctx context.Context, state *PRState) error
 	SaveOutputIntent(ctx context.Context, intent *OutputIntent) error
@@ -1396,6 +1444,120 @@ func (s *BoltJobStore) GetHealthCounts(ctx context.Context, oldWaitWarning time.
 		return nil
 	})
 	return counts, err
+}
+
+// GetDashboardMetrics computes the read-only operations telemetry snapshot in
+// one bbolt read transaction: a dashboard poll never takes a write lock and can
+// never block an incoming webhook admission (T-14-04).
+func (s *BoltJobStore) GetDashboardMetrics(ctx context.Context) (*DashboardMetrics, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.db == nil {
+		return nil, ErrStoreClosed
+	}
+
+	metrics := &DashboardMetrics{
+		Decisions:    make(map[string]int),
+		JobsByKind:   make(map[string]int),
+		JobsByStatus: make(map[string]int),
+		RecentJobs:   make([]*JobSummary, 0, MaxDashboardRecentJobs),
+	}
+	now := time.Now().UTC()
+
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		if prs := tx.Bucket(bucketPRs); prs != nil {
+			metrics.TotalPRs = prs.Stats().KeyN
+		}
+
+		if jobs := tx.Bucket(bucketJobs); jobs != nil {
+			c := jobs.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var j Job
+				if err := json.Unmarshal(v, &j); err != nil {
+					continue
+				}
+				metrics.TotalJobs++
+				metrics.JobsByKind[j.Kind]++
+				metrics.JobsByStatus[j.Status]++
+
+				switch j.Status {
+				case "running":
+					metrics.RunningJobs++
+				case "queued":
+					metrics.QueuedJobs++
+					if !j.NotBeforeAt.IsZero() && now.Before(j.NotBeforeAt) {
+						metrics.DeferredJobs++
+					}
+				case "needs_attention":
+					metrics.NeedsAttentionJobs++
+				}
+				if j.Status == "completed" && (j.Kind == "edit" || j.Kind == "changelog") {
+					metrics.AutonomousCommits++
+				}
+
+				metrics.RecentJobs = append(metrics.RecentJobs, summarizeJob(j))
+			}
+		}
+
+		// Busy workers are exactly the jobs currently executing; there is no
+		// separate worker-heartbeat state to report.
+		metrics.ActiveWorkers = metrics.RunningJobs
+
+		if decisions := tx.Bucket(bucketDecisions); decisions != nil {
+			c := decisions.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var rec DecisionRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					continue
+				}
+				if rec.Event != "" {
+					metrics.Decisions[rec.Event]++
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	completed := metrics.JobsByStatus["completed"]
+	failed := metrics.JobsByStatus["failed"]
+	if completed+failed > 0 {
+		metrics.SuccessRate = float64(completed) / float64(completed+failed) * 100
+	}
+
+	// Newest first, capped at the dashboard ledger bound.
+	sort.SliceStable(metrics.RecentJobs, func(i, j int) bool {
+		return metrics.RecentJobs[i].CreatedAt.After(metrics.RecentJobs[j].CreatedAt)
+	})
+	if len(metrics.RecentJobs) > MaxDashboardRecentJobs {
+		metrics.RecentJobs = metrics.RecentJobs[:MaxDashboardRecentJobs]
+	}
+	return metrics, nil
+}
+
+// summarizeJob projects a Job onto the sanitized dashboard ledger row.
+func summarizeJob(j Job) *JobSummary {
+	summary := &JobSummary{
+		ID:         j.ID,
+		PRKey:      j.PRKey.String(),
+		Owner:      j.Owner,
+		Repo:       j.Repo,
+		PRNumber:   j.PRNumber,
+		Kind:       j.Kind,
+		Trigger:    j.Trigger,
+		Author:     j.Author,
+		Status:     j.Status,
+		HeadSHA:    j.HeadSHA,
+		CreatedAt:  j.CreatedAt,
+		FinishedAt: j.FinishedAt,
+		Error:      j.Error,
+	}
+	if j.Owner != "" && j.Repo != "" && j.PRNumber > 0 {
+		summary.PRURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", j.Owner, j.Repo, j.PRNumber)
+	}
+	return summary
 }
 
 // ClaimNextJob claims the oldest eligible queued job while respecting per-PR exclusion
