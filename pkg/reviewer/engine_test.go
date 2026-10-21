@@ -1028,6 +1028,15 @@ func TestReviewPR_SourceVerificationUnavailableWithoutInventedSuccess(t *testing
 	if strings.Contains(reportMd, "PASSED") {
 		t.Fatalf("report markdown must not claim PASSED verification: %s", reportMd)
 	}
+
+	// Verify ReviewPRAtHeadWithNetwork forwards parameters cleanly without regression
+	reportWithNet, err := eng.ReviewPRAtHeadWithNetwork(context.Background(), "owner", "repo", 103, headSHA, true, true)
+	if err != nil {
+		t.Fatalf("unexpected error on ReviewPRAtHeadWithNetwork: %v", err)
+	}
+	if reportWithNet.HeadSHA != headSHA {
+		t.Fatalf("expected head SHA %s, got %s", headSHA, reportWithNet.HeadSHA)
+	}
 }
 
 func TestDecisionBody_PartialWarningAndOmissionsAndFixed(t *testing.T) {

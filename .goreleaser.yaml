@@ -25,8 +25,16 @@ builds:
       - -X github.com/thozoz/pr-review-go/pkg/version.Commit={{ .ShortCommit }}
       - -X github.com/thozoz/pr-review-go/pkg/version.Date={{ .Date }}
 
+  - id: pr-review-sandbox-helper
+    main: ./cmd/pr-review-sandbox-helper
+    binary: pr-review-sandbox-helper
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags: [-s -w]
+
 archives:
-  - ids: [pr-review-go, pr-review-server]
+  - ids: [pr-review-go, pr-review-server, pr-review-sandbox-helper]
     formats: [tar.gz]
     format_overrides:
       - goos: windows

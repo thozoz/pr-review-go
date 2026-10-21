@@ -32,6 +32,19 @@ jobs:
       - name: Verify module checksums
         run: go mod verify
 
+      - name: Provision bubblewrap userns isolation (direct backend)
+        # Phase 07-03: direct-mode stage-2 exec requires bwrap --unshare-net
+        # on Linux; without userns those runs honestly degrade to
+        # StatusUnavailable (REDUCED-GUARANTEE) instead of executing on host
+        # network. Provision the CT-target capability here so the suite
+        # exercises the wrapped path. The trailing probe fails the step
+        # loudly if userns cannot be enabled.
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y bubblewrap uidmap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -Urn true
+
       - name: Build
         run: go build ./...
 

@@ -175,6 +175,27 @@ func (p *PodmanBackend) Attest(ctx context.Context) error {
 	return nil
 }
 
+// podmanStageEnv returns the fixed hermetic stage env as podman -e flag
+// pairs. The env is built PURELY from this allowlist: no os.Environ
+// inheritance, no secret -e (GH_TOKEN/GITHUB_TOKEN/GITHUB_/LLM_/APP_
+// variants), no caller-added flags. TestKeylessStage2 pins the keyless shape;
+// the T-05-02 token-containment grep test pins the source shape.
+func podmanStageEnv() []string {
+	return []string{
+		"-e", "GOCACHE=/cache/go-build",
+		"-e", "GOPATH=/cache/go",
+		"-e", "GOMODCACHE=/cache/go/pkg/mod",
+		"-e", "TMPDIR=/tmp",
+		"-e", "GOPROXY=off",
+		"-e", "GOTOOLCHAIN=local",
+		"-e", "GOVCS=off",
+		"-e", "GOWORK=off",
+		"-e", "GOENV=off",
+		"-e", "HOME=/tmp",
+		"-e", "PATH=/usr/local/go/bin:/usr/bin:/bin",
+	}
+}
+
 // RunStage executes a single verification stage inside an isolated container.
 func (p *PodmanBackend) RunStage(ctx context.Context, jobID, stageName string, lease *SlotLease, args []string) (*StageResult, error) {
 	if lease == nil {
@@ -216,17 +237,12 @@ func (p *PodmanBackend) RunStage(ctx context.Context, jobID, stageName string, l
 		"-v", fmt.Sprintf("%s:/cache:rw", lease.CacheDir),
 		"-w", "/work",
 		"--entrypoint=",
-		"-e", "GOCACHE=/cache/go-build",
-		"-e", "GOPATH=/cache/go",
-		"-e", "GOMODCACHE=/cache/go/pkg/mod",
-		"-e", "TMPDIR=/tmp",
-		"-e", "GOPROXY=off",
-		"-e", "GOTOOLCHAIN=local",
-		"-e", "GOVCS=off",
-		"-e", "GOWORK=off",
-		"-e", "GOENV=off",
-		"-e", "HOME=/tmp",
-		"-e", "PATH=/usr/local/go/bin:/usr/bin:/bin",
+	)
+	// Stage env is purely the fixed allowlist: no os.Environ inheritance, no
+	// secret -e, no network added back (container stays --network=none and the
+	// exec path adds no --network flag).
+	podmanArgs = append(podmanArgs, podmanStageEnv()...)
+	podmanArgs = append(podmanArgs,
 		p.cfg.ImageDigest,
 	)
 	podmanArgs = append(podmanArgs, args...)

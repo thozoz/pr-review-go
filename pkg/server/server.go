@@ -616,12 +616,19 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 		return
 	}
 
-	kind, payloadText := parseCommentCommand(body)
+	kind, payloadText := parseCommentCommand(withoutNetworkFlag(body))
 	if kind == "" {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ignored"}`))
 		return
 	}
+
+	// Trusted opt-in: the literal --with-network token opts this job's agent
+	// tools into the gateway-mediated fetch path for this job only (D-03).
+	// Admission above already verified CanWriteRepository fail-closed, so an
+	// untrusted author carrying the flag was denied with {"status":"ignored"}
+	// and never reaches here with a job.
+	networkOptIn := hasStandaloneNetworkFlag(body)
 
 	if len(payloadText) > 4096 {
 		payloadText = payloadText[:4096]
@@ -636,15 +643,16 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 	}
 
 	job := Job{
-		Kind:      kind,
-		Trigger:   "explicit",
-		Author:    username,
-		CommentID: commentID,
-		PRKey:     prKey,
-		Owner:     owner,
-		Repo:      repo,
-		PRNumber:  prNum,
-		Payload:   payloadText,
+		Kind:         kind,
+		Trigger:      "explicit",
+		Author:       username,
+		CommentID:    commentID,
+		PRKey:        prKey,
+		Owner:        owner,
+		Repo:         repo,
+		PRNumber:     prNum,
+		Payload:      payloadText,
+		NetworkFetch: networkOptIn,
 	}
 
 	if kind == "review" || kind == "approve" || kind == "request_changes" || kind == "edit" {
@@ -744,6 +752,47 @@ func withoutCommitFlag(rest string) string {
 		kept = append(kept, field)
 	}
 	return strings.Join(kept, " ")
+}
+
+// NetworkFetchStatusLine marks jobs whose agent tools ran with trusted
+// network opt-in. It names no packages, URLs, or contents — only the
+// posture. Allowlist-first per D-04: the flag enables only the
+// gateway-mediated fetch path consumed in plans 03/04, never open egress.
+const NetworkFetchStatusLine = "Network fetch: ON (trusted opt-in, agent tools only; PR code offline)"
+
+// hasStandaloneNetworkFlag reports whether rest contains a standalone
+// --with-network token: a whitespace-delimited field exactly equal to the
+// literal. Embedded forms (--with-networkx) do not match; unrecognized
+// phrasing falls back to existing confirm-comment behavior.
+func hasStandaloneNetworkFlag(rest string) bool {
+	for _, field := range strings.Fields(rest) {
+		if field == "--with-network" {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutNetworkFlag returns the command text with standalone --with-network
+// tokens removed, in the same strings.Fields drop-and-rejoin shape as
+// withoutCommitFlag.
+func withoutNetworkFlag(rest string) string {
+	kept := make([]string, 0, 8)
+	for _, field := range strings.Fields(rest) {
+		if field == "--with-network" {
+			continue
+		}
+		kept = append(kept, field)
+	}
+	return strings.Join(kept, " ")
+}
+
+// appendNetworkFetchLine renders the status line once when fetch is true.
+func appendNetworkFetchLine(text string, fetch bool) string {
+	if !fetch || strings.Contains(text, NetworkFetchStatusLine) {
+		return text
+	}
+	return text + "\n\n" + NetworkFetchStatusLine
 }
 
 func parseCommentCommand(body string) (kind string, payload string) {

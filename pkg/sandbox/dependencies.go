@@ -58,8 +58,14 @@ func ValidateGoMod(workDir string) error {
 		var replaceClause string
 		if inReplaceBlock {
 			replaceClause = line
-		} else if strings.HasPrefix(line, "replace ") {
-			replaceClause = strings.TrimPrefix(line, "replace ")
+		} else {
+			fields := strings.Fields(line)
+			if len(fields) > 1 && fields[0] == "replace" {
+				// Trim the leading "replace" token and any following whitespace
+				trimmed := strings.TrimSpace(line)
+				trimmed = strings.TrimPrefix(trimmed, "replace")
+				replaceClause = strings.TrimSpace(trimmed)
+			}
 		}
 
 		if replaceClause != "" {
@@ -72,10 +78,43 @@ func ValidateGoMod(workDir string) error {
 	return scanner.Err()
 }
 
+// isPythonProject reports whether a directory contains Python project descriptors.
+func isPythonProject(dir string) bool {
+	for _, f := range []string{"pyproject.toml", "requirements.txt", "setup.py", "poetry.lock"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// isRemoteModulePath reports whether a path looks like a remote module path (e.g., has a dotted first path element like example.com/pkg).
+func isRemoteModulePath(p string) bool {
+	if strings.HasPrefix(p, "./") || strings.HasPrefix(p, "../") || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
+		return false
+	}
+	parts := strings.Split(p, "/")
+	if len(parts) == 0 {
+		return false
+	}
+	return strings.Contains(parts[0], ".")
+}
+
 func checkReplaceClause(workDir, clause string) error {
 	parts := strings.Split(clause, "=>")
 	if len(parts) != 2 {
 		return nil
+	}
+
+	// Source module path is the first field of the left-hand side
+	// (e.g. "example.com/old" in "replace example.com/old v1.0.0 => ...").
+	source := strings.TrimSpace(parts[0])
+	if idx := strings.Index(source, "//"); idx != -1 {
+		source = strings.TrimSpace(source[:idx])
+	}
+	sourceMod := ""
+	if sourceFields := strings.Fields(source); len(sourceFields) > 0 {
+		sourceMod = sourceFields[0]
 	}
 
 	target := strings.TrimSpace(parts[1])
@@ -89,14 +128,25 @@ func checkReplaceClause(workDir, clause string) error {
 		return nil
 	}
 
-	// In Go modules, if the target has two fields (e.g. "example.com/mod v1.2.3"),
-	// it is a module@version replacement, not a local filesystem replacement.
-	// A local filesystem replacement has exactly one field (a path).
+	// In Go modules, a two-field target (e.g. "example.com/mod v1.2.3") is a
+	// module@version replacement. Pinning the SAME module to a version stays
+	// inside the go.sum-verified fetch set; swapping to a DIFFERENT remote
+	// module dodges go.sum, so it is refused in-root-escape style (D-05).
 	if len(fields) > 1 {
+		if sourceMod != "" && fields[0] != sourceMod {
+			return fmt.Errorf("%w: remote module swap %q => %q dodges checksum verification", ErrEscapingReplacement, sourceMod, fields[0])
+		}
 		return nil
 	}
 
 	targetPath := fields[0]
+	// A single-field target reading as a remote module path (dotted first
+	// segment, e.g. "example.com/other") is the versionless form of the same
+	// swap — refuse unless it names the source module itself. Genuine local
+	// paths (./sub, sub/pkg, /abs) never match this shape.
+	if targetPath != sourceMod && isRemoteModulePath(targetPath) {
+		return fmt.Errorf("%w: remote module replacement target %q", ErrEscapingReplacement, targetPath)
+	}
 	// If it starts with "." or "/" or "\" or contains path separators without being a module domain
 	if strings.HasPrefix(targetPath, ".") || strings.HasPrefix(targetPath, "/") || strings.HasPrefix(targetPath, "\\") || strings.Contains(targetPath, "/") || strings.Contains(targetPath, "\\") {
 		// Absolute path is rejected
@@ -126,6 +176,29 @@ type PodmanDependencyPreparer struct {
 	Backend    *PodmanBackend
 	Config     *config.Config
 	GatewayCfg DependencyGatewayConfig
+	FetchArgv  []string
+}
+
+// ValidateFetchArgv gates stage-1 fetch commands (D-05, SAFE-01):
+// only the exact triple ["go", "mod", "download"] passes.
+// Any extra flag, tool (curl, wget, go get), or argv element attempting
+// environment overrides (e.g. GOFLAGS=..., GOPROXY=...) is rejected.
+func ValidateFetchArgv(argv []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("fetch argv is empty")
+	}
+	for _, arg := range argv {
+		if strings.HasPrefix(arg, "GOFLAGS=") || strings.HasPrefix(arg, "GOPROXY=") {
+			return fmt.Errorf("fetch argv rejected: environment override in argv: %s", arg)
+		}
+	}
+	if len(argv) != 3 {
+		return fmt.Errorf("fetch argv rejected: expected exact 3 elements [go mod download], got %d elements %v", len(argv), argv)
+	}
+	if argv[0] != "go" || argv[1] != "mod" || argv[2] != "download" {
+		return fmt.Errorf("fetch argv rejected: must be exactly [go mod download], got %v", argv)
+	}
+	return nil
 }
 
 func NewDependencyPreparer(backend *PodmanBackend, cfg *config.Config) *PodmanDependencyPreparer {
@@ -153,6 +226,15 @@ func (p *PodmanDependencyPreparer) PrepareDependencies(ctx context.Context, jobI
 	// 2. Check if go.mod exists
 	goModPath := filepath.Join(lease.WorkDir, "go.mod")
 	if _, err := os.Stat(goModPath); err != nil {
+		// Python projects return honest-incomplete: Python network fetch is not supported in stage 1 (D-03, D-05)
+		if isPythonProject(lease.WorkDir) {
+			return &StageResult{
+				StageName:    "prep",
+				Passed:       false,
+				IsIncomplete: true,
+				Stderr:       "INCOMPLETE: Python network fetch not supported in stage 1 (Go-first); rerun with vendored wheels or offline --no-index",
+			}, nil
+		}
 		// No go.mod; nothing to prepare
 		return &StageResult{
 			StageName: "prep",
@@ -170,6 +252,20 @@ func (p *PodmanDependencyPreparer) PrepareDependencies(ctx context.Context, jobI
 
 	if p.Backend == nil {
 		return nil, errors.New("container backend is unconfigured")
+	}
+
+	// Validate stage-1 fetch command before launching container (D-05, SAFE-01)
+	fetchArgv := p.FetchArgv
+	if len(fetchArgv) == 0 {
+		fetchArgv = []string{"go", "mod", "download"}
+	}
+	if err := ValidateFetchArgv(fetchArgv); err != nil {
+		return &StageResult{
+			StageName:    "prep",
+			Passed:       false,
+			IsIncomplete: true,
+			Stderr:       fmt.Sprintf("INCOMPLETE: %v", err),
+		}, nil
 	}
 
 	// 3. Start per-job dependency gateway

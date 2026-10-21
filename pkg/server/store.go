@@ -125,6 +125,11 @@ type Job struct {
 	// unchanged and schema version stays 1.
 	NotBeforeAt     time.Time  `json:"not_before_at,omitempty"`
 	Payload         string     `json:"payload,omitempty"`
+	// NetworkFetch opts this job's agent tools into the gateway-mediated
+	// fetch path for this job only. False is the default (offline, D-02);
+	// true is valid only for the job that carried an explicit trusted
+	// opt-in (D-03) and resets to false at terminal state.
+	NetworkFetch    bool       `json:"network_fetch,omitempty"`
 	Error           string     `json:"error,omitempty"`
 }
 
@@ -1068,6 +1073,7 @@ func (s *BoltJobStore) RecoverJobs(ctx context.Context) ([]*Job, error) {
 		jobsBucket := tx.Bucket(bucketJobs)
 		prsBucket := tx.Bucket(bucketPRs)
 		intentsBucket := tx.Bucket(bucketIntents)
+		decisionsBucket := tx.Bucket(bucketDecisions)
 
 		c := jobsBucket.Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
@@ -1103,6 +1109,38 @@ func (s *BoltJobStore) RecoverJobs(ctx context.Context) ([]*Job, error) {
 				case "improve":
 					j.Status = "queued"
 					j.RecoveryPhase = "requeued_static"
+
+				case "approve", "request_changes":
+					// Decision jobs store outcome in bucketDecisions (DecisionLedger).
+					// If already recorded as published, job recovers to completed.
+					// Otherwise, parks as needs_attention for operator resolution.
+					decisionProven := false
+					if decisionsBucket != nil && j.HeadSHA != "" {
+						keyBytes := decisionLedgerKey(j.PRKey, j.HeadSHA)
+						if recBytes := decisionsBucket.Get(keyBytes); recBytes != nil {
+							var rec DecisionRecord
+							if err := json.Unmarshal(recBytes, &rec); err == nil && rec.Status == DecisionStatusPublished {
+								decisionProven = true
+							}
+						}
+					}
+					if !decisionProven {
+						marker := fmt.Sprintf("<!-- pr-%s-output:%s -->", j.Kind, j.ID)
+						if itBytes := intentsBucket.Get([]byte(marker)); itBytes != nil {
+							var it OutputIntent
+							if err := json.Unmarshal(itBytes, &it); err == nil && it.Status == "completed" {
+								decisionProven = true
+							}
+						}
+					}
+
+					if decisionProven {
+						j.Status = "completed"
+					} else {
+						j.Status = "needs_attention"
+						j.RecoveryPhase = "interrupted_unproven"
+						j.Error = "interrupted action cannot prove external outcome; requires operator resolution"
+					}
 
 				case "describe", "summary", "docs", "changelog", "assistant", "edit":
 					// Non-idempotent action, routed explicitly per kind (no silent
@@ -1875,6 +1913,11 @@ func (s *BoltJobStore) commitOutcome(ctx context.Context, intent *OutputIntent, 
 
 		if job.Status == "completed" && current != nil && current.Generation > job.Generation {
 			return ErrGenerationChanged
+		}
+
+		// Defense-in-depth: terminal jobs must never persist with NetworkFetch true (T-07-07)
+		if job.Status == "completed" || job.Status == "failed" || job.Status == "superseded" {
+			job.NetworkFetch = false
 		}
 
 		jobRaw, err := json.Marshal(job)
