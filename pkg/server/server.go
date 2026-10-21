@@ -662,7 +662,9 @@ func (s *Server) handleIssueCommentWebhook(ctx context.Context, w http.ResponseW
 		NetworkFetch: networkOptIn,
 	}
 
-	if kind == "review" || kind == "approve" || kind == "request_changes" || kind == "edit" {
+	// Populate live PR BaseSHA and HeadSHA for all comment jobs so metrics and
+	// job rows reliably track the target commit.
+	if s.gh != nil {
 		pr, prErr := s.gh.GetPR(ctx, owner, repo, prNum)
 		if prErr == nil && pr != nil {
 			job.BaseSHA = pr.BaseSHA
