@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ConfinementRank names the single filesystem confinement layer that governs
@@ -136,6 +137,30 @@ func landlockConfinementSpec() ConfinementSpec {
 			// job roots. A root that is empty, "/" or relative would move the
 			// rank's meaning, so it is refused rather than guessed.
 			roots := []string{paths.WorkspaceDir, paths.CacheDir, paths.TmpDir, paths.HomeDir}
+
+			// Stage-0 dependency preparation reaches this job's restricted UDS
+			// gateway. The landlock rank does not remap the filesystem, so the
+			// helper is handed the HOST socket path and needs an explicit --rw
+			// grant on its parent directory; the bwrap-only in-sandbox
+			// placeholders in the argv are rewritten to those host paths
+			// (11-REVIEW CR-01).
+			sock := strings.TrimSpace(opts.GatewaySocketPath)
+			if sock != "" {
+				sock = filepath.Clean(sock)
+				if !filepath.IsAbs(sock) {
+					return nil, fmt.Errorf(
+						"%w: landlock stage-0 gateway socket must be an absolute path, got %q",
+						ErrConfinementUnavailable, sock)
+				}
+				sockDir := filepath.Dir(sock)
+				if sockDir == "" || sockDir == "." || sockDir == "/" {
+					return nil, fmt.Errorf(
+						"%w: landlock stage-0 gateway socket directory must not be the filesystem root, got %q",
+						ErrConfinementUnavailable, sockDir)
+				}
+				roots = append(roots, sockDir)
+			}
+
 			deduped := make([]string, 0, len(roots))
 			seen := make(map[string]bool, len(roots))
 			for _, root := range roots {
@@ -151,13 +176,25 @@ func landlockConfinementSpec() ConfinementSpec {
 				deduped = append(deduped, root)
 			}
 
-			wrapped := make([]string, 0, len(argv)+3+2*len(deduped)+1)
+			// 4 fixed tokens (helper, landlock-run, --ro /) + 2 per root +
+			// the "--" separator, plus the command itself (IN-04).
+			wrapped := make([]string, 0, len(argv)+5+2*len(deduped))
 			wrapped = append(wrapped, helper, "landlock-run", "--ro", "/")
 			for _, root := range deduped {
 				wrapped = append(wrapped, "--rw", root)
 			}
 			wrapped = append(wrapped, "--")
-			return append(wrapped, argv...), nil
+			for _, el := range argv {
+				switch {
+				case el == BwrapROHelperPath:
+					wrapped = append(wrapped, helper)
+				case el == BwrapGatewaySocketPath && sock != "":
+					wrapped = append(wrapped, sock)
+				default:
+					wrapped = append(wrapped, el)
+				}
+			}
+			return wrapped, nil
 		},
 		Env: func(baseEnv []string, paths DirectJobPaths) []string {
 			return baseEnv
@@ -173,13 +210,15 @@ func landlockConfinementSpec() ConfinementSpec {
 // The split is now honest: exit 74 (the negative control) proves the domain was
 // NOT enforcing and becomes StatusConfinementDenied, never StatusUnavailable;
 // 70/71/72/73/75/76 stay StatusUnavailable because they are environment or
-// helper-configuration faults, not project verdicts.
-func applyHelperExitToReport(report *VerificationReport, rank ConfinementRank, res *StageResult) bool {
+// helper-configuration faults, not project verdicts. The claimed stage is
+// recorded on the report so reviewers see which command never ran (IN-02).
+func applyHelperExitToReport(report *VerificationReport, rank ConfinementRank, stage string, res *StageResult) bool {
 	if report == nil || res == nil || res.Passed || rank != RankLandlock {
 		return false
 	}
 	if helperExitConfinementDenied(res.ExitCode) {
 		reason, _ := HelperExitReason(HelperExitNegativeControl)
+		report.FailedStage = stage
 		report.Status = StatusConfinementDenied
 		report.Reason = fmt.Sprintf("%s (helper exit %d)", reason, res.ExitCode)
 		report.Summary = "CONFINEMENT-DENIED: " + report.Reason
@@ -193,6 +232,7 @@ func applyHelperExitToReport(report *VerificationReport, rank ConfinementRank, r
 	if !ok {
 		return false
 	}
+	report.FailedStage = stage
 	report.Status = StatusUnavailable
 	report.Reason = fmt.Sprintf("%s (helper exit %d)", reason, res.ExitCode)
 	report.Summary = "UNAVAILABLE: " + report.Reason
@@ -285,6 +325,21 @@ var (
 	confinementResolvedErr  error
 )
 
+// detachedProbeTimeout bounds the process-lifetime rank probe so a detached
+// probe can never hang the first request forever.
+const detachedProbeTimeout = 30 * time.Second
+
+// detachedProbeContext returns the context the memoized rank probe runs under.
+// It detaches from the caller's cancellation (context.WithoutCancel) and adds
+// its own bounded timeout, so a cancelled/expired first request cannot poison
+// the process-wide rank decision until server restart (11-REVIEW WR-01).
+func detachedProbeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), detachedProbeTimeout)
+}
+
 // ResolveConfinementRank is the single exported confinement decision function.
 // Both direct exec call sites — VerifyDirGated and InLoopCommand — route
 // through it. The real rank decision runs once per process and memoizes both
@@ -299,7 +354,9 @@ func ResolveConfinementRank(ctx context.Context) (ConfinementSpec, error) {
 		return override(ctx)
 	}
 	confinementResolveOnce.Do(func() {
-		confinementResolvedSpec, confinementResolvedErr = resolveConfinementRankWith(ctx, confinementProbes{
+		probeCtx, cancel := detachedProbeContext(ctx)
+		defer cancel()
+		confinementResolvedSpec, confinementResolvedErr = resolveConfinementRankWith(probeCtx, confinementProbes{
 			goos:          runtime.GOOS,
 			attestBwrapRO: AttestBwrapRO,
 			probeLandlock: probeLandlockRank,

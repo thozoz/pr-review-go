@@ -275,6 +275,65 @@ func TestBuildDirectStageEnvDropsInheritedRootKeys(t *testing.T) {
 	}
 }
 
+// TestBuildDirectStageEnvDropsAllGoOverrides proves the pinned offline Go
+// list is authoritative: every inherited override key is dropped before the
+// pins are appended, so a first-match getenv can never resolve to the server's
+// ambient value under the landlock rank (11-REVIEW WR-02 / T-261021-01).
+func TestBuildDirectStageEnvDropsAllGoOverrides(t *testing.T) {
+	paths := provisionTestJobPaths(t)
+
+	inherited := map[string]string{
+		"GOTOOLCHAIN": "auto",
+		"GOWORK":      "/tmp/ambient",
+		"GOVCS":       "*:all",
+		"GOENV":       "/tmp/evil.env",
+		"GO111MODULE": "off",
+	}
+	for k, v := range inherited {
+		t.Setenv(k, v)
+	}
+
+	dir := writeDirectModule(t, map[string]string{
+		"go.mod":  "module example.com/envdrops\n\ngo 1.24\n",
+		"main.go": "package main\n\nfunc main() {}\n",
+	})
+	proj := detectDirectProject(dir)
+	if proj == nil || proj.lang != "go" {
+		t.Fatalf("detectDirectProject(%q) = %+v, want a go project", dir, proj)
+	}
+
+	env := buildDirectStageEnv(proj.offline, &paths)
+	pinned := map[string]string{
+		"GOTOOLCHAIN": "local",
+		"GOWORK":      "off",
+		"GOVCS":       "off",
+		"GOENV":       "off",
+		"GO111MODULE": "on",
+	}
+	for key, want := range pinned {
+		var values []string
+		for _, kv := range env {
+			if i := strings.IndexByte(kv, '='); i >= 0 && kv[:i] == key {
+				values = append(values, kv[i+1:])
+			}
+		}
+		if len(values) != 1 {
+			t.Errorf("%s must appear exactly once (inherited value dropped), got %d (%v)", key, len(values), values)
+			continue
+		}
+		if values[0] != want {
+			t.Errorf("%s = %q, want pinned offline %q (inherited %q must not win)", key, values[0], want, inherited[key])
+		}
+	}
+	for _, kv := range env {
+		for key, inheritedValue := range inherited {
+			if kv == key+"="+inheritedValue {
+				t.Errorf("inherited %s=%s survived into the stage env: %q", key, inheritedValue, kv)
+			}
+		}
+	}
+}
+
 func TestDirectRunnerUnconfiguredRootsFailsClosed(t *testing.T) {
 	if err := AttestBwrap(context.Background()); err != nil {
 		t.Skipf("direct enforcement requires bubblewrap: %v", err)

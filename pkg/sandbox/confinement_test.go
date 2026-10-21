@@ -163,6 +163,44 @@ func TestConfinementSpecArgvDerivesFromJobPaths(t *testing.T) {
 	}
 }
 
+// TestResolveConfinementRankDetachesCallerCancel proves the process-lifetime
+// rank probe is immune to the first caller's context cancellation: the
+// detached probe context keeps its own deadline and never inherits a cancelled
+// parent, so one aborted request cannot poison the memoized decision for the
+// whole server process (11-REVIEW WR-01 / T-261021-03).
+func TestResolveConfinementRankDetachesCallerCancel(t *testing.T) {
+	caller, cancel := context.WithCancel(context.Background())
+	cancel()
+	if caller.Err() == nil {
+		t.Fatal("test setup: caller context must be cancelled")
+	}
+
+	probe, stop := detachedProbeContext(caller)
+	defer stop()
+	if err := probe.Err(); err != nil {
+		t.Fatalf("detached probe context must not inherit caller cancellation, got %v", err)
+	}
+	select {
+	case <-probe.Done():
+		t.Fatal("detached probe context must remain live after caller cancellation")
+	default:
+	}
+	deadline, ok := probe.Deadline()
+	if !ok {
+		t.Fatal("detached probe context must carry a bounded deadline")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > 30*time.Second {
+		t.Fatalf("detached probe deadline = %v away, want within (0, 30s]", remaining)
+	}
+
+	// A live caller context is still bounded by the same independent deadline.
+	probe2, stop2 := detachedProbeContext(context.Background())
+	defer stop2()
+	if _, ok := probe2.Deadline(); !ok {
+		t.Fatal("live caller: detached probe context must still carry a deadline")
+	}
+}
+
 // TestResolveConfinementRankAllUnavailableIsFailClosed is Phase 8 success
 // criterion 3's regression test: with every rank forced unavailable a direct
 // verification run executes zero commands, never reaches StatusPassed, and
@@ -365,6 +403,122 @@ func TestLandlockRankWrapArgvContract(t *testing.T) {
 	})
 }
 
+// TestLandlockStage0WrapAndDirectPrepare proves stage-0 dependency preparation
+// is rank-agnostic: the landlock WrapArgv rewrites the bwrap-only in-sandbox
+// placeholder paths to host paths, grants --rw on the per-job gateway socket
+// directory, and directPrepare then executes through runDirectStage (never
+// RunBwrapStage) with the scrubbed job-private environment (11-REVIEW CR-01).
+func TestLandlockStage0WrapAndDirectPrepare(t *testing.T) {
+	paths := provisionTestJobPaths(t)
+	sockDir := filepath.Join(paths.Root, "control-test")
+	if err := os.MkdirAll(sockDir, 0o700); err != nil {
+		t.Fatalf("mkdir control dir: %v", err)
+	}
+	sockPath := filepath.Join(sockDir, "gateway.sock")
+	helper := filepath.Join(t.TempDir(), HelperBinaryName)
+
+	stage0 := []string{BwrapROHelperPath, "prepare", "-socket", BwrapGatewaySocketPath, "-work", paths.WorkspaceDir}
+	argv, err := landlockConfinementSpec().WrapArgv(stage0, paths, WrapOptions{GatewaySocketPath: sockPath, HelperPath: helper})
+	if err != nil {
+		t.Fatalf("landlock stage-0 wrap: %v", err)
+	}
+	want := []string{
+		helper, "landlock-run", "--ro", "/",
+		"--rw", paths.WorkspaceDir,
+		"--rw", paths.CacheDir,
+		"--rw", paths.TmpDir,
+		"--rw", paths.HomeDir,
+		"--rw", sockDir,
+		"--", helper, "prepare", "-socket", sockPath, "-work", paths.WorkspaceDir,
+	}
+	if strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("stage-0 landlock argv = %q, want %q", argv, want)
+	}
+	if !containsTriple(argv, "--rw", sockDir, "--") {
+		t.Errorf("stage-0 argv must grant --rw on the gateway socket directory %q: %q", sockDir, argv)
+	}
+	if strings.Contains(strings.Join(argv, " "), BwrapROHelperPath) ||
+		strings.Contains(strings.Join(argv, " "), BwrapGatewaySocketPath) {
+		t.Errorf("stage-0 argv must rewrite the bwrap-only placeholder paths: %q", argv)
+	}
+
+	t.Run("bad-gateway-socket-refuses", func(t *testing.T) {
+		for _, bad := range []string{"relative/gateway.sock", "/gateway.sock"} {
+			got, err := landlockConfinementSpec().WrapArgv(stage0, paths, WrapOptions{GatewaySocketPath: bad, HelperPath: helper})
+			if !errors.Is(err, ErrConfinementUnavailable) {
+				t.Fatalf("socket %q: want ErrConfinementUnavailable, got %v", bad, err)
+			}
+			if got != nil {
+				t.Fatalf("socket %q: failed wrap must return nil argv, got %q", bad, got)
+			}
+		}
+	})
+
+	// End-to-end: a fake helper records its argv and environment, then exits 0.
+	argvDump := filepath.Join(t.TempDir(), "argv.txt")
+	envDump := filepath.Join(t.TempDir(), "env.txt")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$0\" \"$@\" > %q\nenv > %q\nexit 0\n", argvDump, envDump)
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake helper: %v", err)
+	}
+	t.Setenv(SandboxHelperPathEnv, helper)
+	t.Setenv("GITHUB_TOKEN", "stage0-sentinel-secret")
+	t.Setenv("GOTOOLCHAIN", "auto")
+
+	res, err := directPrepare(context.Background(), 30*time.Second, paths, landlockConfinementSpec())
+	if err != nil {
+		t.Fatalf("directPrepare under landlock: %v", err)
+	}
+	if res == nil || !res.Passed {
+		t.Fatalf("stage-0 must succeed through runDirectStage, got %+v", res)
+	}
+	rawArgv, err := os.ReadFile(argvDump)
+	if err != nil {
+		t.Fatalf("read helper argv: %v", err)
+	}
+	gotArgv := strings.Split(strings.TrimSuffix(string(rawArgv), "\n"), "\n")
+	if len(gotArgv) < 6 || gotArgv[0] != helper {
+		t.Fatalf("helper argv = %q, want helper %q first", gotArgv, helper)
+	}
+	if gotArgv[1] != "landlock-run" {
+		t.Fatalf("helper argv = %q, want landlock-run subcommand", gotArgv)
+	}
+	prepareIndex := -1
+	socketValue := ""
+	for i := 0; i+1 < len(gotArgv); i++ {
+		if gotArgv[i] == "prepare" {
+			prepareIndex = i
+		}
+		if gotArgv[i] == "-socket" {
+			socketValue = gotArgv[i+1]
+		}
+	}
+	if prepareIndex < 0 {
+		t.Fatalf("helper argv = %q, want the prepare subcommand", gotArgv)
+	}
+	if socketValue == "" || socketValue == BwrapGatewaySocketPath {
+		t.Fatalf("-socket must be rewritten to a host path, got %q", socketValue)
+	}
+	if !strings.HasPrefix(socketValue, paths.Root+string(os.PathSeparator)+"control-") {
+		t.Errorf("-socket %q must live under the job root control dir", socketValue)
+	}
+
+	rawEnv, err := os.ReadFile(envDump)
+	if err != nil {
+		t.Fatalf("read helper env: %v", err)
+	}
+	envText := string(rawEnv)
+	if strings.Contains(envText, "GITHUB_TOKEN=") {
+		t.Errorf("secret-bearing env leaked into the stage-0 environment:\n%s", envText)
+	}
+	if strings.Contains(envText, "GOTOOLCHAIN=") {
+		t.Errorf("inherited GOTOOLCHAIN leaked into the stage-0 environment:\n%s", envText)
+	}
+	if !strings.Contains(envText, "HOME="+paths.HomeDir+"\n") {
+		t.Errorf("stage-0 env must pin HOME to the job-private home %q:\n%s", paths.HomeDir, envText)
+	}
+}
+
 // TestLandlockProbeFakeHelper drives the real probe shape against an executable
 // fake helper that exits with a chosen code, proving the 70–76 mapping at probe
 // time: 70/71/72 are rank-unavailable, 74 can never select the rank, and the
@@ -537,11 +691,14 @@ func TestHelperExitMapsToDeniedOrUnavailableAtExecution(t *testing.T) {
 	{
 		report := &VerificationReport{Status: StatusBuildFailed, Reason: "stale"}
 		res := &StageResult{ExitCode: HelperExitNegativeControl, Passed: false}
-		if !applyHelperExitToReport(report, RankLandlock, res) {
+		if !applyHelperExitToReport(report, RankLandlock, "install", res) {
 			t.Fatal("exit 74: expected the mapping to claim the result")
 		}
 		if report.Status != StatusConfinementDenied {
 			t.Fatalf("exit 74: status = %q, want %q", report.Status, StatusConfinementDenied)
+		}
+		if report.FailedStage != "install" {
+			t.Errorf("exit 74: FailedStage = %q, want install", report.FailedStage)
 		}
 		if !strings.Contains(report.Reason, "74") {
 			t.Errorf("exit 74: reason must name the code: %q", report.Reason)
@@ -564,11 +721,14 @@ func TestHelperExitMapsToDeniedOrUnavailableAtExecution(t *testing.T) {
 	for _, code := range []int{70, 71, 72, 73, 75, 76} {
 		report := &VerificationReport{Status: StatusBuildFailed, Reason: "stale"}
 		res := &StageResult{ExitCode: code, Passed: false}
-		if !applyHelperExitToReport(report, RankLandlock, res) {
+		if !applyHelperExitToReport(report, RankLandlock, "test", res) {
 			t.Fatalf("exit %d: expected the mapping to claim the result", code)
 		}
 		if report.Status != StatusUnavailable {
 			t.Fatalf("exit %d: status = %q, want %q", code, report.Status, StatusUnavailable)
+		}
+		if report.FailedStage != "test" {
+			t.Errorf("exit %d: FailedStage = %q, want test", code, report.FailedStage)
 		}
 		if !strings.Contains(report.Reason, strconv.Itoa(code)) {
 			t.Errorf("exit %d: reason must name the code: %q", code, report.Reason)
@@ -592,7 +752,7 @@ func TestHelperExitMapsToDeniedOrUnavailableAtExecution(t *testing.T) {
 		{"timeout-code", &VerificationReport{}, RankLandlock, &StageResult{ExitCode: 124}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if applyHelperExitToReport(tc.report, tc.rank, tc.res) {
+			if applyHelperExitToReport(tc.report, tc.rank, "build", tc.res) {
 				t.Fatal("mapping must not claim this result")
 			}
 		})

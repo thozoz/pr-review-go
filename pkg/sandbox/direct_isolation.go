@@ -211,6 +211,13 @@ func (p *DirectJobPaths) Cleanup() {
 // job's restricted UDS gateway. The argv comes from the single resolved spec,
 // so stage-0 is never left unwrapped (CONFINE-01).
 //
+// Rank-agnostic: the bwrap-ro rank binds the helper and gateway socket into its
+// private tmpfs and runs through RunBwrapStage, while the landlock rank has no
+// filesystem remap — it receives the host helper/socket paths, an explicit
+// --rw grant on the socket directory, and the scrubbed job-private stage env,
+// then runs through runDirectStage. Stage-0 therefore works under either rank
+// (11-REVIEW CR-01 / 10-REVIEW CR-02).
+//
 // Same-path semantics: the job workspace is bound at its own host path, so the
 // in-sandbox -work value equals the host workspace path (no /work remap).
 //
@@ -221,13 +228,9 @@ func (p *DirectJobPaths) Cleanup() {
 // job root (ROOT-01) and is never itself bound into the sandbox — only the
 // socket file is, read-only.
 func directPrepare(ctx context.Context, timeout time.Duration, paths DirectJobPaths, spec ConfinementSpec) (*StageResult, error) {
-	exe, err := os.Executable()
+	helper, err := ResolveSandboxHelperPath()
 	if err != nil {
 		return nil, err
-	}
-	helper := filepath.Join(filepath.Dir(exe), "pr-review-sandbox-helper")
-	if fi, err := os.Stat(helper); err != nil || !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("trusted sibling pr-review-sandbox-helper unavailable")
 	}
 	helper, err = filepath.EvalSymlinks(helper)
 	if err != nil {
@@ -254,5 +257,9 @@ func directPrepare(ctx context.Context, timeout time.Duration, paths DirectJobPa
 	}
 	stageCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return RunBwrapStage(stageCtx, "install", argv)
+	if spec.Rank == RankBwrapRO {
+		return RunBwrapStage(stageCtx, "install", argv)
+	}
+	env := spec.Env(buildDirectStageEnv(nil, &paths), paths)
+	return runDirectStage(stageCtx, timeout, paths.WorkspaceDir, "install", argv, env), nil
 }
