@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
@@ -163,18 +164,28 @@ func isGatedRefusedAction(act string) bool {
 	return false
 }
 
+// gatedEditMutableFileMaxBytes bounds one str_replace read-modify-write. A
+// larger file is refused with zero bytes written rather than being patched
+// from a display-truncated view (08-REVIEW CR-01).
+const gatedEditMutableFileMaxBytes = 1048576
+
 // gatedRunCommandBackend executes an allow-listed argv with cwd pinned to the
 // work copy. It is nil by default: with no backend assigned the gated loop
-// reports tool-unavailable for well-formed commands (a later plan assigns the
-// direct/podman-backed implementation). This plan asserts the argv gate, not
-// the backend.
+// reports tool-unavailable for well-formed commands. This package-level
+// variable is a TEST/INTEGRATION SEAM consumed by SetGatedInLoopBackends and
+// read only as a fallback when EditCaps.RunCommandBackend is nil; production
+// wiring should pass the backend through EditCaps. It asserts the argv gate,
+// not the backend.
 var gatedRunCommandBackend func(ctx context.Context, workDir string, argv []string) (stdout string, stderr string, exitCode int, err error)
 
-// SetGatedInLoopBackends wires the run_command tool to the sandbox in-loop
-// exec entries (Phase 06-03, D-03): podman exec into the writable /work mount
-// when a container ID is present, otherwise direct work-copy execution. The
-// seam passes argv only, never shell strings; no secret material of any kind
-// crosses it (token containment, T-05-02).
+// SetGatedInLoopBackends wires the package-level run_command seam to the
+// sandbox in-loop exec entries (Phase 06-03, D-03): podman exec into the
+// writable /work mount when a container ID is present, otherwise direct
+// work-copy execution. This is a TEST/INTEGRATION SEAM: production callers
+// bind via EditCaps.RunCommandBackend, and leaving it uncalled simply makes
+// run_command report tool-unavailable. The seam passes argv only, never shell
+// strings; no secret material of any kind crosses it (token containment,
+// T-05-02).
 func SetGatedInLoopBackends(runner *sandbox.Runner, containerID string) {
 	gatedRunCommandBackend = func(ctx context.Context, workDir string, argv []string) (string, string, int, error) {
 		if runner == nil {
@@ -221,7 +232,9 @@ func validateGatedRunCommand(argv []string) error {
 			strings.HasPrefix(el, "/") || strings.HasPrefix(el, "\\") {
 			return fmt.Errorf("absolute path in argv element %d", i)
 		}
-		if el == ".." || strings.HasPrefix(el, "../") || strings.HasPrefix(el, `..\`) {
+		if el == ".." || strings.HasPrefix(el, "../") || strings.HasPrefix(el, `..\`) ||
+			strings.Contains(el, "/../") || strings.Contains(el, `\..\`) ||
+			strings.HasSuffix(el, "/..") || strings.HasSuffix(el, `\..`) {
 			return fmt.Errorf("parent-directory traversal in argv element %d", i)
 		}
 	}
@@ -246,8 +259,16 @@ func gatedGrepFiles(canonicalWorkDir, userPath, pattern string) (string, error) 
 	}
 	var sb strings.Builder
 	truncated := false
+	listingTruncated := false
 	for _, rel := range strings.Split(listing, "\n") {
 		if rel == "" {
+			continue
+		}
+		if rel == workspaceListingTruncatedNotice {
+			// The listing was capped: file contents below the cap were
+			// searched, but the model must not read an absent match as
+			// proof the symbol does not exist (08-REVIEW WR-05).
+			listingTruncated = true
 			continue
 		}
 		slashRel := filepath.ToSlash(rel)
@@ -275,6 +296,12 @@ func gatedGrepFiles(canonicalWorkDir, userPath, pattern string) (string, error) 
 	if truncated {
 		out += "\n...[truncated: grep output exceeds 6000 bytes]..."
 	}
+	if listingTruncated && !truncated {
+		if out != "" {
+			out += "\n"
+		}
+		out += "...[truncated: file listing capped at 100 entries; grep results may be incomplete]..."
+	}
 	return out, nil
 }
 
@@ -296,8 +323,17 @@ func gatedGlobFiles(canonicalWorkDir, userPath, pattern string) (string, error) 
 	}
 	hasSep := strings.Contains(pattern, "/") || strings.Contains(pattern, "\\")
 	var matched []string
+	globTruncated := false
+	listingTruncated := false
 	for _, rel := range strings.Split(listing, "\n") {
 		if rel == "" {
+			continue
+		}
+		if rel == workspaceListingTruncatedNotice {
+			// A capped listing means the glob examined only the first 100
+			// entries; say so instead of reporting "no match" as complete
+			// (08-REVIEW WR-05).
+			listingTruncated = true
 			continue
 		}
 		slashRel := filepath.ToSlash(rel)
@@ -315,17 +351,27 @@ func gatedGlobFiles(canonicalWorkDir, userPath, pattern string) (string, error) 
 			return "", fmt.Errorf("invalid glob pattern: %w", mErr)
 		}
 		if ok {
-			matched = append(matched, slashRel)
-			if len(matched) > gatedGlobMaxEntries {
+			if len(matched) >= gatedGlobMaxEntries {
+				globTruncated = true
 				break
 			}
+			matched = append(matched, slashRel)
 		}
 	}
-	if len(matched) > gatedGlobMaxEntries {
-		matched = matched[:gatedGlobMaxEntries]
-		return strings.Join(matched, "\n") + "\n...[truncated: glob output exceeds 200 entries]...", nil
+	out := strings.Join(matched, "\n")
+	if globTruncated {
+		if out != "" {
+			out += "\n"
+		}
+		out += "...[truncated: glob output exceeds 200 entries]..."
 	}
-	return strings.Join(matched, "\n"), nil
+	if listingTruncated {
+		if out != "" {
+			out += "\n"
+		}
+		out += "...[truncated: file listing capped at 100 entries; glob results may be incomplete]..."
+	}
+	return out, nil
 }
 
 // History summarization bounds (D-01). The loop history grows every round;
@@ -357,11 +403,26 @@ func summarizeGatedHistory(history string, keepTailBytes int) string {
 	if keepTailBytes > len(history) {
 		keepTailBytes = len(history)
 	}
+	if keepTailBytes >= len(history) {
+		return history
+	}
 	head := history
 	if len(history) > gatedHistoryHeadBytes {
-		head = history[:gatedHistoryHeadBytes]
+		headEnd := gatedHistoryHeadBytes
+		// Never split a multi-byte rune across the compression boundary.
+		for headEnd > 0 && headEnd < len(history) && !utf8.RuneStart(history[headEnd]) {
+			headEnd--
+		}
+		head = history[:headEnd]
 	}
-	tail := history[len(history)-keepTailBytes:]
+	tailStart := len(history) - keepTailBytes
+	if tailStart < len(head) {
+		tailStart = len(head)
+	}
+	for tailStart < len(history) && !utf8.RuneStart(history[tailStart]) {
+		tailStart++
+	}
+	tail := history[tailStart:]
 	if dropped := len(history) - len(head) - len(tail); dropped <= 0 {
 		return history
 	} else {
@@ -486,9 +547,16 @@ func RunGatedEditLoop(ctx context.Context, llmClient GatedEditLLM, workDir strin
 			result.TotalBytes += newBytes
 			history += fmt.Sprintf("\nAction requested: write_file (path: %s)\nTool Result:\nWrote %d bytes.\nNext action (or answer):", step.Path, newBytes)
 		case "str_replace", "str_replace_editor":
-			original, rErr := readWorkspaceFile(canonicalWorkDir, step.Path)
+			// Read the authoritative bytes, never the 30KB display view: a
+			// patched truncated copy would silently drop the file tail when
+			// written back (08-REVIEW CR-01).
+			original, oversized, rErr := readWorkspaceFileFull(canonicalWorkDir, step.Path, gatedEditMutableFileMaxBytes)
 			if rErr != nil {
 				history += fmt.Sprintf("\nAction requested: str_replace (path: %s)\nTool Result:\nError: %v\nNext action:", step.Path, rErr)
+				break
+			}
+			if oversized {
+				history += fmt.Sprintf("\nAction requested: str_replace (path: %s)\nTool Result:\nError: file exceeds the %d-byte edit limit; no bytes written. Narrow the edit or use write_file.\nNext action:", step.Path, gatedEditMutableFileMaxBytes)
 				break
 			}
 			if step.OldStr == "" {
@@ -597,7 +665,14 @@ func countGatedLines(content string) int {
 	if content == "" {
 		return 0
 	}
-	return strings.Count(content, "\n") + 1
+	// Count logical lines: every newline terminates one line, and a final
+	// unterminated segment is one more. Content ending in "\n" therefore does
+	// not gain a phantom empty line (08-REVIEW IN-03).
+	lines := strings.Count(content, "\n")
+	if !strings.HasSuffix(content, "\n") {
+		lines++
+	}
+	return lines
 }
 
 // gatedWriteFile writes content to a path jailed inside canonicalWorkDir. It

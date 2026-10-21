@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,8 +37,8 @@ func TestWebhookDurableTracer(t *testing.T) {
 	)
 
 	var (
-		llmCalls     int32
-		compareCalls int32
+		llmCalls        int32
+		compareCalls    int32
 		createdComments []string
 		editedComments  []string
 		commentMu       sync.Mutex
@@ -154,7 +155,7 @@ func TestWebhookDurableTracer(t *testing.T) {
 	setupCfg := &config.Config{
 		GitHubAppSetupToken: "setup-token-123",
 		PublicURL:           "https://example.com",
-		WebhookStateDir:      filepath.Join(stateDir, "setup-sub"),
+		WebhookStateDir:     filepath.Join(stateDir, "setup-sub"),
 	}
 	setupSrv := NewServer(setupCfg)
 	if err := setupSrv.Start(context.Background()); err != nil {
@@ -1163,14 +1164,14 @@ func TestAutomaticReviewCoalescing(t *testing.T) {
 			Host: "github.com", RepoID: repoID, DeliveryID: "deliv-delayed-1", PayloadHash: "h-del", ReceivedAt: time.Now(),
 		}, []Job{
 			{
-				Kind:       "review",
-				Trigger:    "automatic",
-				PRKey:      prKey,
-				Owner:      "o",
-				Repo:       "r",
-				PRNumber:   prNum,
-				HeadSHA:    shaA,
-				BaseSHA:    baseSHA,
+				Kind:     "review",
+				Trigger:  "automatic",
+				PRKey:    prKey,
+				Owner:    "o",
+				Repo:     "r",
+				PRNumber: prNum,
+				HeadSHA:  shaA,
+				BaseSHA:  baseSHA,
 			},
 		})
 		if err != nil || res.Status != AdmitAccepted {
@@ -1310,14 +1311,14 @@ func TestAutomaticReviewCoalescing(t *testing.T) {
 			Host: "github.com", RepoID: repoID, DeliveryID: "deliv-a", PayloadHash: "ha", ReceivedAt: time.Now(),
 		}, []Job{
 			{
-				Kind:       "review",
-				Trigger:    "automatic",
-				PRKey:      prKey,
-				Owner:      "o",
-				Repo:       "r",
-				PRNumber:   prNum,
-				HeadSHA:    shaA,
-				BaseSHA:    baseSHA,
+				Kind:     "review",
+				Trigger:  "automatic",
+				PRKey:    prKey,
+				Owner:    "o",
+				Repo:     "r",
+				PRNumber: prNum,
+				HeadSHA:  shaA,
+				BaseSHA:  baseSHA,
 			},
 		})
 		if err != nil || res.Status != AdmitAccepted {
@@ -2704,11 +2705,11 @@ func TestExecuteDecision_HappyPath(t *testing.T) {
 	}
 
 	deliv := Delivery{
-		Host:        "github.com",
-		RepoID:      repoID,
-		DeliveryID:  "deliv-dec-happy",
-		EventKind:   "issue_comment",
-		ReceivedAt:  time.Now().UTC(),
+		Host:       "github.com",
+		RepoID:     repoID,
+		DeliveryID: "deliv-dec-happy",
+		EventKind:  "issue_comment",
+		ReceivedAt: time.Now().UTC(),
 	}
 	res, err := store.Admit(context.Background(), deliv, []Job{job})
 	if err != nil || res.Status != AdmitAccepted {
@@ -2817,11 +2818,11 @@ func TestExecuteDecision_ReauthorizationDenied(t *testing.T) {
 	}
 
 	deliv := Delivery{
-		Host:        "github.com",
-		RepoID:      repoID,
-		DeliveryID:  "deliv-dec-denied",
-		EventKind:   "issue_comment",
-		ReceivedAt:  time.Now().UTC(),
+		Host:       "github.com",
+		RepoID:     repoID,
+		DeliveryID: "deliv-dec-denied",
+		EventKind:  "issue_comment",
+		ReceivedAt: time.Now().UTC(),
 	}
 	res, err := store.Admit(context.Background(), deliv, []Job{job})
 	if err != nil || res.Status != AdmitAccepted {
@@ -2856,10 +2857,10 @@ func TestDecisionDuplicate_SecondCommandPostsWarningAndNoReview(t *testing.T) {
 	)
 
 	var (
-		reviewsCreated   atomic.Int32
-		issueComments    []string
-		commentsMu       sync.Mutex
-		lastStatusBody   string
+		reviewsCreated atomic.Int32
+		issueComments  []string
+		commentsMu     sync.Mutex
+		lastStatusBody string
 	)
 
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2947,11 +2948,11 @@ func TestDecisionDuplicate_SecondCommandPostsWarningAndNoReview(t *testing.T) {
 	}
 
 	deliv1 := Delivery{
-		Host:        "github.com",
-		RepoID:      repoID,
-		DeliveryID:  "deliv-dup-1",
-		EventKind:   "issue_comment",
-		ReceivedAt:  time.Now().UTC(),
+		Host:       "github.com",
+		RepoID:     repoID,
+		DeliveryID: "deliv-dup-1",
+		EventKind:  "issue_comment",
+		ReceivedAt: time.Now().UTC(),
 	}
 	_, _ = store.Admit(context.Background(), deliv1, []Job{job1})
 	queued, _ := store.ListQueuedJobs(context.Background())
@@ -2982,11 +2983,11 @@ func TestDecisionDuplicate_SecondCommandPostsWarningAndNoReview(t *testing.T) {
 	}
 
 	deliv2 := Delivery{
-		Host:        "github.com",
-		RepoID:      repoID,
-		DeliveryID:  "deliv-dup-2",
-		EventKind:   "issue_comment",
-		ReceivedAt:  time.Now().UTC(),
+		Host:       "github.com",
+		RepoID:     repoID,
+		DeliveryID: "deliv-dup-2",
+		EventKind:  "issue_comment",
+		ReceivedAt: time.Now().UTC(),
 	}
 	_, _ = store.Admit(context.Background(), deliv2, []Job{job2})
 	queued2, _ := store.ListQueuedJobs(context.Background())
@@ -3131,11 +3132,11 @@ func TestDecisionHead_AdvancedMidFlowPostsOldSHANotice(t *testing.T) {
 	}
 
 	deliv := Delivery{
-		Host:        "github.com",
-		RepoID:      repoID,
-		DeliveryID:  "deliv-dec-head",
-		EventKind:   "issue_comment",
-		ReceivedAt:  time.Now().UTC(),
+		Host:       "github.com",
+		RepoID:     repoID,
+		DeliveryID: "deliv-dec-head",
+		EventKind:  "issue_comment",
+		ReceivedAt: time.Now().UTC(),
 	}
 	_, _ = store.Admit(context.Background(), deliv, []Job{job})
 	queued, _ := store.ListQueuedJobs(context.Background())
@@ -3240,11 +3241,11 @@ func networkFetchTestServer(t *testing.T, permission string) (*Server, *httptest
 func admitNetworkFetchJob(t *testing.T, store JobStore, job Job, deliveryID string) *Job {
 	t.Helper()
 	deliv := Delivery{
-		Host:        "github.com",
-		RepoID:      12345,
-		DeliveryID:  deliveryID,
-		EventKind:   "issue_comment",
-		ReceivedAt:  time.Now().UTC(),
+		Host:       "github.com",
+		RepoID:     12345,
+		DeliveryID: deliveryID,
+		EventKind:  "issue_comment",
+		ReceivedAt: time.Now().UTC(),
 	}
 	res, err := store.Admit(context.Background(), deliv, []Job{job})
 	if err != nil || res.Status != AdmitAccepted {
@@ -3329,7 +3330,7 @@ func TestNetworkFetchAutoJobOffline(t *testing.T) {
 func TestNetworkFetchAllowedExplicitHonored(t *testing.T) {
 	// Trusted at execution: opt-in survives the gate and executes.
 	srv, _, store := networkFetchTestServer(t, "write") // ALLOWED
-	srv.labeler = nil // no-op labels: the execution-time flag value is what matters
+	srv.labeler = nil                                   // no-op labels: the execution-time flag value is what matters
 	prKey, _ := MakePRKey("github.com", 12345, 12)
 	admitted := admitNetworkFetchJob(t, store, Job{
 		Kind:         "labels",
@@ -3476,6 +3477,66 @@ func TestNetworkFetchForwardedToExecutionPipelines(t *testing.T) {
 	}
 }
 
+// TestReadVerifiedEditSnapshotStagesRegularFiles proves the push snapshot
+// reader returns exact bytes for regular files under the snapshot root
+// (08-REVIEW CR-02).
+func TestReadVerifiedEditSnapshotStagesRegularFiles(t *testing.T) {
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "pkg", "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "pkg", "sub", "file.go"), []byte("package sub\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	files, err := readVerifiedEditSnapshot(src, []string{"pkg/sub/file.go"})
+	if err != nil {
+		t.Fatalf("regular file must be staged, got %v", err)
+	}
+	if got := files["pkg/sub/file.go"]; got != "package sub\n" {
+		t.Fatalf("staged content = %q", got)
+	}
+}
 
+// TestReadVerifiedEditSnapshotRejectsSymlink proves a symlink in the
+// sandbox-writable work copy is refused even when its target stays inside the
+// snapshot (08-REVIEW CR-02).
+func TestReadVerifiedEditSnapshotRejectsSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on Windows")
+	}
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "real.txt"), []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real.txt", filepath.Join(src, "link.txt")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := readVerifiedEditSnapshot(src, []string{"link.txt"}); err == nil {
+		t.Fatal("a symlink must be refused, never followed into the push")
+	} else if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("refusal must name the symlink, got: %v", err)
+	}
+}
 
-
+// TestReadVerifiedEditSnapshotRejectsNonRegular proves directories, missing
+// paths and out-of-jail names are refused (08-REVIEW CR-02).
+func TestReadVerifiedEditSnapshotRejectsNonRegular(t *testing.T) {
+	src := t.TempDir()
+	if err := os.Mkdir(filepath.Join(src, "adir"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"directory", "adir"},
+		{"missing", "missing.txt"},
+		{"absolute", "/etc/hostname"},
+		{"traversal", "../outside.txt"},
+	}
+	for _, tc := range cases {
+		if _, err := readVerifiedEditSnapshot(src, []string{tc.path}); err == nil {
+			t.Errorf("%s path %q must be refused", tc.name, tc.path)
+		}
+	}
+}

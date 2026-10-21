@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // scriptGatedLLM replays a scripted response per LLM call.
@@ -76,8 +77,8 @@ func TestStrReplace_HappyPathAppliesPatch(t *testing.T) {
 	if result.TotalBytes != len(want) {
 		t.Fatalf("unexpected TotalBytes: %d, want %d", result.TotalBytes, len(want))
 	}
-	if result.TotalLines != 4 {
-		t.Fatalf("unexpected TotalLines: %d, want 4", result.TotalLines)
+	if result.TotalLines != 3 {
+		t.Fatalf("unexpected TotalLines: %d, want 3", result.TotalLines)
 	}
 	if result.Truncated {
 		t.Fatalf("happy patch must not truncate")
@@ -344,8 +345,8 @@ func TestGatedEdit_HappyPathAppliesInsideJail(t *testing.T) {
 	if result.TotalBytes != len("line1\nline2\n") {
 		t.Fatalf("unexpected TotalBytes: %d", result.TotalBytes)
 	}
-	if result.TotalLines != 3 {
-		t.Fatalf("unexpected TotalLines: %d", result.TotalLines)
+	if result.TotalLines != 2 {
+		t.Fatalf("unexpected TotalLines: %d, want 2", result.TotalLines)
 	}
 	if result.Truncated {
 		t.Fatalf("happy path must not truncate")
@@ -741,5 +742,217 @@ func TestTurnBudget_ViolationAbortStillFiresAtThree(t *testing.T) {
 	}
 	if fake.calls != 3 {
 		t.Fatalf("violation abort must still fire at exactly 3, got %d calls", fake.calls)
+	}
+}
+
+// TestStrReplace_RefusesOversizedFile pins 08-REVIEW CR-01: a file larger than
+// the 1 MiB edit limit must be refused with zero bytes written, never patched
+// from a truncated view.
+func TestStrReplace_RefusesOversizedFile(t *testing.T) {
+	workDir := t.TempDir()
+	var sb strings.Builder
+	sb.WriteString("alpha=1\n")
+	sb.WriteString(strings.Repeat("padding-line-0123456789\n", (gatedEditMutableFileMaxBytes/24)+10))
+	original := sb.String()
+	if len(original) <= gatedEditMutableFileMaxBytes {
+		t.Fatalf("test fixture must exceed the edit limit, got %d bytes", len(original))
+	}
+	path := filepath.Join(workDir, "big.txt")
+	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call == 1 {
+			return gatedStrReplaceJSON("big.txt", "alpha=1", "alpha=2")
+		}
+		return gatedAnswerJSON
+	}}
+	result, err := RunGatedEditLoop(context.Background(), fake, workDir, "patch big file", "", EditCaps{})
+	if err != nil {
+		t.Fatalf("oversized str_replace must be refused as a tool error, got: %v", err)
+	}
+	if len(result.FilesChanged) != 0 || result.TotalBytes != 0 {
+		t.Fatalf("oversized str_replace must write zero bytes, got %+v", result)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != original {
+		t.Fatalf("oversized file must remain byte-identical (before=%d after=%d bytes)", len(original), len(after))
+	}
+	if fake.calls != 2 {
+		t.Fatalf("loop must continue to the answer turn, got %d calls", fake.calls)
+	}
+}
+
+// TestStrReplace_UsesAuthoritativeBytesBeyondDisplayCap pins that str_replace
+// reads the real file, not the 30KB display view: a match past the display cap
+// is patched without shrinking the file.
+func TestStrReplace_UsesAuthoritativeBytesBeyondDisplayCap(t *testing.T) {
+	workDir := t.TempDir()
+	original := strings.Repeat("a", 40000) + "\nUNIQUE_TARGET_TOKEN\n"
+	path := filepath.Join(workDir, "tail.txt")
+	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &scriptGatedLLM{fn: func(call int) string {
+		if call == 1 {
+			return gatedStrReplaceJSON("tail.txt", "UNIQUE_TARGET_TOKEN", "PATCHED_TARGET_TOKEN")
+		}
+		return gatedAnswerJSON
+	}}
+	if _, err := RunGatedEditLoop(context.Background(), fake, workDir, "patch tail", "", EditCaps{}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Repeat("a", 40000) + "\nPATCHED_TARGET_TOKEN\n"
+	if string(after) != want {
+		t.Fatalf("str_replace must patch authoritative bytes (len before=%d after=%d)", len(original), len(after))
+	}
+	if strings.Contains(string(after), "[file truncated") {
+		t.Fatal("a display truncation marker must never reach a written file")
+	}
+}
+
+// TestValidateGatedRunCommand_InnerTraversal pins 08-REVIEW WR-04: traversal
+// inside an element (not only as a prefix) must be refused.
+func TestValidateGatedRunCommand_InnerTraversal(t *testing.T) {
+	bad := [][]string{
+		{"go", "test", "./pkg/../../etc"},
+		{"go", "build", "foo/../.."},
+		{"go", "test", "a/b/.."},
+		{"go", "test", `foo\..\..`},
+	}
+	for _, argv := range bad {
+		if err := validateGatedRunCommand(argv); err == nil {
+			t.Errorf("argv %q must be refused: inner parent traversal", argv)
+		}
+	}
+	good := [][]string{
+		{"go", "test", "./..."},
+		{"go", "build", "-o", "out", "."},
+		{"npm", "test", "--", "run/thing"},
+	}
+	for _, argv := range good {
+		if err := validateGatedRunCommand(argv); err != nil {
+			t.Errorf("argv %q must be accepted, got %v", argv, err)
+		}
+	}
+}
+
+// TestCountGatedLines_TrailingNewline pins 08-REVIEW IN-03: a trailing newline
+// terminates a line instead of creating a phantom empty one.
+func TestCountGatedLines_TrailingNewline(t *testing.T) {
+	cases := []struct {
+		content string
+		want    int
+	}{
+		{"", 0},
+		{"a", 1},
+		{"a\n", 1},
+		{"a\nb", 2},
+		{"a\nb\n", 2},
+		{"a\n\n", 2},
+		{"\n", 1},
+	}
+	for _, tc := range cases {
+		if got := countGatedLines(tc.content); got != tc.want {
+			t.Errorf("countGatedLines(%q) = %d, want %d", tc.content, got, tc.want)
+		}
+	}
+}
+
+// TestSummarizeGatedHistory_SplitsOnRuneBoundaries pins 08-REVIEW IN-03: the
+// head and tail cuts must not split a multi-byte rune.
+func TestSummarizeGatedHistory_SplitsOnRuneBoundaries(t *testing.T) {
+	// Head cut: gatedHistoryHeadBytes lands on the continuation byte of "é".
+	headCase := strings.Repeat("a", 1999) + strings.Repeat("é", 9000) + strings.Repeat("b", 30000)
+	out := summarizeGatedHistory(headCase, 12000)
+	if !utf8.ValidString(out) {
+		t.Fatal("summarized history with a split head must be valid UTF-8")
+	}
+	if !strings.Contains(out, "[summarized:") {
+		t.Fatal("long history must be summarized")
+	}
+
+	// Tail cut: tailStart lands on the continuation byte of "é".
+	prefix := strings.Repeat("a", 27991)
+	mid := strings.Repeat("é", 20)
+	suffix := strings.Repeat("c", 40000-27991-len(mid))
+	tailCase := prefix + mid + suffix
+	if len(tailCase) != 40000 {
+		t.Fatalf("fixture length = %d, want 40000", len(tailCase))
+	}
+	tailOut := summarizeGatedHistory(tailCase, 12000)
+	if !utf8.ValidString(tailOut) {
+		t.Fatal("summarized history with a split tail must be valid UTF-8")
+	}
+}
+
+// TestListWorkspaceTruncationIsExplicit pins 08-REVIEW WR-05: list, grep and
+// glob must never present a capped listing as complete.
+func TestListWorkspaceTruncationIsExplicit(t *testing.T) {
+	workDir := t.TempDir()
+	for i := 0; i < workspaceListingMaxEntries+20; i++ {
+		name := fmt.Sprintf("file-%03d.txt", i)
+		if err := os.WriteFile(filepath.Join(workDir, name), []byte("no match here\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	listing, err := listWorkspaceFiles(workDir, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(listing, "\n")
+	if len(lines) != workspaceListingMaxEntries+1 {
+		t.Fatalf("capped listing lines = %d, want %d", len(lines), workspaceListingMaxEntries+1)
+	}
+	if lines[len(lines)-1] != workspaceListingTruncatedNotice {
+		t.Fatalf("last listing line = %q, want the explicit truncation notice", lines[len(lines)-1])
+	}
+
+	grepOut, err := gatedGrepFiles(workDir, ".", "NO_SUCH_SYMBOL_XYZ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(grepOut, "grep results may be incomplete") {
+		t.Fatalf("grep over a capped listing must say results may be incomplete: %q", grepOut)
+	}
+
+	globOut, err := gatedGlobFiles(workDir, ".", "*.nomatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(globOut, "glob results may be incomplete") {
+		t.Fatalf("glob over a capped listing must say results may be incomplete: %q", globOut)
+	}
+}
+
+// TestReadWorkspaceFileFullHasNoMarker pins the CR-01 contract directly.
+func TestReadWorkspaceFileFullHasNoMarker(t *testing.T) {
+	workDir := t.TempDir()
+	content := strings.Repeat("x", 100) + "TAIL"
+	if err := os.WriteFile(filepath.Join(workDir, "f.txt"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, truncated, err := readWorkspaceFileFull(workDir, "f.txt", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated {
+		t.Fatal("read limit 50 over a 104-byte file must report truncation")
+	}
+	if got != content[:50] {
+		t.Fatalf("readWorkspaceFileFull must return exact bytes, got %q", got)
+	}
+	if strings.Contains(got, "truncated") {
+		t.Fatal("readWorkspaceFileFull must not inject a display marker")
 	}
 }

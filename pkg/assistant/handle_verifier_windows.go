@@ -48,6 +48,14 @@ func getFinalPathName(h syscall.Handle) (string, error) {
 	}
 }
 
+// VerifyFileHandleInRoot verifies that the open file descriptor points within
+// canonicalWorkDir and does not access restricted paths. It is the exported
+// seam used by the server's push snapshot reader, which must validate a
+// descriptor it opened through its own os.Root (08-REVIEW CR-02).
+func VerifyFileHandleInRoot(f *os.File, canonicalWorkDir string) error {
+	return verifyFileHandle(f, canonicalWorkDir)
+}
+
 // verifyFileHandle queries the Windows kernel for the normalized target path
 // of the open handle, ensuring that the file held open actually resides within
 // canonicalWorkDir and does not access restricted paths such as .git.
