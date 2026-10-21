@@ -119,9 +119,10 @@ func main() {
 	}
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
+	routes := srv.Routes()
 	httpServer := &http.Server{
 		Addr:    addr,
-		Handler: srv.Routes(),
+		Handler: routes,
 	}
 
 	serverErrCh := make(chan error, 1)
@@ -132,6 +133,28 @@ func main() {
 		}
 		close(serverErrCh)
 	}()
+
+	// Optional standalone dashboard listener (PORT_DASHBOARD). It reuses the
+	// same routes so the UI and JSON API behave identically; failure to bind
+	// is logged but does not take down the webhook listener.
+	var dashboardServer *http.Server
+	if cfg.DashboardPort > 0 {
+		if cfg.DashboardPort == cfg.Port {
+			log.Printf("PORT_DASHBOARD=%d matches PORT; dashboard is served on the main listener", cfg.DashboardPort)
+		} else {
+			dashboardAddr := fmt.Sprintf("0.0.0.0:%d", cfg.DashboardPort)
+			dashboardServer = &http.Server{
+				Addr:    dashboardAddr,
+				Handler: routes,
+			}
+			go func() {
+				log.Printf("📊 Dashboard listening on http://%s/dashboard", dashboardAddr)
+				if err := dashboardServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					log.Printf("Dashboard listener stopped with error: %v", err)
+				}
+			}()
+		}
+	}
 
 	select {
 	case err := <-serverErrCh:
@@ -147,8 +170,11 @@ func main() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
 
-		// Stop HTTP server first to reject new requests
+		// Stop HTTP servers first to reject new requests
 		_ = httpServer.Shutdown(shutdownCtx)
+		if dashboardServer != nil {
+			_ = dashboardServer.Shutdown(shutdownCtx)
+		}
 
 		// Drain and shutdown workers and close store
 		if err := srv.Shutdown(shutdownCtx); err != nil {
