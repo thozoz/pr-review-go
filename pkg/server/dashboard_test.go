@@ -108,3 +108,62 @@ func TestDashboardPagesRender(t *testing.T) {
 		}
 	}
 }
+
+func TestDashboardHTMLStructure(t *testing.T) {
+	srv, _ := newDashboardTestServer(t, "")
+
+	req := httptest.NewRequest("GET", "/dashboard", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	rr := serveDashboardRequest(srv, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /dashboard status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+
+	for _, needle := range []string{
+		// Dark-mode palette.
+		"#0d1117", "#161b22", "#30363d", "#c9d1d9", "#58a6ff",
+		"#238636", "#d29922", "#da3633", "#8957e5",
+		// Summary stat cards, live monitor, ledger, dispatch form.
+		`id="stat-total-prs"`,
+		`id="stat-autonomous-commits"`,
+		`id="stat-approvals"`,
+		`id="stat-queued"`,
+		`id="stat-deferred"`,
+		`id="stat-needs-attention"`,
+		`id="running-jobs"`,
+		`id="queued-jobs"`,
+		`id="attention-jobs"`,
+		`id="ledger-table"`,
+		`id="ledger-body"`,
+		`id="dispatch-form"`,
+		`id="dispatch-pr-url"`,
+		`id="dispatch-action"`,
+		`/api/v1/metrics`,
+		`/api/v1/dashboard/dispatch`,
+		"setInterval",
+		"refresh-interval",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("dashboard HTML missing %q", needle)
+		}
+	}
+
+	// Zero external dependencies: every asset is inlined.
+	lower := strings.ToLower(body)
+	for _, forbidden := range []string{
+		"http://", "https://cdn", "unpkg", "cdnjs", "fonts.googleapis", "fonts.gstatic",
+		"<script src=", "<link rel=\"stylesheet\"", "<link href=",
+	} {
+		if strings.Contains(lower, forbidden) {
+			t.Errorf("dashboard HTML must not reference external dependency %q", forbidden)
+		}
+	}
+
+	// Dispatch action options are the four supported operator actions.
+	for _, action := range []string{`value="review"`, `value="summary"`, `value="describe"`, `value="labels"`} {
+		if !strings.Contains(body, action) {
+			t.Errorf("dashboard HTML missing dispatch action option %q", action)
+		}
+	}
+}
