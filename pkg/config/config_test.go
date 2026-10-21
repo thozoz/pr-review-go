@@ -794,3 +794,74 @@ func TestValidateDirectRootPathResolvesSymlink(t *testing.T) {
 		t.Errorf("symlink refusal must use the shared-tmp error text: %v", err)
 	}
 }
+
+func TestLLMMaxTokens(t *testing.T) {
+	baseCfg := func() *Config {
+		return &Config{
+			GitHubToken: "token",
+			LLMAPIKey:   "key",
+			LLMModel:    "model",
+			LLMBaseURL:  "https://example.com",
+		}
+	}
+
+	// 1. Direct validation tests
+	validCases := []int{0, MinLLMMaxTokens, 4096, MaxLLMMaxTokens}
+	for _, tc := range validCases {
+		cfg := baseCfg()
+		cfg.LLMMaxTokens = tc
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected LLMMaxTokens=%d to be valid, got: %v", tc, err)
+		}
+	}
+
+	invalidCases := []int{-1, MinLLMMaxTokens - 1, 100, MaxLLMMaxTokens + 1, 200000}
+	for _, tc := range invalidCases {
+		cfg := baseCfg()
+		cfg.LLMMaxTokens = tc
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("expected error for invalid LLMMaxTokens=%d, got nil", tc)
+		}
+	}
+
+	// 2. Load() environment variable parsing tests
+	envTests := []struct {
+		name      string
+		raw       string
+		want      int
+		shouldErr bool
+	}{
+		{name: "unset", raw: "", want: 0, shouldErr: false},
+		{name: "whitespace", raw: "   ", want: 0, shouldErr: false},
+		{name: "invalid non-numeric", raw: "invalid", want: 0, shouldErr: false},
+		{name: "negative defaults to 0", raw: "-50", want: 0, shouldErr: false},
+		{name: "valid 4096", raw: "4096", want: 4096, shouldErr: false},
+		{name: "valid min boundary", raw: "256", want: 256, shouldErr: false},
+		{name: "valid max boundary", raw: "131072", want: 131072, shouldErr: false},
+		{name: "out-of-bounds low", raw: "100", want: 100, shouldErr: true},
+		{name: "out-of-bounds high", raw: "200000", want: 200000, shouldErr: true},
+	}
+
+	for _, tt := range envTests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GITHUB_TOKEN", "token")
+			t.Setenv("LLM_API_KEY", "key")
+			t.Setenv("LLM_MODEL", "model")
+			t.Setenv("LLM_BASE_URL", "https://example.com")
+			t.Setenv("LLM_MAX_TOKENS", tt.raw)
+
+			cfg := Load()
+			if cfg.LLMMaxTokens != tt.want {
+				t.Fatalf("Load() LLMMaxTokens = %d, want %d", cfg.LLMMaxTokens, tt.want)
+			}
+
+			err := cfg.Validate()
+			if tt.shouldErr && err == nil {
+				t.Fatalf("expected validation error for LLM_MAX_TOKENS=%q, got nil", tt.raw)
+			}
+			if !tt.shouldErr && err != nil {
+				t.Fatalf("unexpected validation error for LLM_MAX_TOKENS=%q: %v", tt.raw, err)
+			}
+		})
+	}
+}

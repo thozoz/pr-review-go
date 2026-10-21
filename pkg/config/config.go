@@ -80,6 +80,7 @@ type Config struct {
 	LLMConcurrency      int           `json:"llm_concurrency"`
 	LLMMinInterval      time.Duration `json:"llm_min_interval"`
 	LLMResponseMaxBytes int64         `json:"llm_response_max_bytes"`
+	LLMMaxTokens        int           `json:"llm_max_tokens"`
 	SandboxConcurrency  int           `json:"sandbox_concurrency"`
 
 	// Diff limits
@@ -129,6 +130,8 @@ const (
 	DefaultLLMResponseMaxBytes = 1048576  // 1 MiB
 	MinLLMResponseMaxBytes     = 65536    // 64 KiB
 	MaxLLMResponseMaxBytes     = 16777216 // 16 MiB
+	MinLLMMaxTokens            = 256
+	MaxLLMMaxTokens            = 131072
 	DefaultSandboxConcurrency  = 1
 	MinSandboxConcurrency      = 1
 	MaxSandboxConcurrency      = 16
@@ -538,6 +541,10 @@ func (c *Config) ValidateCapacity() error {
 	}
 	if c.LLMResponseMaxBytes < MinLLMResponseMaxBytes || c.LLMResponseMaxBytes > MaxLLMResponseMaxBytes {
 		return fmt.Errorf("invalid LLMResponseMaxBytes: %d (must be between %d and %d)", c.LLMResponseMaxBytes, MinLLMResponseMaxBytes, MaxLLMResponseMaxBytes)
+	}
+
+	if c.LLMMaxTokens < 0 || (c.LLMMaxTokens > 0 && (c.LLMMaxTokens < MinLLMMaxTokens || c.LLMMaxTokens > MaxLLMMaxTokens)) {
+		return fmt.Errorf("invalid LLMMaxTokens: %d (must be between %d and %d)", c.LLMMaxTokens, MinLLMMaxTokens, MaxLLMMaxTokens)
 	}
 
 	if c.SandboxConcurrency == 0 {
@@ -976,6 +983,13 @@ func Load() *Config {
 		}
 	}
 
+	llmMaxTokens := 0
+	if raw := strings.TrimSpace(os.Getenv("LLM_MAX_TOKENS")); raw != "" {
+		if val, err := strconv.Atoi(raw); err == nil && val > 0 {
+			llmMaxTokens = val
+		}
+	}
+
 	sandboxConcurrency := DefaultSandboxConcurrency
 	if raw := os.Getenv("SANDBOX_CONCURRENCY"); raw != "" {
 		if val, err := strconv.Atoi(raw); err == nil {
@@ -1204,6 +1218,7 @@ func Load() *Config {
 		LLMConcurrency:            llmConcurrency,
 		LLMMinInterval:            llmMinInterval,
 		LLMResponseMaxBytes:       llmResponseMaxBytes,
+		LLMMaxTokens:              llmMaxTokens,
 		SandboxConcurrency:        sandboxConcurrency,
 		DiffMaxBytes:              diffMaxBytes,
 		DiffMaxFiles:              diffMaxFiles,
