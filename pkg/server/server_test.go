@@ -191,6 +191,13 @@ func TestCommentCommandPermissionAndImproveNotice(t *testing.T) {
 					}
 					w.Header().Set("Content-Type", "application/json")
 					_ = json.NewEncoder(w).Encode(map[string]string{"permission": tc.permission})
+				case "/repos/org/repo/pulls/12":
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"number": 12,
+						"head":   map[string]any{"sha": "2222222222222222222222222222222222222222", "ref": "feat"},
+						"base":   map[string]any{"sha": "1111111111111111111111111111111111111111", "ref": "main"},
+					})
 				case "/repos/org/repo/issues/12/comments":
 					var comment struct {
 						Body string `json:"body"`
