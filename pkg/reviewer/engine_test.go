@@ -3,6 +3,7 @@ package reviewer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1261,5 +1262,174 @@ func TestReviewerPromptsHandleConfinementDenied(t *testing.T) {
 	user := buildUserPrompt(&github.PRDetails{Title: "t", Author: "a", BaseRef: "main", HeadRef: "f"}, "", nil, nil, "STATUS", sandbox.StatusConfinementDenied)
 	if !strings.Contains(user, "Confinement Denied") {
 		t.Errorf("user prompt heading must name the denial: %q", user)
+	}
+}
+
+// REV-GATE-02: a review that examined zero code hunks must never be published;
+// executeAgentReview fails closed with ErrZeroCoverage so the job is marked failed.
+func TestReviewPRAtHead_ZeroCoverageGateFailsJob(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	llmCalls := 0
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{{
+				Message: llm.ChatMessage{
+					Role:    "assistant",
+					Content: `{"action": "answer", "score": 33, "summary": "Never read anything.", "findings": [{"file": "main.go", "line": 2, "severity": "CRITICAL", "title": "Fabricated defect", "description": "Hallucinated from filenames."}]}`,
+				},
+				FinishReason: "stop",
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/104"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 104,
+				"title":  "Zero coverage PR",
+				"body":   "Body",
+				"head":   map[string]any{"sha": headSHA, "ref": "feat"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,3 @@\n package main\n+func main() {}\n"))
+		case strings.Contains(r.URL.Path, "/issues/104/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pulls/104/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false,
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 104, headSHA)
+	if err == nil {
+		t.Fatalf("expected zero-coverage failure, got report: %+v", report)
+	}
+	if !errors.Is(err, ErrZeroCoverage) {
+		t.Fatalf("expected error wrapping ErrZeroCoverage, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "LLM_ZERO_COVERAGE") {
+		t.Errorf("expected actionable LLM_ZERO_COVERAGE error, got: %v", err)
+	}
+	if llmCalls == 0 {
+		t.Errorf("expected the agent to have run before the gate rejected publication")
+	}
+}
+
+// REV-GATE-02: binary/mode-only-only PRs have zero examinable hunks and must
+// not be blocked by the zero-coverage gate.
+func TestReviewPRAtHead_NonCodePRBypassesZeroCoverageGate(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{{
+				Message: llm.ChatMessage{
+					Role:    "assistant",
+					Content: `{"action": "answer", "score": 90, "summary": "Only binary and mode changes.", "findings": []}`,
+				},
+				FinishReason: "stop",
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	rawDiff := `diff --git a/logo.png b/logo.png
+new file mode 100644
+Binary files /dev/null and b/logo.png differ
+diff --git a/run.sh b/run.sh
+old mode 100644
+new mode 100755
+`
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/105"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 105,
+				"title":  "Non-code PR",
+				"body":   "Body",
+				"head":   map[string]any{"sha": headSHA, "ref": "feat"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte(rawDiff))
+		case strings.Contains(r.URL.Path, "/issues/105/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pulls/105/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false,
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 105, headSHA)
+	if err != nil {
+		t.Fatalf("non-code PR must not be blocked by the zero-coverage gate, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected a report for a non-code PR")
+	}
+	if report.HeadSHA != headSHA {
+		t.Errorf("expected report head SHA %s, got %s", headSHA, report.HeadSHA)
 	}
 }

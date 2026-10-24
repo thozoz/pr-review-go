@@ -322,3 +322,59 @@ index 123..456 100644
 		t.Fatalf("expected no partial review warning on full coverage, got:\n%s", markdown)
 	}
 }
+
+// REV-GATE-02 defense-in-depth: findings must never render when zero hunks were
+// examined, so fabricated feedback cannot reach the PR discussion.
+func TestReport_ZeroCoverage_SuppressesFabricatedFindings(t *testing.T) {
+	report := &ReviewReport{
+		PRTitle: "Zero Coverage PR",
+		Score:   20,
+		Summary: "Agent answered without reading any code.",
+		Coverage: &CoverageReport{
+			State:         CoverageStatePartial,
+			TotalHunks:    5,
+			ExaminedCount: 0,
+			SkippedCount:  5,
+			SkippedHunks:  []CoverageItem{{ID: "main.go#H1", File: "main.go", Reason: "not examined"}},
+		},
+		Findings: []Finding{
+			{
+				File:        "main.go",
+				Line:        10,
+				Severity:    "CRITICAL",
+				Title:       "Fabricated NullPointer",
+				Description: "Hallucinated defect one.",
+			},
+			{
+				File:        "handler.go",
+				Line:        20,
+				Severity:    "WARNING",
+				Title:       "Invented RaceCondition",
+				Description: "Hallucinated defect two.",
+			},
+		},
+	}
+
+	markdown := FormatReportMarkdown(report)
+
+	if !strings.Contains(markdown, "Zero Review Coverage Warning") {
+		t.Fatalf("expected Zero Review Coverage Warning, got:\n%s", markdown)
+	}
+	if !strings.Contains(markdown, "Findings Suppressed") {
+		t.Fatalf("expected Findings Suppressed notice, got:\n%s", markdown)
+	}
+	if !strings.Contains(markdown, "LLM_ZERO_COVERAGE") {
+		t.Fatalf("expected suppression notice to name LLM_ZERO_COVERAGE, got:\n%s", markdown)
+	}
+	for _, banned := range []string{"Fabricated NullPointer", "Invented RaceCondition", "Hallucinated defect"} {
+		if strings.Contains(markdown, banned) {
+			t.Fatalf("fabricated finding %q must not be rendered, got:\n%s", banned, markdown)
+		}
+	}
+	if strings.Contains(markdown, "<!-- pr-review-go:fingerprint=") {
+		t.Fatalf("suppressed findings must not emit dedup fingerprints, got:\n%s", markdown)
+	}
+	if strings.Contains(markdown, "ready to merge") {
+		t.Fatalf("zero-coverage report must never claim ready to merge, got:\n%s", markdown)
+	}
+}

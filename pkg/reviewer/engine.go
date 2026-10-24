@@ -201,6 +201,14 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 		return nil, err
 	}
 
+	// REV-GATE-02: fail closed when the agent examined zero code hunks, so an
+	// ungrounded review is never published (the job transitions to failed).
+	if ledger != nil {
+		if examinable := ledger.ExaminableCount(); examinable > 0 && ledger.ExaminedCount() == 0 {
+			return nil, fmt.Errorf("%w: examined 0 of %d examinable hunks", ErrZeroCoverage, examinable)
+		}
+	}
+
 	// Deduplicate findings against existing comments
 	var allCommentBodies []string
 	for _, c := range generalComments {
@@ -708,6 +716,13 @@ func FormatReportMarkdown(r *ReviewReport) string {
 
 	cov := r.GetCoverage()
 	isPartial := cov != nil && cov.State == CoverageStatePartial
+	// Defense-in-depth (REV-GATE-02): a report with zero examined hunks can
+	// only carry ungrounded findings, so they are never rendered.
+	zeroCoverage := cov != nil && cov.TotalHunks > 0 && cov.ExaminedCount == 0
+
+	if zeroCoverage {
+		sb.WriteString(fmt.Sprintf("> 🚫 **Zero Review Coverage Warning:** No hunks were examined (0 of %d hunks examined). Findings cannot be verified and are not published.\n\n", cov.TotalHunks))
+	}
 
 	if isPartial {
 		sb.WriteString(fmt.Sprintf("> ⚠️ **Partial Review Warning:** Review coverage is incomplete (%d of %d hunks examined, %d skipped). Unexamined changes have not been verified and are not cleared for merge.\n\n",
@@ -800,7 +815,15 @@ func FormatReportMarkdown(r *ReviewReport) string {
 	}
 
 	hasClassified := r.Classification != nil || len(r.PersistingFindings) > 0 || len(r.FixedFindings) > 0 || len(r.NewFindings) > 0
-	if hasClassified {
+
+	hasUngroundedFindings := len(r.Findings) > 0 || len(r.PersistingFindings) > 0 || len(r.NewFindings) > 0
+	if r.Classification != nil {
+		hasUngroundedFindings = hasUngroundedFindings || len(r.Classification.Persisting) > 0 || len(r.Classification.New) > 0
+	}
+
+	if zeroCoverage && hasUngroundedFindings {
+		sb.WriteString(fmt.Sprintf("### 🎯 Findings\n⚠️ **Findings Suppressed:** The review agent did not examine any modified files (0 of %d hunks examined). Findings are suppressed to prevent fabricated or hallucinated feedback. (LLM_ZERO_COVERAGE)\n\n", cov.TotalHunks))
+	} else if hasClassified {
 		var persisting []PersistingFinding
 		var fixed []FixedFinding
 		var newFindings []Finding

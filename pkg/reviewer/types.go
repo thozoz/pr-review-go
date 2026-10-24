@@ -1,10 +1,16 @@
 package reviewer
 
 import (
+	"errors"
+
 	"github.com/thozoz/pr-review-go/pkg/diff"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
+
+// ErrZeroCoverage is returned when a review would be published although the
+// agent examined zero code hunks. Ungrounded reviews are never published.
+var ErrZeroCoverage = errors.New("LLM_ZERO_COVERAGE: review agent examined 0 hunks; cannot publish ungrounded review")
 
 type Finding struct {
 	File          string `json:"file"`
