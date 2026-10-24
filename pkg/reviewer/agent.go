@@ -450,18 +450,28 @@ func isMutationAction(act string) bool {
 	return false
 }
 
+// parseAgentAction decodes the FIRST JSON object in the model output.
+//
+// Models routinely emit several concatenated action objects in one reply, e.g.
+//
+//	{"action": "read_file", "path": "a.go"}
+//	{"action": "read_file", "path": "b.go"}
+//
+// Slicing from the first '{' to the LAST '}' turns that into invalid JSON, so
+// every such turn was discarded: no file was read, the turn was spent, and the
+// unparsed text was appended back into the history. Decoding with a stream
+// decoder accepts the first complete object and ignores any trailing ones.
 func parseAgentAction(raw string) (*AgentAction, error) {
 	trimmed := strings.TrimSpace(raw)
 	start := strings.Index(trimmed, "{")
-	end := strings.LastIndex(trimmed, "}")
-	if start >= 0 && end > start {
-		trimmed = trimmed[start : end+1]
-	} else {
+	if start < 0 {
 		return nil, fmt.Errorf("no json object found")
 	}
+	trimmed = trimmed[start:]
 
+	dec := json.NewDecoder(strings.NewReader(trimmed))
 	var action AgentAction
-	if err := json.Unmarshal([]byte(trimmed), &action); err != nil {
+	if err := dec.Decode(&action); err != nil {
 		return nil, err
 	}
 	return &action, nil

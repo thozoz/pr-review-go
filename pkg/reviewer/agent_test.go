@@ -969,3 +969,61 @@ func TestAgent_EarlyAnswerPushback_BoundedSinglePush(t *testing.T) {
 		t.Errorf("pushback must be bounded to a single attempt, saw %d", pushbackCount)
 	}
 }
+
+// Models commonly emit several concatenated action objects. Slicing from the
+// first '{' to the last '}' made that invalid JSON, so the turn was silently
+// discarded and no file was ever read (observed live on thozoz/aura-web PR #1).
+func TestParseAgentAction_MultipleConcatenatedObjects(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+		path string
+	}{
+		{
+			name: "two read_file objects",
+			raw:  "{\"action\": \"read_file\", \"path\": \"a.go\"}\n{\"action\": \"read_file\", \"path\": \"b.go\"}",
+			want: "read_file",
+			path: "a.go",
+		},
+		{
+			name: "four objects incl trailing prose",
+			raw:  "Here you go:\n{\"action\": \"read_file\", \"path\": \"x.go\"}\n{\"action\": \"read_file\", \"path\": \"y.go\"}\nDone.",
+			want: "read_file",
+			path: "x.go",
+		},
+		{
+			name: "single object unchanged",
+			raw:  "{\"action\": \"list_files\", \"path\": \".\"}",
+			want: "list_files",
+			path: ".",
+		},
+		{
+			name: "fenced code block",
+			raw:  "```json\n{\"action\": \"answer\", \"score\": 90, \"summary\": \"ok\"}\n```",
+			want: "answer",
+			path: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseAgentAction(tc.raw)
+			if err != nil {
+				t.Fatalf("parseAgentAction() error = %v", err)
+			}
+			if got.Action != tc.want {
+				t.Errorf("Action = %q, want %q", got.Action, tc.want)
+			}
+			if got.Path != tc.path {
+				t.Errorf("Path = %q, want %q", got.Path, tc.path)
+			}
+		})
+	}
+}
+
+// Output with no JSON object at all must still fail loudly.
+func TestParseAgentAction_NoObject(t *testing.T) {
+	if _, err := parseAgentAction("I think this code is fine."); err == nil {
+		t.Fatal("parseAgentAction() error = nil, want an error for JSON-free output")
+	}
+}
