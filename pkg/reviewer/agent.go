@@ -111,6 +111,16 @@ func (a *ReviewerAgent) Run(
 	var finalOutput *LLMReviewOutput
 	budgetExhausted := false
 
+	// REV-READ-01: an answer that lands before any modified file has been served
+	// is rejected once, so the model cannot report on code it never read.
+	hasExaminableChanges := tools != nil && ledger != nil && ledger.ExaminableCount() > 0
+	earlyAnswerPushes := 0
+	earlyAnswerPushback := func() {
+		earlyAnswerPushes++
+		example := firstExaminableFile(inv)
+		history += fmt.Sprintf("\nAction rejected: cannot conclude review via action='answer' without reading any modified files. You must inspect the modified files using action='read_file' first (e.g. read %s). Do not fabricate findings without examining code.\nNext action:", example)
+	}
+
 	for turn := 0; turn < maxTurns; turn++ {
 		select {
 		case <-ctx.Done():
@@ -131,6 +141,11 @@ func (a *ReviewerAgent) Run(
 		if parseErr != nil {
 			// Plain text or unparseable: check if extractJSONOutput can parse a final review
 			if out, err := extractJSONOutput(rawResponse); err == nil {
+				if hasExaminableChanges && len(filesServed) == 0 && earlyAnswerPushes < 1 {
+					history += fmt.Sprintf("\nAssistant: %s", rawResponse)
+					earlyAnswerPushback()
+					continue
+				}
 				finalOutput = out
 				break
 			}
@@ -140,6 +155,10 @@ func (a *ReviewerAgent) Run(
 
 		// Check if action is answer
 		if action.Action == "answer" || (action.Action == "" && (action.Score != nil || len(action.Findings) > 0 || action.Summary != "")) {
+			if hasExaminableChanges && len(filesServed) == 0 && earlyAnswerPushes < 1 {
+				earlyAnswerPushback()
+				continue
+			}
 			if action.Review != nil {
 				finalOutput = action.Review
 			} else if action.Score != nil || len(action.Findings) > 0 || action.Summary != "" {
@@ -321,7 +340,7 @@ AVAILABLE ACTIONS:
    Format: {"action": "list_files", "path": "."}
 3. "search_files": Search for a text pattern in files across the snapshot.
    Format: {"action": "search_files", "query": "text"}
-4. "answer": Conclude your review with score, summary, and findings.
+4. "answer": Conclude your review with score, summary, and findings. Only deliver your answer after reading the modified files with action='read_file'.
    Format: {"action": "answer", "score": 85, "summary": "...", "findings": [...]}
 
 RULES & RESTRICTIONS:
@@ -398,8 +417,23 @@ func (a *ReviewerAgent) buildAgentInitialUserPrompt(
 	}
 	b.WriteString("\n")
 
-	b.WriteString("Begin exploring by reading the modified files with action='read_file', or deliver your review via action='answer'.\n")
+	b.WriteString("Begin exploring by reading the modified files with action='read_file'. You must examine the modified code before concluding your review with action='answer'.\n")
 	return b.String()
+}
+
+// firstExaminableFile returns the path of the first file in the inventory that
+// holds real code hunks (non-binary, non-deleted, non-mode-only), or "" if none.
+func firstExaminableFile(inv *diff.ChangeInventory) string {
+	if inv == nil {
+		return ""
+	}
+	for _, f := range inv.Files {
+		if f == nil || f.IsBinary || f.IsDeleted || f.IsModeOnly || len(f.Hunks) == 0 {
+			continue
+		}
+		return f.Path
+	}
+	return ""
 }
 
 func isMutationAction(act string) bool {

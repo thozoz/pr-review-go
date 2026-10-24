@@ -794,3 +794,178 @@ func TestConfinement_ConcurrentLoopsIsolated(t *testing.T) {
 		t.Fatalf("concurrent loop isolation failed with %d errors", count)
 	}
 }
+
+// REV-READ-01: an early "answer" before any modified file was served must be
+// rejected once, and the model is pushed to read the changed file first.
+func TestAgent_EarlyAnswerPushback_RequiresReadFile(t *testing.T) {
+	snapDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(snapDir, "a.go"), []byte("package main\n\nfunc A() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	const testSHA = "dddddddddddddddddddddddddddddddddddddddd"
+	snap := &sandbox.Snapshot{CommitSHA: testSHA, SourceDir: snapDir}
+	if err := snap.Validate(); err != nil {
+		t.Fatalf("snapshot validate failed: %v", err)
+	}
+
+	rawDiff := `diff --git a/a.go b/a.go
+--- a/a.go
++++ b/a.go
+@@ -1,2 +1,3 @@
+ package main
++func A() {}
+`
+	inv := diff.Parse(rawDiff, diff.DefaultParseOptions())
+	ledger := diff.NewCoverageLedger(inv)
+
+	var step int32
+	var mu sync.Mutex
+	var userPrompts []string
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		for _, msg := range req.Messages {
+			if msg.Role == "user" {
+				userPrompts = append(userPrompts, msg.Content)
+			}
+		}
+		mu.Unlock()
+
+		curStep := atomic.AddInt32(&step, 1)
+		var respContent string
+		switch curStep {
+		case 1:
+			// Fabricated answer on turn 1, before reading anything.
+			respContent = `{"action": "answer", "score": 42, "summary": "Fabricated review.", "findings": [{"file": "a.go", "line": 2, "severity": "CRITICAL", "title": "Invented bug", "description": "Never saw the code."}]}`
+		case 2:
+			respContent = `{"action": "read_file", "path": "a.go"}`
+		default:
+			respContent = `{"action": "answer", "score": 88, "summary": "Reviewed after reading a.go.", "findings": []}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{{
+				Message:      llm.ChatMessage{Role: "assistant", Content: respContent},
+				FinishReason: "stop",
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	cfg := &config.Config{AgentMaxTurns: 10}
+	agent := NewReviewerAgent(cfg, llm.NewClient(llmServer.URL, "key", "model"))
+	pr := &github.PRDetails{Title: "Early answer", HeadSHA: testSHA}
+
+	res, err := agent.Run(context.Background(), pr, inv, ledger, snap, "skipped", sandbox.StatusUnavailable, nil, nil)
+	if err != nil {
+		t.Fatalf("agent.Run failed: %v", err)
+	}
+
+	if len(res.FilesServed) != 1 || res.FilesServed[0] != "a.go" {
+		t.Fatalf("expected a.go to be served after pushback, got %v", res.FilesServed)
+	}
+	if !ledger.IsExamined("a.go#H1") {
+		t.Errorf("a.go#H1 should be examined after the model read it")
+	}
+	if res.Output == nil || res.Output.Score != 88 {
+		t.Fatalf("expected the post-read answer (score 88), got %+v", res.Output)
+	}
+	if res.TurnsUsed != 3 {
+		t.Errorf("expected 3 turns (rejected answer, read, answer), got %d", res.TurnsUsed)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(userPrompts) < 2 {
+		t.Fatalf("expected at least 2 user prompts, got %d", len(userPrompts))
+	}
+	if !strings.Contains(userPrompts[1], "Action rejected") {
+		t.Errorf("expected pushback message in second prompt, got:\n%s", userPrompts[1])
+	}
+	if !strings.Contains(userPrompts[1], "action='read_file'") || !strings.Contains(userPrompts[1], "a.go") {
+		t.Errorf("pushback must name read_file and the changed file, got:\n%s", userPrompts[1])
+	}
+}
+
+// REV-READ-01: pushback is bounded to one attempt, so an insistent model cannot
+// loop, and the turn budget is still respected.
+func TestAgent_EarlyAnswerPushback_BoundedSinglePush(t *testing.T) {
+	snapDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(snapDir, "a.go"), []byte("package main\n\nfunc A() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	const testSHA = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	snap := &sandbox.Snapshot{CommitSHA: testSHA, SourceDir: snapDir}
+
+	rawDiff := `diff --git a/a.go b/a.go
+--- a/a.go
++++ b/a.go
+@@ -1,2 +1,3 @@
+ package main
++func A() {}
+`
+	inv := diff.Parse(rawDiff, diff.DefaultParseOptions())
+	ledger := diff.NewCoverageLedger(inv)
+
+	var step int32
+	var mu sync.Mutex
+	pushbackCount := 0
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		for _, msg := range req.Messages {
+			if msg.Role == "user" && strings.Contains(msg.Content, "Action rejected") {
+				pushbackCount++
+				break
+			}
+		}
+		mu.Unlock()
+		atomic.AddInt32(&step, 1)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{{
+				Message:      llm.ChatMessage{Role: "assistant", Content: `{"action": "answer", "score": 50, "summary": "Insisting.", "findings": []}`},
+				FinishReason: "stop",
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	cfg := &config.Config{AgentMaxTurns: 5}
+	agent := NewReviewerAgent(cfg, llm.NewClient(llmServer.URL, "key", "model"))
+	pr := &github.PRDetails{Title: "Insistent answer", HeadSHA: testSHA}
+
+	res, err := agent.Run(context.Background(), pr, inv, ledger, snap, "skipped", sandbox.StatusUnavailable, nil, nil)
+	if err != nil {
+		t.Fatalf("agent.Run failed: %v", err)
+	}
+
+	if res.TurnsUsed != 2 {
+		t.Errorf("expected exactly 2 turns (one pushback then acceptance), got %d", res.TurnsUsed)
+	}
+	if len(res.FilesServed) != 0 {
+		t.Errorf("expected no files served, got %v", res.FilesServed)
+	}
+	if res.Output == nil {
+		t.Fatalf("expected the second answer to be accepted")
+	}
+	if calls := atomic.LoadInt32(&step); calls != 2 {
+		t.Errorf("expected exactly 2 LLM calls, got %d", calls)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if pushbackCount != 1 {
+		t.Errorf("pushback must be bounded to a single attempt, saw %d", pushbackCount)
+	}
+}
