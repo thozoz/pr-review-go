@@ -155,26 +155,69 @@ func TestChatCompletionEmptyContentWithoutReasoning(t *testing.T) {
 	}
 }
 
-func TestChatCompletionEmptyContentWithReasoningButStopDoesNotRetry(t *testing.T) {
+// A provider that reports reasoning-token exhaustion as finish_reason="stop"
+// (observed live: evren/deepseek-v4.1-flash) must still get the recovery retry;
+// gating the retry on finish_reason="length" alone left these completions with
+// no retry at all.
+func TestChatCompletionEmptyContentWithReasoningRetriesForAnyFinishReason(t *testing.T) {
 	var attempts int32
 	var requests []chatRequestBody
-	ts := newReasoningServer(t, &attempts, &requests, func(_ int32, w http.ResponseWriter) {
-		writeChatResponse(w, nil, "stop", "Deliberation finished, no answer")
+	ts := newReasoningServer(t, &attempts, &requests, func(attempt int32, w http.ResponseWriter) {
+		if attempt == 1 {
+			writeChatResponse(w, nil, "stop", "Deliberation finished, no answer")
+			return
+		}
+		writeChatResponse(w, "Recovered answer", "stop", "Thought process")
 	})
 	defer ts.Close()
 
 	client := NewClient(ts.URL, "key", "reasoning-model")
+	client.SetMaxTokens(4096)
+
+	got, err := client.ChatCompletion(context.Background(), "system", "user")
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v, want the recovery retry to succeed", err)
+	}
+	if got != "Recovered answer" {
+		t.Fatalf("ChatCompletion() = %q, want %q", got, "Recovered answer")
+	}
+	if attempts != 2 {
+		t.Fatalf("provider attempts = %d, want 2 (reasoning recovery retry)", attempts)
+	}
+	if requests[1].MaxTokens == nil || *requests[1].MaxTokens != 8192 {
+		t.Fatalf("retry request max_tokens = %v, want doubled 8192", requests[1].MaxTokens)
+	}
+}
+
+// Reasoning present but the retry also returns nothing publishable: the typed
+// error must report the retry so operators know the budget was already doubled.
+func TestChatCompletionReasoningExhaustedAfterRetryTyped(t *testing.T) {
+	var attempts int32
+	var requests []chatRequestBody
+	ts := newReasoningServer(t, &attempts, &requests, func(_ int32, w http.ResponseWriter) {
+		writeChatResponse(w, nil, "stop", "Still deliberating")
+	})
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "key", "reasoning-model")
+	client.SetMaxTokens(4096)
 
 	_, err := client.ChatCompletion(context.Background(), "system", "user")
 	var emptyErr *EmptyAssistantContentError
 	if !errors.As(err, &emptyErr) {
 		t.Fatalf("errors.As(*EmptyAssistantContentError) = false; err = %v", err)
 	}
+	if !emptyErr.Retried {
+		t.Error("Retried = false, want true")
+	}
 	if !emptyErr.HasReasoning {
 		t.Error("HasReasoning = false, want true")
 	}
-	if attempts != 1 {
-		t.Fatalf("provider attempts = %d, want 1 (retry requires finish_reason=length)", attempts)
+	if emptyErr.MaxTokensAttempted != 8192 {
+		t.Errorf("MaxTokensAttempted = %d, want 8192", emptyErr.MaxTokensAttempted)
+	}
+	if attempts != 2 {
+		t.Fatalf("provider attempts = %d, want 2 (exactly one retry)", attempts)
 	}
 }
 

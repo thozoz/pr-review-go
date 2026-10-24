@@ -430,9 +430,12 @@ type completionResult struct {
 
 // completeWithRecovery applies the empty-content recovery policy:
 //   - non-empty content is returned as-is; reasoning_content is never returned;
-//   - empty content with finish_reason "length" and reasoning present means the
-//     token budget was consumed while thinking, so exactly one retry is made
-//     with a doubled budget (capped at MaxLLMMaxTokens);
+//   - empty content with a non-empty reasoning scratchpad means the token budget
+//     was consumed while thinking, so exactly one retry is made with a doubled
+//     budget (capped at MaxLLMMaxTokens). The provider's finish_reason is not
+//     reliable here: reasoning exhaustion is reported as "length" by some
+//     backends and as "stop" by others, and gating on "length" alone left
+//     finish_reason=stop reasoning-only completions failing with no retry;
 //   - any remaining empty content fails with a typed, actionable error.
 func (c *Client) completeWithRecovery(ctx context.Context, model, systemPrompt, userPrompt string, maxBytes int64) (string, error) {
 	baseTokens := c.maxTokens
@@ -449,7 +452,7 @@ func (c *Client) completeWithRecovery(ctx context.Context, model, systemPrompt, 
 		return result.Content, nil
 	}
 
-	if result.FinishReason == "length" && result.HasReasoning && effectiveTokens < MaxLLMMaxTokens {
+	if result.HasReasoning && effectiveTokens < MaxLLMMaxTokens {
 		retryTokens := effectiveTokens * 2
 		if retryTokens > MaxLLMMaxTokens {
 			retryTokens = MaxLLMMaxTokens
