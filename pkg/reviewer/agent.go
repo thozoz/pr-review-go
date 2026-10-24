@@ -134,7 +134,11 @@ func (a *ReviewerAgent) Run(
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, fmt.Errorf("llm call failed: %w", err)
+			// Report where the loop was when the provider gave up: turn number,
+			// history size and how many files had been served make a bare
+			// "empty assistant response content" diagnosable from the job row.
+			return nil, fmt.Errorf("llm call failed (turn %d/%d, history %d bytes, %d files served): %w",
+				turnsUsed, maxTurns, len(history), len(filesServed), err)
 		}
 
 		action, parseErr := parseAgentAction(rawResponse)
