@@ -54,11 +54,17 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 	var timeout time.Duration
 	switch job.Kind {
 	case "review":
-		timeout = 10 * time.Minute
+		// A gated review runs snapshot preparation plus sandbox verification,
+		// then a multi-turn read-only agent loop whose turns can each take tens
+		// of seconds on a reasoning model. 10 minutes left no headroom for the
+		// empty-completion fallback path, so jobs died with "context deadline
+		// exceeded" while still making progress (observed live on
+		// thozoz/aura-web PR #1).
+		timeout = 20 * time.Minute
 	case "edit":
 		// Edit jobs hold the per-PR slot for the whole gated pipeline
-		// (snapshot, LLM edit loop, verify, push); 10 minutes matches review.
-		timeout = 10 * time.Minute
+		// (snapshot, LLM edit loop, verify, push); matches review.
+		timeout = 20 * time.Minute
 	case "labels", "summary", "improve":
 		timeout = 2 * time.Minute
 	case "describe", "changelog", "docs", "approve", "request_changes":

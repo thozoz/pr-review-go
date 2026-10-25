@@ -22,8 +22,10 @@ var (
 )
 
 // maxEmptyResponseRetries bounds how many times a single turn is re-requested
-// after the provider returned no usable completion at all.
-const maxEmptyResponseRetries = 3
+// after the provider returned no usable completion at all. The LLM client has
+// already tried the other models in LLM_FALLBACK_MODELS by this point, so one
+// extra attempt is enough; more just burns the job's wall-clock budget.
+const maxEmptyResponseRetries = 1
 
 // AgentAction represents a single JSON tool or answer request from the model.
 type AgentAction struct {
