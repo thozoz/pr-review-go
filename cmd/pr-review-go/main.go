@@ -248,7 +248,7 @@ func main() {
 	}
 
 	fmt.Printf("🚀 Starting review for %s/%s #%d...\n", owner, repo, num)
-	fmt.Printf("📦 Workspace analysis: %v | Project build/test verification: disabled | Model: %s\n", cfg.EnableSandbox, cfg.LLMModel)
+	fmt.Printf("📦 Workspace analysis and sandbox verification enabled: %v | Model: %s\n", cfg.EnableSandbox, cfg.LLMModel)
 
 	engine := reviewer.NewEngine(cfg)
 
