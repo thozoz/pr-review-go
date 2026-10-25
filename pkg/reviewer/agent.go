@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 
@@ -19,6 +20,10 @@ var (
 	// ErrModelViolationsExceeded indicates the model requested too many forbidden mutation actions.
 	ErrModelViolationsExceeded = errors.New("model exceeded mutation violation limit")
 )
+
+// maxEmptyResponseRetries bounds how many times a single turn is re-requested
+// after the provider returned no usable completion at all.
+const maxEmptyResponseRetries = 3
 
 // AgentAction represents a single JSON tool or answer request from the model.
 type AgentAction struct {
@@ -115,6 +120,10 @@ func (a *ReviewerAgent) Run(
 	// is rejected once, so the model cannot report on code it never read.
 	hasExaminableChanges := tools != nil && ledger != nil && ledger.ExaminableCount() > 0
 	earlyAnswerPushes := 0
+	// An empty completion is a provider fault; retry the same turn a couple of
+	// times before failing the job, so a flaky backend does not discard a review
+	// that was already half-explored.
+	emptyResponseRetries := 0
 	earlyAnswerPushback := func() {
 		earlyAnswerPushes++
 		example := firstExaminableFile(inv)
@@ -133,6 +142,17 @@ func (a *ReviewerAgent) Run(
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 				return nil, ctx.Err()
+			}
+			// A provider that returns an empty completion is a transient provider
+			// fault, not a review verdict. The LLM client already retried with a
+			// doubled budget, so retry here at the loop level without spending a
+			// turn: the model never got to act, so nothing was learned or lost.
+			if errors.Is(err, llm.ErrEmptyAssistantContent) && emptyResponseRetries < maxEmptyResponseRetries {
+				emptyResponseRetries++
+				log.Printf("[reviewer] empty completion on turn %d (attempt %d/%d, history %d bytes); retrying the same turn",
+					turnsUsed, emptyResponseRetries, maxEmptyResponseRetries, len(history))
+				turnsUsed--
+				continue
 			}
 			// Report where the loop was when the provider gave up: turn number,
 			// history size and how many files had been served make a bare

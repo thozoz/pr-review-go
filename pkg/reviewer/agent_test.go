@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/thozoz/pr-review-go/pkg/diff"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
+	"github.com/thozoz/pr-review-go/pkg/retry"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
 
@@ -1025,5 +1027,63 @@ func TestParseAgentAction_MultipleConcatenatedObjects(t *testing.T) {
 func TestParseAgentAction_NoObject(t *testing.T) {
 	if _, err := parseAgentAction("I think this code is fine."); err == nil {
 		t.Fatal("parseAgentAction() error = nil, want an error for JSON-free output")
+	}
+}
+
+// A provider that returns an empty completion must not burn a review turn or
+// fail the job outright: the same turn is re-requested, bounded by
+// maxEmptyResponseRetries. Observed live (thozoz/aura-web PR #1) where a single
+// empty response at turn 2 discarded an already-explored review.
+func TestAgent_EmptyCompletionRetriesSameTurn(t *testing.T) {
+	const filePath = "internal/site/search.go"
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "internal", "site"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, filePath), []byte("package site\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			// Provider returns no content at all.
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}`))
+		case 2:
+			_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`,
+				`{"action": "read_file", "path": "`+filePath+`"}`)
+		default:
+			_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`,
+				`{"action": "answer", "score": 90, "summary": "grounded review", "findings": []}`)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{AgentMaxTurns: 6}
+	llmClient := llm.NewClient(srv.URL, "key", "model")
+	llmClient.SetRetryPolicy(retry.Policy{MaxAttempts: 1, BaseDelay: time.Millisecond})
+
+	ledger := diff.NewCoverageLedger(&diff.ChangeInventory{
+		Files: []*diff.FileDiff{{Path: filePath, Hunks: []*diff.Hunk{{NewStart: 1, NewCount: 3}}}},
+	})
+	agent := NewReviewerAgent(cfg, llmClient)
+	res, err := agent.Run(context.Background(), &github.PRDetails{
+		Owner: "o", Repo: "r", Number: 1, HeadSHA: strings.Repeat("a", 40),
+	}, &diff.ChangeInventory{Files: []*diff.FileDiff{{Path: filePath, Hunks: []*diff.Hunk{{NewStart: 1, NewCount: 3}}}}},
+		ledger, &sandbox.Snapshot{SourceDir: dir, CommitSHA: strings.Repeat("a", 40)}, "", sandbox.StatusUnavailable, nil, nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want the empty completion to be retried", err)
+	}
+	if res == nil || res.Output == nil {
+		t.Fatal("Run() returned no review output")
+	}
+	if atomic.LoadInt32(&calls) != 3 {
+		t.Fatalf("provider calls = %d, want 3 (empty, read_file, answer)", calls)
+	}
+	if len(res.FilesServed) != 1 {
+		t.Fatalf("FilesServed = %v, want the one examined file", res.FilesServed)
 	}
 }
