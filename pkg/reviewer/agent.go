@@ -715,6 +715,13 @@ func parseXMLAgentActions(raw string) []*AgentAction {
 			action.Query = firstNonEmpty(params["query"], params["pattern"], params["text"], params["term"])
 			action.Pattern = action.Query
 		case "answer":
+			// XML/DSML answers carry the same JSON findings array as JSON
+			// answers. Never turn supplied evidence into an empty review.
+			if findings, ok := params["findings"]; ok {
+				if err := json.Unmarshal([]byte(findings), &action.Findings); err != nil {
+					continue
+				}
+			}
 			action.Summary = params["summary"]
 			if score := params["score"]; score != "" {
 				if n, err := strconv.Atoi(score); err == nil {

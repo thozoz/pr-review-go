@@ -1319,6 +1319,33 @@ func TestParseAgentActions_MultipleInOrder(t *testing.T) {
 	}
 }
 
+// Alternate wire formats must preserve the same finding evidence as JSON.
+func TestParseAgentAction_XMLAnswerPreservesFindings(t *testing.T) {
+	raw := `<invoke name="answer"><parameter name="summary">One independently supported defect.</parameter><parameter name="score">40</parameter><parameter name="findings">[{"file":"a.go","line":3,"severity":"high","title":"Unsafe input","description":"Untrusted input reaches the output."}]</parameter></invoke>`
+	got, err := parseAgentAction(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Findings) != 1 || got.Findings[0].File != "a.go" || got.Findings[0].Line != 3 || got.Findings[0].Title != "Unsafe input" {
+		t.Fatalf("XML answer lost finding evidence: %+v", got)
+	}
+	prefix := "｜" + "DSML" + "｜ "
+	dsml := strings.NewReplacer("<invoke", "<"+prefix+"invoke", "</invoke", "</"+prefix+"invoke", "<parameter", "<"+prefix+"parameter", "</parameter", "</"+prefix+"parameter").Replace(raw)
+	if parsed, err := parseAgentAction(dsml); err != nil || len(parsed.Findings) != 1 || parsed.Findings[0].Title != got.Findings[0].Title {
+		t.Fatalf("DSML must preserve finding evidence too: action=%+v error=%v", parsed, err)
+	}
+	bad := strings.Replace(raw, `[{"file":"a.go","line":3,"severity":"high","title":"Unsafe input","description":"Untrusted input reaches the output."}]`, `not-json`, 1)
+	if _, err := parseAgentAction(bad); err == nil {
+		t.Fatal("malformed XML findings must not silently become an empty review")
+	}
+	res, _, _ := runAgentReplies(t, map[string]string{"a.go": "package p\n"}, nil, []string{
+		`{"action":"read_file","path":"a.go"}`, raw,
+	})
+	if res.TurnsUsed != 2 || len(res.Output.Findings) != 1 || res.Output.Findings[0].Description != got.Findings[0].Description {
+		t.Fatalf("Run must preserve XML finding evidence without extra calls: %+v", res)
+	}
+}
+
 // JSON batches must keep collecting every object, not just the first.
 func TestParseAgentActions_JSONMultipleInOrder(t *testing.T) {
 	actions, err := parseAgentActions(`{"action":"read_file","path":"a.go"}{"action":"read_file","path":"b.go"}`)
