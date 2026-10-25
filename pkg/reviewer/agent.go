@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,6 +22,11 @@ var (
 	// ErrModelViolationsExceeded indicates the model requested too many forbidden mutation actions.
 	ErrModelViolationsExceeded = errors.New("model exceeded mutation violation limit")
 )
+
+// logVerboseTurns reports whether full per-turn replies should be logged.
+func logVerboseTurns() bool {
+	return strings.TrimSpace(os.Getenv("REVIEWER_VERBOSE_TURNS")) == "1"
+}
 
 // maxEarlyAnswerPushes bounds how many times a model may try to conclude before
 // it has read any modified file. Live PR #2 needed more than one nudge: the model
@@ -173,6 +179,9 @@ func (a *ReviewerAgent) Run(
 		}
 
 		log.Printf("[reviewer] turn %d/%d done in %s (%d response bytes)", turnsUsed, maxTurns, time.Since(turnStarted).Round(time.Second), len(rawResponse))
+		if logVerboseTurns() {
+			log.Printf("[reviewer] turn %d/%d reply: %.200s", turnsUsed, maxTurns, strings.ReplaceAll(rawResponse, "\n", " "))
+		}
 
 		action, parseErr := parseAgentAction(rawResponse)
 		if parseErr != nil {
