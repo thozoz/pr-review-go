@@ -203,7 +203,12 @@ func NewClient(baseURL, apiKey, model string) *Client {
 		apiKey:  apiKey,
 		model:   model,
 		httpClient: &http.Client{
-			Timeout: 5 * time.Minute,
+			// A single provider round trip. 5 minutes meant one stalled model
+			// could consume a quarter of a review job's budget before the
+			// fallback chain even started (observed live: a reasoning model
+			// thinking for 7.5 minutes on one turn). LLM_REQUEST_TIMEOUT
+			// overrides this for genuinely long-running backends.
+			Timeout: requestTimeoutFromEnv(),
 		},
 		maxResponseBytes: DefaultLLMResponseMaxBytes,
 		maxTokens:        maxTokensFromEnv(),
@@ -211,6 +216,25 @@ func NewClient(baseURL, apiKey, model string) *Client {
 	}
 	client.SetFallbackModels(strings.Split(os.Getenv("LLM_FALLBACK_MODELS"), ","))
 	return client
+}
+
+// DefaultLLMRequestTimeout bounds one provider round trip when LLM_REQUEST_TIMEOUT
+// is unset. Long enough for a slow reasoning turn, short enough that a stalled
+// backend cannot consume a whole job.
+const DefaultLLMRequestTimeout = 2 * time.Minute
+
+// requestTimeoutFromEnv returns the LLM_REQUEST_TIMEOUT duration (seconds), or
+// DefaultLLMRequestTimeout when unset or unparseable.
+func requestTimeoutFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("LLM_REQUEST_TIMEOUT"))
+	if raw == "" {
+		return DefaultLLMRequestTimeout
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs <= 0 {
+		return DefaultLLMRequestTimeout
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // maxTokensFromEnv returns the LLM_MAX_TOKENS request budget, or 0 when the
@@ -441,10 +465,14 @@ type completionResult struct {
 //   - non-empty content is returned as-is; reasoning_content is never returned;
 //   - empty content with a non-empty reasoning scratchpad means the token budget
 //     was consumed while thinking, so exactly one retry is made with a doubled
-//     budget (capped at MaxLLMMaxTokens). The provider's finish_reason is not
-//     reliable here: reasoning exhaustion is reported as "length" by some
-//     backends and as "stop" by others, and gating on "length" alone left
-//     finish_reason=stop reasoning-only completions failing with no retry;
+//     budget (capped at MaxLLMMaxTokens). This is the genuine truncation signal:
+//     the model wanted more room and a doubled budget usually lets it finish;
+//   - empty content with reasoning whose finish_reason is NOT "length" means the
+//     backend simply chose to emit nothing. Doubling the budget there is actively
+//     harmful — the model just thinks longer (measured: 7.5 minutes at 32768 for
+//     a prompt that answered in 3 seconds at 16384), which burned the whole job
+//     deadline. That case fails fast so ChatCompletion can move on to the next
+//     model in LLM_FALLBACK_MODELS;
 //   - any remaining empty content fails with a typed, actionable error.
 func (c *Client) completeWithRecovery(ctx context.Context, model, systemPrompt, userPrompt string, maxBytes int64) (string, error) {
 	baseTokens := c.maxTokens
@@ -461,7 +489,7 @@ func (c *Client) completeWithRecovery(ctx context.Context, model, systemPrompt, 
 		return result.Content, nil
 	}
 
-	if result.HasReasoning && effectiveTokens < MaxLLMMaxTokens {
+	if result.HasReasoning && result.FinishReason == "length" && effectiveTokens < MaxLLMMaxTokens {
 		retryTokens := effectiveTokens * 2
 		if retryTokens > MaxLLMMaxTokens {
 			retryTokens = MaxLLMMaxTokens
