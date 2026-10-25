@@ -492,6 +492,9 @@ func TestPromptAndReportFormattingForAllVerificationStatuses(t *testing.T) {
 				"Concurrency & State", "race conditions",
 				"Logic & Reliability", "API & Contract", "performance regressions",
 				"One severe finding does not end the review",
+				"trace untrusted data through its transformations to the consuming operation",
+				"verify validation or escaping for that operation's context",
+				"rather than assuming one protection makes neighboring paths safe",
 				"Focus strictly on real defects",
 			} {
 				if !strings.Contains(sysPrompt, want) {

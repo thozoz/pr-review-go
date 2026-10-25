@@ -429,7 +429,8 @@ const reviewChecklistRule = `- Consider each applicable category across the chan
   2. Concurrency & State: race conditions, deadlocks, atomicity, goroutine lifecycle, synchronization.
   3. Logic & Reliability: nil dereferences, off-by-one errors, resource/connection leaks, unhandled errors.
   4. API & Contract: breaking changes, schema mismatches, parameter validation, performance regressions.
-- One severe finding does not end the review: check the remaining applicable categories before answering.`
+- One severe finding does not end the review: check the remaining applicable categories before answering.
+- For each changed input/output path, trace untrusted data through its transformations to the consuming operation; verify validation or escaping for that operation's context rather than assuming one protection makes neighboring paths safe.`
 
 // withReviewChecklist injects the shared checklist right after the CRITICAL
 // RULES heading so every verification status gets it without duplicating text.
