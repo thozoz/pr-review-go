@@ -23,6 +23,23 @@ import (
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
 
+func TestAgent_HTTPTimeoutReturnsError(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+	client := llm.NewClient(srv.URL, "key", "model")
+	client.SetTimeout(10 * time.Millisecond)
+	client.SetRetryPolicy(retry.Policy{MaxAttempts: 1})
+	a := NewReviewerAgent(&config.Config{AgentMaxTurns: 1}, client)
+	result, err := a.Run(context.Background(), &github.PRDetails{Title: "timeout"}, nil, nil, nil, "", sandbox.StatusUnavailable, nil, nil)
+	if err == nil || result != nil {
+		t.Fatalf("provider timeout must return an error, not a nil successful result: result=%+v error=%v", result, err)
+	}
+}
+
 func TestAgentPrompts_IndependentConcernCategories(t *testing.T) {
 	a := &ReviewerAgent{}
 	for _, status := range []sandbox.VerificationStatus{sandbox.StatusPassed, sandbox.StatusTestFailed, sandbox.StatusUnavailable} {

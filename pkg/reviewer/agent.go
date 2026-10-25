@@ -170,7 +170,7 @@ func (a *ReviewerAgent) Run(
 		log.Printf("[reviewer] turn %d/%d start (history %d bytes, %d files served)", turnsUsed, maxTurns, len(history), len(filesServed))
 		rawResponse, err := a.llm.ChatCompletion(ctx, systemPrompt, history)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
 			// A provider that returns an empty completion is a transient provider
