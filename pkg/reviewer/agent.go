@@ -22,6 +22,12 @@ var (
 	ErrModelViolationsExceeded = errors.New("model exceeded mutation violation limit")
 )
 
+// maxEarlyAnswerPushes bounds how many times a model may try to conclude before
+// it has read any modified file. Live PR #2 needed more than one nudge: the model
+// answered on turn 1, was pushed back, and answered again without reading, so a
+// single pushback let it burn the whole turn budget on nothing.
+const maxEarlyAnswerPushes = 3
+
 // maxEmptyResponseRetries bounds how many times a single turn is re-requested
 // after the provider returned no usable completion at all. The LLM client has
 // already tried the other models in LLM_FALLBACK_MODELS by this point, so one
@@ -172,7 +178,7 @@ func (a *ReviewerAgent) Run(
 		if parseErr != nil {
 			// Plain text or unparseable: check if extractJSONOutput can parse a final review
 			if out, err := extractJSONOutput(rawResponse); err == nil {
-				if hasExaminableChanges && len(filesServed) == 0 && earlyAnswerPushes < 1 {
+				if hasExaminableChanges && len(filesServed) == 0 && earlyAnswerPushes < maxEarlyAnswerPushes {
 					history += fmt.Sprintf("\nAssistant: %s", rawResponse)
 					earlyAnswerPushback()
 					continue
@@ -186,7 +192,7 @@ func (a *ReviewerAgent) Run(
 
 		// Check if action is answer
 		if action.Action == "answer" || (action.Action == "" && (action.Score != nil || len(action.Findings) > 0 || action.Summary != "")) {
-			if hasExaminableChanges && len(filesServed) == 0 && earlyAnswerPushes < 1 {
+			if hasExaminableChanges && len(filesServed) == 0 && earlyAnswerPushes < maxEarlyAnswerPushes {
 				earlyAnswerPushback()
 				continue
 			}
@@ -448,7 +454,14 @@ func (a *ReviewerAgent) buildAgentInitialUserPrompt(
 	}
 	b.WriteString("\n")
 
-	b.WriteString("Begin exploring by reading the modified files with action='read_file'. You must examine the modified code before concluding your review with action='answer'.\n")
+	// The change map above is deliberately metadata only: file paths and hunk
+	// headers, never code. State that plainly, because a model shown a short
+	// change map otherwise concludes it has enough to review and answers on turn
+	// one (observed live on thozoz/aura-web PR #2: twelve turns, zero files
+	// read, so the zero-coverage gate correctly refused to publish anything).
+	b.WriteString("IMPORTANT: this change map contains NO source code — only file paths and hunk headers.\n")
+	b.WriteString("You cannot review anything from it. Your FIRST action must be action='read_file' on a modified file.\n")
+	b.WriteString("Read every modified non-test source file before you conclude, then answer with action='answer'.\n")
 	return b.String()
 }
 

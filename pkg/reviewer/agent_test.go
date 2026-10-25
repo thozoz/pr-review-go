@@ -952,8 +952,10 @@ func TestAgent_EarlyAnswerPushback_BoundedSinglePush(t *testing.T) {
 		t.Fatalf("agent.Run failed: %v", err)
 	}
 
-	if res.TurnsUsed != 2 {
-		t.Errorf("expected exactly 2 turns (one pushback then acceptance), got %d", res.TurnsUsed)
+	// The model insists maxEarlyAnswerPushes times, then its answer is accepted
+	// (the engine's zero-coverage gate is what refuses to publish in that case).
+	if res.TurnsUsed != maxEarlyAnswerPushes+1 {
+		t.Errorf("expected %d turns (%d pushbacks then acceptance), got %d", maxEarlyAnswerPushes+1, maxEarlyAnswerPushes, res.TurnsUsed)
 	}
 	if len(res.FilesServed) != 0 {
 		t.Errorf("expected no files served, got %v", res.FilesServed)
@@ -961,14 +963,14 @@ func TestAgent_EarlyAnswerPushback_BoundedSinglePush(t *testing.T) {
 	if res.Output == nil {
 		t.Fatalf("expected the second answer to be accepted")
 	}
-	if calls := atomic.LoadInt32(&step); calls != 2 {
-		t.Errorf("expected exactly 2 LLM calls, got %d", calls)
+	if calls := atomic.LoadInt32(&step); calls != int32(maxEarlyAnswerPushes+1) {
+		t.Errorf("expected exactly %d LLM calls, got %d", maxEarlyAnswerPushes+1, calls)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if pushbackCount != 1 {
-		t.Errorf("pushback must be bounded to a single attempt, saw %d", pushbackCount)
+	if pushbackCount != maxEarlyAnswerPushes {
+		t.Errorf("pushback must be bounded to %d attempts, saw %d", maxEarlyAnswerPushes, pushbackCount)
 	}
 }
 
