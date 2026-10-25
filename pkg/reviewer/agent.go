@@ -23,6 +23,11 @@ import (
 var (
 	// ErrModelViolationsExceeded indicates the model requested too many forbidden mutation actions.
 	ErrModelViolationsExceeded = errors.New("model exceeded mutation violation limit")
+
+	// ErrAmbiguousAgentReply marks a reply that mixes wire formats or mixes an
+	// answer with tool calls. Such a reply is rejected whole and nudged, never
+	// partially executed, so no action or finding is silently dropped.
+	ErrAmbiguousAgentReply = errors.New("ambiguous agent reply")
 )
 
 // logVerboseTurns reports whether full per-turn replies should be logged.
@@ -35,6 +40,11 @@ func logVerboseTurns() bool {
 // answered on turn 1, was pushed back, and answered again without reading, so a
 // single pushback let it burn the whole turn budget on nothing.
 const maxEarlyAnswerPushes = 3
+
+// maxActionsPerReply bounds how many tool calls from one reply are executed, in
+// order. DSML-emitting models batch several reads per reply; this keeps a single
+// reply from doing unbounded work while still using what the model asked for.
+const maxActionsPerReply = 5
 
 // maxEmptyResponseRetries bounds how many times a single turn is re-requested
 // after the provider returned no usable completion at all. The LLM client has
@@ -127,6 +137,7 @@ func (a *ReviewerAgent) Run(
 	history := a.buildAgentInitialUserPrompt(pr, inv, comments, threads, verificationSummary, verificationStatus)
 
 	filesServedMap := make(map[string]bool)
+	readAttempts := make(map[string]bool)
 	var filesServed []string
 	violations := 0
 	turnsUsed := 0
@@ -185,24 +196,34 @@ func (a *ReviewerAgent) Run(
 			log.Printf("[reviewer] turn %d/%d reply: %.200s", turnsUsed, maxTurns, strings.ReplaceAll(rawResponse, "\n", " "))
 		}
 
-		action, parseErr := parseAgentAction(rawResponse)
+		actions, parseErr := parseAgentActions(rawResponse)
 		if parseErr != nil {
-			// Plain text or unparseable: check if extractJSONOutput can parse a final review
-			if out, err := extractJSONOutput(rawResponse); err == nil {
-				if hasExaminableChanges && len(filesServed) == 0 && earlyAnswerPushes < maxEarlyAnswerPushes {
-					history += fmt.Sprintf("\nAssistant: %s", rawResponse)
-					earlyAnswerPushback()
-					continue
-				}
-				finalOutput = out
-				break
+			// A reply that mixes protocols or mixes answer with tool calls is
+			// rejected whole; extracting the JSON half would silently drop the
+			// tool calls, so nudge instead of falling through to the JSON path.
+			if errors.Is(parseErr, ErrAmbiguousAgentReply) {
+				history += fmt.Sprintf("\nAssistant: %s\nAction rejected: %v. Reply with exactly one protocol, and either a single action='answer' or up to %d read-only tool calls.\nNext action:", rawResponse, parseErr, maxActionsPerReply)
+				continue
 			}
-			history += fmt.Sprintf("\nAssistant: %s\nUser: Please reply with a single JSON action object (e.g. read_file, list_files, search_files, or answer).", rawResponse)
-			continue
+			if out, err := extractJSONOutput(rawResponse); err == nil {
+				actions = []*AgentAction{{Action: "answer", Review: out}}
+			} else {
+				history += fmt.Sprintf("\nAssistant: %s\nUser: Please reply with a single JSON action object (e.g. read_file, list_files, search_files, or answer).", rawResponse)
+				continue
+			}
 		}
 
-		// Check if action is answer
-		if action.Action == "answer" || (action.Action == "" && (action.Score != nil || len(action.Findings) > 0 || action.Summary != "")) {
+		if isAnswerAction(actions[0]) && tools != nil && !tools.IsBudgetExhausted() && turnsUsed < maxTurns {
+			if pending := remainingReadActions(inv, readAttempts); len(pending) > 0 {
+				history += "\nAction rejected: changed files remain unread. The following action='read_file' calls provide missing evidence. Reconsider your findings using this content and investigate relevant definitions, callers and tests before answering again.\n"
+				log.Printf("[reviewer] coverage completion: serving %d unread changed files before accepting answer", len(pending))
+				actions = pending
+			}
+		}
+
+		// An answer is never mixed with tool calls (that reply is rejected above).
+		action := actions[0]
+		if isAnswerAction(action) {
 			if hasExaminableChanges && len(filesServed) == 0 && earlyAnswerPushes < maxEarlyAnswerPushes {
 				earlyAnswerPushback()
 				continue
@@ -237,83 +258,100 @@ func (a *ReviewerAgent) Run(
 			break
 		}
 
-		// Handle mutation violations
-		if isMutationAction(action.Action) {
-			violations++
-			refusalMsg := fmt.Sprintf("Error: %s is disabled: the reviewer is strictly read-only and mutations/command execution are not permitted.", action.Action)
-			history += fmt.Sprintf("\nAction requested: %s\nTool Result:\n%s\nNext action (or provide final answer via action='answer'):", action.Action, refusalMsg)
-			if violations >= violationLimit {
-				return nil, fmt.Errorf("%w: refused %d mutation attempts (%s)", ErrModelViolationsExceeded, violations, action.Action)
+		// Execute the reply's tool calls in order, bounded per reply; the same
+		// turn, violation and byte-budget limits apply to every action.
+		skipped := 0
+		if len(actions) > maxActionsPerReply {
+			skipped = len(actions) - maxActionsPerReply
+			actions = actions[:maxActionsPerReply]
+		}
+		for i, action := range actions {
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
-			continue
-		}
-
-		// Execute read-only tools
-		if tools == nil {
-			history += "\nTool Result:\nSnapshot is not available for file reads.\nNext action:"
-			continue
-		}
-
-		var toolResult string
-		switch action.Action {
-		case "read_file":
-			content, rErr := tools.ReadFile(action.Path)
-			if rErr != nil {
-				toolResult = fmt.Sprintf("Error reading file: %v", rErr)
-			} else {
-				toolResult = content
-				norm := normalizeFilePath(action.Path)
-				if !filesServedMap[norm] {
-					filesServedMap[norm] = true
-					filesServed = append(filesServed, norm)
+			// Handle mutation violations
+			if isMutationAction(action.Action) {
+				violations++
+				refusalMsg := fmt.Sprintf("Error: %s is disabled: the reviewer is strictly read-only and mutations/command execution are not permitted.", action.Action)
+				history += fmt.Sprintf("\nAction requested: %s\nTool Result:\n%s\nNext action (or provide final answer via action='answer'):", action.Action, refusalMsg)
+				if violations >= violationLimit {
+					return nil, fmt.Errorf("%w: refused %d mutation attempts (%s)", ErrModelViolationsExceeded, violations, action.Action)
 				}
-				// Mark file examined in ledger
-				if ledger != nil {
-					ledger.MarkFileExamined(norm)
-					// Also check if inventory path matches without prefix
-					if inv != nil {
-						if f := inv.FindFile(norm); f != nil {
-							ledger.MarkFileExamined(f.Path)
+				continue
+			}
+
+			// Execute read-only tools
+			if tools == nil {
+				history += "\nTool Result:\nSnapshot is not available for file reads.\nNext action:"
+				continue
+			}
+
+			var toolResult string
+			switch action.Action {
+			case "read_file":
+				readAttempts[normalizeFilePath(action.Path)] = true
+				content, complete, rErr := tools.readFile(action.Path)
+				if rErr != nil {
+					toolResult = fmt.Sprintf("Error reading file: %v", rErr)
+				} else {
+					toolResult = content
+					norm := normalizeFilePath(action.Path)
+					if !filesServedMap[norm] {
+						filesServedMap[norm] = true
+						filesServed = append(filesServed, norm)
+					}
+					// Truncated content is useful context, but not full-file coverage.
+					if ledger != nil && complete {
+						ledger.MarkFileExamined(norm)
+						// Also check if inventory path matches without prefix
+						if inv != nil {
+							if f := inv.FindFile(norm); f != nil {
+								ledger.MarkFileExamined(f.Path)
+							}
 						}
 					}
 				}
-			}
-			history += fmt.Sprintf("\nAction requested: read_file (path: %s)\nTool Result:\n```\n%s\n```\nNext action:", action.Path, toolResult)
+				history += fmt.Sprintf("\nAction requested: read_file (path: %s)\nTool Result:\n```\n%s\n```\nNext action:", action.Path, toolResult)
 
-		case "list_files":
-			p := action.Path
-			if p == "" {
-				p = "."
-			}
-			listing, lErr := tools.ListFiles(p)
-			if lErr != nil {
-				toolResult = fmt.Sprintf("Error listing files: %v", lErr)
-			} else {
-				toolResult = listing
-			}
-			history += fmt.Sprintf("\nAction requested: list_files (path: %s)\nTool Result:\n```\n%s\n```\nNext action:", p, toolResult)
+			case "list_files":
+				p := action.Path
+				if p == "" {
+					p = "."
+				}
+				listing, lErr := tools.ListFiles(p)
+				if lErr != nil {
+					toolResult = fmt.Sprintf("Error listing files: %v", lErr)
+				} else {
+					toolResult = listing
+				}
+				history += fmt.Sprintf("\nAction requested: list_files (path: %s)\nTool Result:\n```\n%s\n```\nNext action:", p, toolResult)
 
-		case "search_files":
-			q := action.Query
-			if q == "" {
-				q = action.Pattern
-			}
-			matches, sErr := tools.SearchFiles(q)
-			if sErr != nil {
-				toolResult = fmt.Sprintf("Error searching files: %v", sErr)
-			} else {
-				toolResult = matches
-			}
-			history += fmt.Sprintf("\nAction requested: search_files (query: %s)\nTool Result:\n```\n%s\n```\nNext action:", q, toolResult)
+			case "search_files":
+				q := action.Query
+				if q == "" {
+					q = action.Pattern
+				}
+				matches, sErr := tools.SearchFiles(q)
+				if sErr != nil {
+					toolResult = fmt.Sprintf("Error searching files: %v", sErr)
+				} else {
+					toolResult = matches
+				}
+				history += fmt.Sprintf("\nAction requested: search_files (query: %s)\nTool Result:\n```\n%s\n```\nNext action:", q, toolResult)
 
-		default:
-			toolResult = fmt.Sprintf("Unknown action: %s. Use read_file, list_files, search_files, or answer.", action.Action)
-			history += fmt.Sprintf("\nAction requested: %s\nTool Result:\n%s\nNext action:", action.Action, toolResult)
+			default:
+				toolResult = fmt.Sprintf("Unknown action: %s. Use read_file, list_files, search_files, or answer.", action.Action)
+				history += fmt.Sprintf("\nAction requested: %s\nTool Result:\n%s\nNext action:", action.Action, toolResult)
+			}
+
+			if tools.IsBudgetExhausted() {
+				budgetExhausted = true
+				skipped += len(actions) - i - 1
+				break
+			}
 		}
-
-		if tools.IsBudgetExhausted() {
-			budgetExhausted = true
-			break
+		if skipped > 0 {
+			history += fmt.Sprintf("\nNote: %d further action(s) from that reply were not executed (limit %d tool calls per reply, or the tool byte budget is exhausted).\nNext action:", skipped, maxActionsPerReply)
 		}
 	}
 
@@ -393,9 +431,10 @@ AVAILABLE ACTIONS:
 
 RULES & RESTRICTIONS:
 - You have up to %d iterative tool turns to inspect changed files, related tests, and callers.
+- Start with the modified files, then use targeted search and reads to verify suspected bugs against definitions, callers, tests, or configuration. Do not guess unseen behavior or crawl unrelated files.
 - The review is strictly read-only. Modifying files ("write_file"), running shell commands ("run_command"), or git push ("commit_and_push") are strictly forbidden and will be refused.
-- Output MUST be a single strict JSON object matching {"action": "...", ...}.
-- Do not wrap in markdown code blocks.`, maxTurns)
+- Output one strict JSON action object, or up to %d consecutive JSON objects for independent read-only tool calls. An answer MUST be a single object and never mixed with tool calls.
+- Do not wrap in markdown code blocks.`, maxTurns, maxActionsPerReply)
 }
 
 func (a *ReviewerAgent) buildAgentInitialUserPrompt(
@@ -524,31 +563,108 @@ func isMutationAction(act string) bool {
 //     JSON decoder rejected it, no file was ever read, and the zero-coverage gate
 //     correctly refused to publish the result.
 func parseAgentAction(raw string) (*AgentAction, error) {
-	if action := parseXMLAgentAction(raw); action != nil {
-		return action, nil
+	actions, err := parseAgentActions(raw)
+	if err != nil {
+		return nil, err
+	}
+	return actions[0], nil
+}
+
+// parseAgentActions decodes every action in one reply, in order.
+//
+// Two wire shapes are accepted, because both are observed in production:
+//
+//  1. JSON, possibly several concatenated objects. A stream decoder collects
+//     each complete object.
+//  2. XML function-call markup, plain or with the DeepSeek DSML prefix, e.g.
+//     an invoke element named read_file holding a parameter element for path.
+//     Live thozoz/aura-web PR #3 spent 8 of 12 turns emitting DSML: the JSON
+//     decoder rejected it and no file was ever read.
+//
+// A reply mixing JSON with XML, or an answer with tool calls, is ambiguous: it
+// is rejected whole rather than silently dropping half of it.
+func parseAgentActions(raw string) ([]*AgentAction, error) {
+	xmlActions := parseXMLAgentActions(raw)
+	jsonActions := parseJSONAgentActions(xmlInvokePattern.ReplaceAllString(raw, ""))
+	if len(xmlActions) > 0 && len(jsonActions) > 0 {
+		return nil, fmt.Errorf("%w: reply mixes JSON and XML tool calls", ErrAmbiguousAgentReply)
+	}
+	actions := xmlActions
+	if len(actions) == 0 {
+		actions = jsonActions
+	}
+	if len(actions) == 0 {
+		return nil, fmt.Errorf("no agent action found")
 	}
 
+	var answers, calls int
+	for _, a := range actions {
+		if isAnswerAction(a) {
+			answers++
+		} else {
+			calls++
+		}
+	}
+	if answers > 0 && calls > 0 {
+		return nil, fmt.Errorf("%w: reply mixes action='answer' with tool calls", ErrAmbiguousAgentReply)
+	}
+	if answers > 1 {
+		return nil, fmt.Errorf("%w: reply contains %d answers", ErrAmbiguousAgentReply, answers)
+	}
+	return actions, nil
+}
+
+// isAnswerAction reports whether an action concludes the review.
+func isAnswerAction(action *AgentAction) bool {
+	return action.Action == "answer" ||
+		(action.Action == "" && (action.Score != nil || len(action.Findings) > 0 || action.Summary != ""))
+}
+
+// parseJSONAgentActions decodes concatenated JSON action objects in order.
+func parseJSONAgentActions(raw string) []*AgentAction {
 	trimmed := strings.TrimSpace(raw)
 	start := strings.Index(trimmed, "{")
 	if start < 0 {
-		return nil, fmt.Errorf("no json object found")
+		return nil
 	}
-	trimmed = trimmed[start:]
-
-	dec := json.NewDecoder(strings.NewReader(trimmed))
-	var action AgentAction
-	if err := dec.Decode(&action); err != nil {
-		return nil, err
+	dec := json.NewDecoder(strings.NewReader(trimmed[start:]))
+	var actions []*AgentAction
+	for {
+		var action AgentAction
+		if err := dec.Decode(&action); err != nil {
+			break
+		}
+		actions = append(actions, &action)
 	}
-	return &action, nil
+	return actions
 }
 
-// xmlInvokePattern captures "<invoke name="TOOL">body</invoke>" blocks, which is
-// how several OpenAI-compatible function-calling dialects render a tool call.
-var xmlInvokePattern = regexp.MustCompile(`(?is)<invoke\s+name\s*=\s*"([^"]+)"\s*>(.*?)</invoke>`)
+// dsmlPrefix matches the optional DeepSeek DSML marker before a tag name, as in
+// the fullwidth-pipe form. Plain tags keep matching with the group absent.
+const dsmlPrefix = `(?:[｜|]DSML[｜|]\s+)?`
 
-// xmlParameterPattern captures "<parameter name="KEY">VALUE</parameter>" pairs.
-var xmlParameterPattern = regexp.MustCompile(`(?is)<parameter\s+name\s*=\s*"([^"]+)"\s*>(.*?)</parameter>`)
+// xmlInvokePattern captures an invoke block and its raw attribute list.
+var xmlInvokePattern = regexp.MustCompile(`(?is)<` + dsmlPrefix + `invoke\b([^>]*)>(.*?)</` + dsmlPrefix + `invoke\s*>`)
+
+// xmlParameterPattern captures a parameter block and its raw attribute list.
+var xmlParameterPattern = regexp.MustCompile(`(?is)<` + dsmlPrefix + `parameter\b([^>]*)>(.*?)</` + dsmlPrefix + `parameter\s*>`)
+
+// xmlAttrPattern captures key="value" or key='value' attributes in any order.
+var xmlAttrPattern = regexp.MustCompile(`(?is)([a-z_][a-z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+
+// xmlAttrValue returns the value of attr from a raw attribute list.
+func xmlAttrValue(attrs, attr string) string {
+	for _, m := range xmlAttrPattern.FindAllStringSubmatch(attrs, -1) {
+		if !strings.EqualFold(m[1], attr) {
+			continue
+		}
+		if m[2] != "" {
+			return m[2]
+		}
+		return m[3]
+	}
+	return ""
+}
 
 // xmlToolAliases maps the function names used by other dialects onto this
 // protocol's action names.
@@ -567,11 +683,13 @@ var xmlToolAliases = map[string]string{
 	"submit":       "answer",
 }
 
-// parseXMLAgentAction extracts the first usable tool call from XML markup, or
-// returns nil when the reply carries none.
-func parseXMLAgentAction(raw string) *AgentAction {
+// parseXMLAgentActions extracts every usable tool call from XML markup, in
+// order. Unknown tools and calls with no usable argument are skipped so a later
+// well-formed call in the same reply still runs.
+func parseXMLAgentActions(raw string) []*AgentAction {
+	var actions []*AgentAction
 	for _, match := range xmlInvokePattern.FindAllStringSubmatch(raw, -1) {
-		tool := strings.ToLower(strings.TrimSpace(match[1]))
+		tool := strings.ToLower(strings.TrimSpace(xmlAttrValue(match[1], "name")))
 		actionName, ok := xmlToolAliases[tool]
 		if !ok {
 			continue
@@ -579,7 +697,11 @@ func parseXMLAgentAction(raw string) *AgentAction {
 
 		params := make(map[string]string)
 		for _, pm := range xmlParameterPattern.FindAllStringSubmatch(match[2], -1) {
-			params[strings.ToLower(strings.TrimSpace(pm[1]))] = strings.TrimSpace(pm[2])
+			key := strings.ToLower(strings.TrimSpace(xmlAttrValue(pm[1], "name")))
+			if key == "" {
+				continue
+			}
+			params[key] = strings.TrimSpace(pm[2])
 		}
 
 		action := &AgentAction{Action: actionName}
@@ -609,9 +731,9 @@ func parseXMLAgentAction(raw string) *AgentAction {
 		if actionName != "answer" && action.Path == "" && action.Query == "" {
 			continue
 		}
-		return action
+		actions = append(actions, action)
 	}
-	return nil
+	return actions
 }
 
 // firstNonEmpty returns the first non-blank candidate.
@@ -622,6 +744,30 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// remainingReadActions completes evidence delivery without retrying failed reads.
+func remainingReadActions(inv *diff.ChangeInventory, attempted map[string]bool) []*AgentAction {
+	if inv == nil {
+		return nil
+	}
+	var actions []*AgentAction
+	seen := make(map[string]bool)
+	for _, file := range inv.Files {
+		if file.IsBinary || file.IsDeleted || file.IsModeOnly || len(file.Hunks) == 0 {
+			continue
+		}
+		path := normalizeFilePath(file.Path)
+		if attempted[path] || seen[path] {
+			continue
+		}
+		seen[path] = true
+		actions = append(actions, &AgentAction{Action: "read_file", Path: path})
+		if len(actions) == maxActionsPerReply {
+			break
+		}
+	}
+	return actions
 }
 
 func normalizeFilePath(p string) string {

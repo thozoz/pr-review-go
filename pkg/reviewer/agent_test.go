@@ -465,9 +465,9 @@ func TestConfinement_TraversalAndEscapes(t *testing.T) {
 	}
 
 	adversarialPaths := []struct {
-		name          string
-		path          string
-		expectedRule  string
+		name         string
+		path         string
+		expectedRule string
 	}{
 		{"parent directory escape", "../outside.txt", "path outside workspace"},
 		{"deep parent traversal", "../../etc/passwd", "path outside workspace"},
@@ -612,8 +612,8 @@ func TestBudget_OversizedSingleToolOutputTruncatesWithMarker(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		AgentFileReadBytes: 10000,  // 10KB per read cap
-		AgentMaxToolBytes:  15000,  // 15KB total tool budget
+		AgentFileReadBytes: 10000, // 10KB per read cap
+		AgentMaxToolBytes:  15000, // 15KB total tool budget
 	}
 
 	tools, err := NewSnapshotTools(snapDir, cfg)
@@ -660,9 +660,9 @@ func TestBudget_OversizedSingleToolOutputTruncatesWithMarker(t *testing.T) {
 
 func TestHeadBinding_MismatchAbortsZeroLLMCalls(t *testing.T) {
 	const (
-		jobHeadSHA      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-		mismatchedSHA   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-		baseSHA         = "cccccccccccccccccccccccccccccccccccccccc"
+		jobHeadSHA    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		mismatchedSHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		baseSHA       = "cccccccccccccccccccccccccccccccccccccccc"
 	)
 
 	var llmCalls int32
@@ -895,9 +895,8 @@ func TestAgent_EarlyAnswerPushback_RequiresReadFile(t *testing.T) {
 	}
 }
 
-// REV-READ-01: pushback is bounded to one attempt, so an insistent model cannot
-// loop, and the turn budget is still respected.
-func TestAgent_EarlyAnswerPushback_BoundedSinglePush(t *testing.T) {
+// An insistent answer triggers one automatic read, then can finish with evidence.
+func TestAgent_EarlyAnswerCompletion_Bounded(t *testing.T) {
 	snapDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(snapDir, "a.go"), []byte("package main\n\nfunc A() {}\n"), 0644); err != nil {
 		t.Fatal(err)
@@ -952,25 +951,23 @@ func TestAgent_EarlyAnswerPushback_BoundedSinglePush(t *testing.T) {
 		t.Fatalf("agent.Run failed: %v", err)
 	}
 
-	// The model insists maxEarlyAnswerPushes times, then its answer is accepted
-	// (the engine's zero-coverage gate is what refuses to publish in that case).
-	if res.TurnsUsed != maxEarlyAnswerPushes+1 {
-		t.Errorf("expected %d turns (%d pushbacks then acceptance), got %d", maxEarlyAnswerPushes+1, maxEarlyAnswerPushes, res.TurnsUsed)
+	if res.TurnsUsed != 2 {
+		t.Errorf("expected 2 turns (automatic read then acceptance), got %d", res.TurnsUsed)
 	}
-	if len(res.FilesServed) != 0 {
-		t.Errorf("expected no files served, got %v", res.FilesServed)
+	if len(res.FilesServed) != 1 || res.FilesServed[0] != "a.go" || ledger.ExaminedCount() != 1 {
+		t.Errorf("expected a.go delivered and covered, got %v", res.FilesServed)
 	}
 	if res.Output == nil {
 		t.Fatalf("expected the second answer to be accepted")
 	}
-	if calls := atomic.LoadInt32(&step); calls != int32(maxEarlyAnswerPushes+1) {
-		t.Errorf("expected exactly %d LLM calls, got %d", maxEarlyAnswerPushes+1, calls)
+	if calls := atomic.LoadInt32(&step); calls != 2 {
+		t.Errorf("expected exactly 2 LLM calls, got %d", calls)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if pushbackCount != maxEarlyAnswerPushes {
-		t.Errorf("pushback must be bounded to %d attempts, saw %d", maxEarlyAnswerPushes, pushbackCount)
+	if pushbackCount != 1 {
+		t.Errorf("expected one automatic completion, saw %d", pushbackCount)
 	}
 }
 
@@ -1190,5 +1187,450 @@ func TestParseAgentAction_JSONStillParsed(t *testing.T) {
 	}
 	if got.Action != "read_file" || got.Path != "x.go" {
 		t.Fatalf("got %+v, want read_file x.go", got)
+	}
+}
+
+// Live thozoz/aura-web PR #3 spent 8 of 12 turns emitting DeepSeek DSML
+// markup: the JSON decoder rejected it, so no file was ever read. The DSML
+// prefix is optional, attributes may come in any order, and extra attributes
+// such as string="true" must not hide the name.
+func TestParseAgentAction_DeepSeekDSML(t *testing.T) {
+	// Built rather than written literally: the DSML marker is a reserved token.
+	p := "｜"
+	dsml := func(name, attrs, body string) string {
+		return "<" + p + "DSML" + p + " " + name + " " + attrs + ">" + body + "</" + p + "DSML" + p + " " + name + ">"
+	}
+	param := func(attrs, value string) string { return dsml("parameter", attrs, value) }
+	invoke := func(attrs, body string) string { return dsml("invoke", attrs, body) }
+
+	cases := []struct {
+		name    string
+		raw     string
+		action  string
+		path    string
+		query   string
+		summary string
+		score   int
+	}{
+		{
+			name:   "real log shape with fullwidth prefix and string attribute",
+			raw:    invoke(`name="read_file"`, param(`name="path" string="true"`, "internal/site/search.go")),
+			action: "read_file",
+			path:   "internal/site/search.go",
+		},
+		{
+			name:   "extra attribute before name, single quotes",
+			raw:    invoke(`string="true" name="read"`, param(`string="true" name='file_path'`, "cmd/auraweb/main.go")),
+			action: "read_file",
+			path:   "cmd/auraweb/main.go",
+		},
+		{
+			name:   "search with extra attribute after name",
+			raw:    `<invoke name="search_files"><parameter name="query" string="true">searchCacheKey</parameter></invoke>`,
+			action: "search_files",
+			query:  "searchCacheKey",
+		},
+		{
+			name:    "answer with score before summary and string attributes",
+			raw:     invoke(`name="answer"`, param(`name="score"`, "88")+param(`name="summary" string="true"`, "Looks correct.")),
+			action:  "answer",
+			summary: "Looks correct.",
+			score:   88,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseAgentAction(tc.raw)
+			if err != nil {
+				t.Fatalf("parseAgentAction() error = %v", err)
+			}
+			if got.Action != tc.action {
+				t.Errorf("Action = %q, want %q", got.Action, tc.action)
+			}
+			if tc.path != "" && got.Path != tc.path {
+				t.Errorf("Path = %q, want %q", got.Path, tc.path)
+			}
+			if tc.query != "" && got.Query != tc.query {
+				t.Errorf("Query = %q, want %q", got.Query, tc.query)
+			}
+			if tc.summary != "" && got.Summary != tc.summary {
+				t.Errorf("Summary = %q, want %q", got.Summary, tc.summary)
+			}
+			if tc.score != 0 && (got.Score == nil || *got.Score != tc.score) {
+				t.Errorf("Score = %v, want %d", got.Score, tc.score)
+			}
+		})
+	}
+}
+
+// A reply may legitimately batch several reads; they must all be extracted, in
+// the order the model wrote them, across plain and prefixed tags.
+func TestParseAgentActions_MultipleInOrder(t *testing.T) {
+	p := "｜"
+	dsmlRead := func(path string) string {
+		return "<" + p + "DSML" + p + ` invoke name="read_file"><` + p + "DSML" + p + ` parameter name="path">` + path +
+			"</" + p + "DSML" + p + " parameter></" + p + "DSML" + p + " invoke>"
+	}
+	raw := dsmlRead("a.go") +
+		`<invoke name="read_file"><parameter name="path">b.go</parameter></invoke>` +
+		dsmlRead("c.go")
+
+	actions, err := parseAgentActions(raw)
+	if err != nil {
+		t.Fatalf("parseAgentActions() error = %v", err)
+	}
+	if len(actions) != 3 {
+		t.Fatalf("got %d actions, want 3", len(actions))
+	}
+	for i, want := range []string{"a.go", "b.go", "c.go"} {
+		if actions[i].Path != want {
+			t.Errorf("actions[%d].Path = %q, want %q", i, actions[i].Path, want)
+		}
+	}
+}
+
+// JSON batches must keep collecting every object, not just the first.
+func TestParseAgentActions_JSONMultipleInOrder(t *testing.T) {
+	actions, err := parseAgentActions(`{"action":"read_file","path":"a.go"}{"action":"read_file","path":"b.go"}`)
+	if err != nil {
+		t.Fatalf("parseAgentActions() error = %v", err)
+	}
+	if len(actions) != 2 || actions[0].Path != "a.go" || actions[1].Path != "b.go" {
+		t.Fatalf("got %+v, want a.go then b.go", actions)
+	}
+}
+
+// Ambiguous replies are rejected whole: half-parsing them would silently drop
+// either the tool calls or the answer.
+func TestParseAgentActions_RejectsAmbiguousReplies(t *testing.T) {
+	xmlRead := `<invoke name="read_file"><parameter name="path">a.go</parameter></invoke>`
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"json and xml", xmlRead + `{"action":"read_file","path":"b.go"}`},
+		{"answer with tool call", xmlRead + `<invoke name="answer"><parameter name="summary">done</parameter></invoke>`},
+		{"two answers", `<invoke name="answer"><parameter name="summary">one</parameter></invoke><invoke name="answer"><parameter name="summary">two</parameter></invoke>`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseAgentActions(tc.raw); !errors.Is(err, ErrAmbiguousAgentReply) {
+				t.Fatalf("error = %v, want ErrAmbiguousAgentReply", err)
+			}
+		})
+	}
+}
+
+// Broken or unknown markup must not execute anything; an unknown call is
+// skipped so a later valid call in the same reply still runs.
+func TestParseAgentActions_MalformedAndUnknown(t *testing.T) {
+	bad := []string{
+		`<invoke name="read_file"><parameter name="path">a.go`,
+		`<invoke name="delete_repository"><parameter name="path">a.go</parameter></invoke>`,
+		`&lt;invoke name="read_file"&gt;`,
+	}
+	for _, raw := range bad {
+		if actions, err := parseAgentActions(raw); err == nil {
+			t.Errorf("parseAgentActions(%q) = %+v, want an error", raw, actions)
+		}
+	}
+
+	actions, err := parseAgentActions(`<invoke name="delete_repository"><parameter name="path">x</parameter></invoke><invoke name="read_file"><parameter name="path">good.go</parameter></invoke>`)
+	if err != nil {
+		t.Fatalf("parseAgentActions() error = %v", err)
+	}
+	if len(actions) != 1 || actions[0].Path != "good.go" {
+		t.Fatalf("got %+v, want only the valid read of good.go", actions)
+	}
+}
+
+func coverageInventory(paths ...string) *diff.ChangeInventory {
+	inv := &diff.ChangeInventory{}
+	for _, path := range paths {
+		inv.Files = append(inv.Files, &diff.FileDiff{Path: path, Hunks: []*diff.Hunk{{NewStart: 1, NewCount: 1}}})
+	}
+	return inv
+}
+
+func TestAgent_CoverageCompletionAcrossBatches(t *testing.T) {
+	paths := []string{"a.go", "b.go", "c.go", "d.go", "e.go", "f.go", "g.go", "h.go"}
+	files := make(map[string]string)
+	for _, path := range paths {
+		files[path] = "package p\n// evidence for " + path + "\n"
+	}
+	res, ledger, prompts := runAgentReplies(t, files, nil, []string{
+		`{"action":"read_file","path":"a.go"}`,
+		`{"action":"answer","score":90,"summary":"done","findings":[]}`,
+	}, coverageInventory(paths...))
+	if res.TurnsUsed != 4 || ledger.ExaminedCount() != len(paths) {
+		t.Fatalf("turns=%d examined=%d; want 4 turns and 8 hunks", res.TurnsUsed, ledger.ExaminedCount())
+	}
+	if strings.Join(res.FilesServed, ",") != strings.Join(paths, ",") {
+		t.Fatalf("read order = %v, want %v", res.FilesServed, paths)
+	}
+	if len(prompts) != 4 || !strings.Contains(prompts[3], "evidence for h.go") {
+		t.Fatal("final model call must see the last automatically supplied file")
+	}
+}
+
+func TestAgent_CoverageCompletionReferenceDoesNotClearChangedFile(t *testing.T) {
+	res, ledger, prompts := runAgentReplies(t, map[string]string{
+		"reference.go": "package p\n", "a.go": "package p\n// changed evidence\n",
+	}, nil, []string{
+		`{"action":"read_file","path":"reference.go"}`,
+		`{"action":"answer","summary":"done"}`,
+	}, coverageInventory("a.go"))
+	if res.TurnsUsed != 3 || ledger.ExaminedCount() != 1 || len(res.FilesServed) != 2 {
+		t.Fatalf("unexpected result: turns=%d files=%v coverage=%d", res.TurnsUsed, res.FilesServed, ledger.ExaminedCount())
+	}
+	if !strings.Contains(prompts[2], "changed evidence") {
+		t.Fatal("answer must be reconsidered after reading the changed file")
+	}
+}
+
+func TestAgent_CoverageCompletionFailedAndTruncatedNotRetried(t *testing.T) {
+	res, ledger, prompts := runAgentReplies(t, map[string]string{
+		"a.go": "a", "big.go": strings.Repeat("b", 100),
+	}, &config.Config{AgentFileReadBytes: 8}, []string{
+		`{"action":"read_file","path":"a.go"}`,
+		`{"action":"answer","summary":"partial"}`,
+	}, coverageInventory("a.go", "big.go", "missing.go"))
+	if res.TurnsUsed != 3 || ledger.ExaminedCount() != 1 {
+		t.Fatalf("turns=%d coverage=%d; want one completion and only a.go covered", res.TurnsUsed, ledger.ExaminedCount())
+	}
+	if strings.Count(prompts[len(prompts)-1], "path: missing.go") != 1 || strings.Count(prompts[len(prompts)-1], "path: big.go") != 1 {
+		t.Fatal("failed and truncated paths must only be attempted once automatically")
+	}
+}
+
+func TestAgent_CoverageCompletionRespectsLastTurn(t *testing.T) {
+	res, ledger, _ := runAgentReplies(t, map[string]string{"a.go": "a", "b.go": "b"},
+		&config.Config{AgentMaxTurns: 2}, []string{
+			`{"action":"read_file","path":"a.go"}`,
+			`{"action":"answer","summary":"partial"}`,
+		}, coverageInventory("a.go", "b.go"))
+	if res.TurnsUsed != 2 || ledger.ExaminedCount() != 1 || len(res.FilesServed) != 1 {
+		t.Fatalf("must not deliver unseen evidence on the last turn: %+v coverage=%d", res, ledger.ExaminedCount())
+	}
+}
+
+func TestAgent_CoverageCompletionRespectsByteBudget(t *testing.T) {
+	res, ledger, _ := runAgentReplies(t, map[string]string{"a.go": "abcd", "b.go": "efgh", "c.go": "ijkl"},
+		&config.Config{AgentMaxToolBytes: 5}, []string{
+			`{"action":"read_file","path":"a.go"}`,
+			`{"action":"answer","summary":"partial"}`,
+		}, coverageInventory("a.go", "b.go", "c.go"))
+	if !res.BudgetExhausted || ledger.ExaminedCount() != 1 || len(res.FilesServed) != 2 {
+		t.Fatalf("must stop during completion without covering truncated b.go: %+v coverage=%d", res, ledger.ExaminedCount())
+	}
+}
+
+func TestRemainingReadActionsSkipsUnsupportedAndAttempted(t *testing.T) {
+	inv := coverageInventory("a.go", "deleted.go", "binary.go", "mode.go", "empty.go", "b.go", "b.go")
+	inv.Files[1].IsDeleted = true
+	inv.Files[2].IsBinary = true
+	inv.Files[3].IsModeOnly = true
+	inv.Files[4].Hunks = nil
+	actions := remainingReadActions(inv, map[string]bool{"a.go": true})
+	if len(actions) != 1 || actions[0].Path != "b.go" {
+		t.Fatalf("unexpected required actions: %+v", actions)
+	}
+}
+
+func TestReadFileCompleteness(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		content   string
+		readLimit int64
+		toolLimit int64
+		complete  bool
+	}{
+		{"exact read cap", "abcdefgh", 8, 100, true},
+		{"exact total budget", "abcdefgh", 8, 8, true},
+		{"file cap", "abcdefghi", 8, 100, false},
+		{"total budget", "abcdefgh", 8, 7, false},
+		{"literal truncation marker", "...[tool output omitted, budget exhausted]...", 100, 200, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(tc.content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			tools, err := NewSnapshotTools(dir, &config.Config{AgentFileReadBytes: tc.readLimit, AgentMaxToolBytes: tc.toolLimit})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, complete, err := tools.readFile("a.go")
+			if err != nil || complete != tc.complete {
+				t.Fatalf("complete=%v err=%v, want %v", complete, err, tc.complete)
+			}
+		})
+	}
+}
+
+// dsmlRead renders one prefixed read_file call. The marker is concatenated so
+// this source never contains it literally.
+func dsmlRead(path string) string {
+	p := "｜"
+	return "<" + p + "DSML" + p + ` invoke name="read_file"><` + p + "DSML" + p + ` parameter name="path" string="true">` +
+		path + "</" + p + "DSML" + p + " parameter></" + p + "DSML" + p + " invoke>"
+}
+
+// runAgentReplies drives a ReviewerAgent against a scripted LLM and returns the
+// result, ledger, and the user prompts seen on each call.
+func runAgentReplies(t *testing.T, files map[string]string, cfg *config.Config, replies []string, inventories ...*diff.ChangeInventory) (*AgentReviewResult, *diff.CoverageLedger, []string) {
+	t.Helper()
+	dir := t.TempDir()
+	for name, content := range files {
+		full := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var step int32
+	var mu sync.Mutex
+	var prompts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				prompts = append(prompts, m.Content)
+			}
+		}
+		mu.Unlock()
+
+		n := int(atomic.AddInt32(&step, 1)) - 1
+		if n >= len(replies) {
+			n = len(replies) - 1
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{Choices: []llm.ChatChoice{{
+			Message:      llm.ChatMessage{Role: "assistant", Content: replies[n]},
+			FinishReason: "stop",
+		}}})
+	}))
+	defer srv.Close()
+
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
+	if cfg.AgentMaxTurns == 0 {
+		cfg.AgentMaxTurns = 10
+	}
+	const testSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	inv := &diff.ChangeInventory{Files: []*diff.FileDiff{{Path: "a.go", Hunks: []*diff.Hunk{{NewStart: 1, NewCount: 2}}}}}
+	if len(inventories) > 0 {
+		inv = inventories[0]
+	}
+	ledger := diff.NewCoverageLedger(inv)
+	agent := NewReviewerAgent(cfg, llm.NewClient(srv.URL, "key", "model"))
+	res, err := agent.Run(context.Background(), &github.PRDetails{Title: "t", HeadSHA: testSHA}, inv, ledger,
+		&sandbox.Snapshot{SourceDir: dir, CommitSHA: testSHA}, "", sandbox.StatusUnavailable, nil, nil)
+	if err != nil {
+		t.Fatalf("agent.Run failed: %v", err)
+	}
+	return res, ledger, prompts
+}
+
+// One DSML reply batching three reads must execute all three in one turn, in
+// the order written, instead of spending (and losing) three turns.
+func TestAgent_DSMLBatchExecutesInOrder(t *testing.T) {
+	files := map[string]string{"a.go": "package a\n", "b.go": "package b\n", "c.go": "package c\n"}
+	res, ledger, _ := runAgentReplies(t, files, nil, []string{
+		dsmlRead("a.go") + dsmlRead("b.go") + dsmlRead("c.go"),
+		`{"action": "answer", "score": 90, "summary": "read all three", "findings": []}`,
+	})
+	if res.TurnsUsed != 2 {
+		t.Errorf("TurnsUsed = %d, want 2 (one batch turn plus the answer)", res.TurnsUsed)
+	}
+	want := []string{"a.go", "b.go", "c.go"}
+	if len(res.FilesServed) != len(want) {
+		t.Fatalf("FilesServed = %v, want %v", res.FilesServed, want)
+	}
+	for i := range want {
+		if res.FilesServed[i] != want[i] {
+			t.Errorf("FilesServed[%d] = %q, want %q", i, res.FilesServed[i], want[i])
+		}
+	}
+	if ledger.ExaminedCount() == 0 {
+		t.Errorf("batch read must still mark coverage")
+	}
+}
+
+// The per-reply cap bounds work; the actions beyond it are reported, not
+// silently discarded.
+func TestAgent_DSMLBatchCappedAtFive(t *testing.T) {
+	files := map[string]string{}
+	var batch string
+	for _, name := range []string{"a.go", "b.go", "c.go", "d.go", "e.go", "f.go"} {
+		files[name] = "package x\n"
+		batch += dsmlRead(name)
+	}
+	res, _, prompts := runAgentReplies(t, files, nil, []string{
+		batch,
+		`{"action": "answer", "score": 90, "summary": "done", "findings": []}`,
+	})
+	if len(res.FilesServed) != maxActionsPerReply {
+		t.Fatalf("FilesServed = %v, want %d", res.FilesServed, maxActionsPerReply)
+	}
+	for _, served := range res.FilesServed {
+		if served == "f.go" {
+			t.Errorf("sixth read must not run in the same reply, got %v", res.FilesServed)
+		}
+	}
+	if len(prompts) < 2 || !strings.Contains(prompts[1], "not executed") {
+		t.Errorf("reply must report the skipped action, got prompts %v", prompts)
+	}
+}
+
+// A reply that runs out of tool byte budget mid-batch must stop there, keep
+// what it read, and not error.
+func TestAgent_DSMLMidBatchBudgetExhaustion(t *testing.T) {
+	files := map[string]string{"a.go": "package main\n\nfunc A() {}\n", "b.go": "package main\n\nfunc A() {}\n", "c.go": "package main\n\nfunc A() {}\n"}
+	cfg := &config.Config{AgentMaxToolBytes: 40}
+	res, _, _ := runAgentReplies(t, files, cfg, []string{
+		dsmlRead("a.go") + dsmlRead("b.go") + dsmlRead("c.go"),
+		`{"action": "answer", "score": 80, "summary": "partial", "findings": []}`,
+	})
+	if !res.BudgetExhausted {
+		t.Errorf("BudgetExhausted = false, want true")
+	}
+	if len(res.FilesServed) != 2 {
+		t.Errorf("FilesServed = %v, want 2 (third read must not run after exhaustion)", res.FilesServed)
+	}
+	if res.TurnsUsed > 3 {
+		t.Errorf("TurnsUsed = %d, mid-batch exhaustion must not spin", res.TurnsUsed)
+	}
+}
+
+// An answer mixed with tool calls is rejected whole and nudged; the tool call
+// in it must not execute.
+func TestAgent_MixedAnswerAndToolNudged(t *testing.T) {
+	files := map[string]string{"a.go": "package a\n"}
+	res, ledger, prompts := runAgentReplies(t, files, nil, []string{
+		dsmlRead("a.go") + `<invoke name="answer"><parameter name="summary">premature</parameter></invoke>`,
+		dsmlRead("a.go"),
+		`{"action": "answer", "score": 90, "summary": "after reading", "findings": []}`,
+	})
+	if len(res.FilesServed) != 1 || res.FilesServed[0] != "a.go" {
+		t.Fatalf("FilesServed = %v, want a.go served once by the clean reply", res.FilesServed)
+	}
+	if res.TurnsUsed != 3 {
+		t.Errorf("TurnsUsed = %d, want 3 (rejected, read, answer)", res.TurnsUsed)
+	}
+	if ledger.ExaminedCount() == 0 {
+		t.Errorf("clean reply must still mark coverage")
+	}
+	if len(prompts) < 2 || !strings.Contains(prompts[1], "Action rejected") {
+		t.Errorf("mixed reply must be nudged, prompts = %v", prompts)
 	}
 }
