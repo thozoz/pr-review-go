@@ -23,6 +23,36 @@ import (
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
 )
 
+func TestAgentPrompts_IndependentConcernCategories(t *testing.T) {
+	a := &ReviewerAgent{}
+	for _, status := range []sandbox.VerificationStatus{sandbox.StatusPassed, sandbox.StatusTestFailed, sandbox.StatusUnavailable} {
+		t.Run(string(status), func(t *testing.T) {
+			system := a.buildAgentSystemPrompt(status, 10)
+			for _, want := range []string{
+				buildSystemPrompt(status),
+				"Finding one severe defect is not a reason to stop early or to cap the number of findings",
+				"You have up to 10 iterative tool turns",
+				"Do not guess unseen behavior or crawl unrelated files",
+			} {
+				if !strings.Contains(system, want) {
+					t.Errorf("agent system prompt missing %q", want)
+				}
+			}
+			initial := a.buildAgentInitialUserPrompt(&github.PRDetails{Title: "test"}, coverageInventory("a.go"), nil, nil, "", status)
+			for _, want := range []string{
+				"Your FIRST action must be action='read_file' on a modified file",
+				"Read every modified non-test source file before you conclude",
+				"weighing each against the applicable concern categories (security and input validation, concurrency, logic and correctness)",
+				"then answer with action='answer'",
+			} {
+				if !strings.Contains(initial, want) {
+					t.Errorf("agent initial prompt missing %q", want)
+				}
+			}
+		})
+	}
+}
+
 func TestAgent_ExploresTwoChangedFiles(t *testing.T) {
 	snapDir := t.TempDir()
 	fileA := filepath.Join(snapDir, "pkg", "auth", "token.go")
@@ -1370,6 +1400,19 @@ func TestAgent_CoverageCompletionAcrossBatches(t *testing.T) {
 	}
 	if len(prompts) != 4 || !strings.Contains(prompts[3], "evidence for h.go") {
 		t.Fatal("final model call must see the last automatically supplied file")
+	}
+	for _, want := range []string{
+		"Action rejected: changed files remain unread",
+		"investigate relevant definitions, callers and tests before answering again",
+		"weigh each newly served file against the other applicable categories (security and input validation, concurrency, logic)",
+		"a severe defect in one category does not end the review",
+	} {
+		if !strings.Contains(prompts[3], want) {
+			t.Errorf("coverage completion prompt missing %q", want)
+		}
+	}
+	if len(res.Output.Findings) != 0 {
+		t.Fatal("independent concern inspection must still accept an empty findings list")
 	}
 }
 

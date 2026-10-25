@@ -484,6 +484,32 @@ func TestPromptAndReportFormattingForAllVerificationStatuses(t *testing.T) {
 				t.Errorf("system prompt for status %q missing expected substring %q", tc.status, tc.expectedSys)
 			}
 
+			for _, want := range []string{
+				"Consider each applicable category across the changed files",
+				"reporting only defects you can support with evidence",
+				"an empty findings list is a valid outcome",
+				"Security & Input Validation", "injection", "XSS", "path traversal",
+				"Concurrency & State", "race conditions",
+				"Logic & Reliability", "API & Contract", "performance regressions",
+				"One severe finding does not end the review",
+				"Focus strictly on real defects",
+			} {
+				if !strings.Contains(sysPrompt, want) {
+					t.Errorf("system prompt for status %q missing checklist contract %q", tc.status, want)
+				}
+			}
+			if strings.Count(sysPrompt, "Security & Input Validation") != 1 {
+				t.Error("system prompt must contain the shared checklist exactly once")
+			}
+			if tc.status == sandbox.StatusBuildFailed || tc.status == sandbox.StatusTestFailed {
+				if strings.Contains(sysPrompt, "Accurately focus on verified build/test defects.") {
+					t.Error("failed verification must not narrow inspection to build/test defects")
+				}
+				if !strings.Contains(sysPrompt, "keep inspecting the changed files for independently supported security, input-validation and logic defects") {
+					t.Error("failed verification must preserve independent defect inspection")
+				}
+			}
+
 			userPrompt := buildUserPrompt(pr, "", nil, nil, "STATUS: "+string(tc.status), tc.status)
 			if !strings.Contains(userPrompt, tc.expectedHeader) {
 				t.Errorf("user prompt for status %q missing expected header %q", tc.status, tc.expectedHeader)

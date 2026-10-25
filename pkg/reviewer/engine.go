@@ -422,7 +422,32 @@ func parseVerificationStatus(status any) sandbox.VerificationStatus {
 	}
 }
 
+// reviewChecklistRule reminds the model to check independent concerns after a
+// severe finding, without requiring extra model calls or a findings quota.
+const reviewChecklistRule = `- Consider each applicable category across the changed files, reporting only defects you can support with evidence (an empty findings list is a valid outcome):
+  1. Security & Input Validation: untrusted input, injection (SQL, command, template), XSS, path traversal, auth/authz bypass, sensitive data exposure.
+  2. Concurrency & State: race conditions, deadlocks, atomicity, goroutine lifecycle, synchronization.
+  3. Logic & Reliability: nil dereferences, off-by-one errors, resource/connection leaks, unhandled errors.
+  4. API & Contract: breaking changes, schema mismatches, parameter validation, performance regressions.
+- One severe finding does not end the review: check the remaining applicable categories before answering.`
+
+// withReviewChecklist injects the shared checklist right after the CRITICAL
+// RULES heading so every verification status gets it without duplicating text.
+func withReviewChecklist(prompt string) string {
+	const anchor = "\nCRITICAL RULES:\n"
+	i := strings.Index(prompt, anchor)
+	if i < 0 {
+		return prompt + "\n" + reviewChecklistRule
+	}
+	at := i + len(anchor)
+	return prompt[:at] + reviewChecklistRule + "\n" + prompt[at:]
+}
+
 func buildSystemPrompt(status any) string {
+	return withReviewChecklist(buildStatusSystemPrompt(status))
+}
+
+func buildStatusSystemPrompt(status any) string {
 	st := parseVerificationStatus(status)
 	switch st {
 	case sandbox.StatusPassed:
@@ -450,7 +475,7 @@ Your role is to analyze Pull Requests by combining three critical signals:
 NOTE: Real live sandbox verification was executed and encountered failures. Do not claim or assume tests passed.
 
 CRITICAL RULES:
-- Never hallucinate false bugs. Live sandbox verification proved real failure (compilation or unit tests). Accurately focus on verified build/test defects.
+- Never hallucinate false bugs. Live sandbox verification proved real failure (compilation or unit tests). Analyze the verified build/test defects, then keep inspecting the changed files for independently supported security, input-validation and logic defects instead of stopping at the first failure.
 - Do not claim builds or tests passed when live sandbox verification reported failure.
 - If an existing discussion thread shows a concern was already acknowledged, discussed, or dismissed by the author/reviewer, DO NOT repeat it as a new issue.
 - If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.

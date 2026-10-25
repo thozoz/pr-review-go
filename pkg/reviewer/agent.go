@@ -215,7 +215,7 @@ func (a *ReviewerAgent) Run(
 
 		if isAnswerAction(actions[0]) && tools != nil && !tools.IsBudgetExhausted() && turnsUsed < maxTurns {
 			if pending := remainingReadActions(inv, readAttempts); len(pending) > 0 {
-				history += "\nAction rejected: changed files remain unread. The following action='read_file' calls provide missing evidence. Reconsider your findings using this content and investigate relevant definitions, callers and tests before answering again.\n"
+				history += "\nAction rejected: changed files remain unread. The following action='read_file' calls provide missing evidence. Reconsider your findings using this content and investigate relevant definitions, callers and tests before answering again. Also weigh each newly served file against the other applicable categories (security and input validation, concurrency, logic) so a severe defect in one category does not end the review.\n"
 				log.Printf("[reviewer] coverage completion: serving %d unread changed files before accepting answer", len(pending))
 				actions = pending
 			}
@@ -432,6 +432,7 @@ AVAILABLE ACTIONS:
 RULES & RESTRICTIONS:
 - You have up to %d iterative tool turns to inspect changed files, related tests, and callers.
 - Start with the modified files, then use targeted search and reads to verify suspected bugs against definitions, callers, tests, or configuration. Do not guess unseen behavior or crawl unrelated files.
+- Check the modified files against the applicable concern categories (security and input validation, concurrency, logic and correctness). Finding one severe defect is not a reason to stop early or to cap the number of findings.
 - The review is strictly read-only. Modifying files ("write_file"), running shell commands ("run_command"), or git push ("commit_and_push") are strictly forbidden and will be refused.
 - Output one strict JSON action object, or up to %d consecutive JSON objects for independent read-only tool calls. An answer MUST be a single object and never mixed with tool calls.
 - Do not wrap in markdown code blocks.`, maxTurns, maxActionsPerReply)
@@ -511,7 +512,7 @@ func (a *ReviewerAgent) buildAgentInitialUserPrompt(
 	// read, so the zero-coverage gate correctly refused to publish anything).
 	b.WriteString("IMPORTANT: this change map contains NO source code — only file paths and hunk headers.\n")
 	b.WriteString("You cannot review anything from it. Your FIRST action must be action='read_file' on a modified file.\n")
-	b.WriteString("Read every modified non-test source file before you conclude, then answer with action='answer'.\n")
+	b.WriteString("Read every modified non-test source file before you conclude, weighing each against the applicable concern categories (security and input validation, concurrency, logic and correctness), then answer with action='answer'.\n")
 	return b.String()
 }
 
