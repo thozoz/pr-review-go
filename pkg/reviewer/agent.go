@@ -8,6 +8,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -503,18 +505,29 @@ func isMutationAction(act string) bool {
 	return false
 }
 
-// parseAgentAction decodes the FIRST JSON object in the model output.
+// parseAgentAction decodes the model's requested action from one reply.
 //
-// Models routinely emit several concatenated action objects in one reply, e.g.
+// Two wire shapes are accepted, because both are observed in production:
 //
-//	{"action": "read_file", "path": "a.go"}
-//	{"action": "read_file", "path": "b.go"}
+//  1. JSON, possibly several concatenated objects in one reply:
+//     {"action": "read_file", "path": "a.go"}
+//     {"action": "read_file", "path": "b.go"}
+//     Slicing from the first '{' to the LAST '}' turns that into invalid JSON, so
+//     a stream decoder is used to accept the first complete object.
 //
-// Slicing from the first '{' to the LAST '}' turns that into invalid JSON, so
-// every such turn was discarded: no file was read, the turn was spent, and the
-// unparsed text was appended back into the history. Decoding with a stream
-// decoder accepts the first complete object and ignores any trailing ones.
+//  2. XML tool-call markup, emitted by models that were trained on a function-
+//     calling dialect rather than this protocol:
+//     <tool_calls><invoke name="read_file">
+//     <parameter name="path">a.go</parameter>
+//     </invoke></tool_calls>
+//     This shape cost every turn of a live review (thozoz/aura-web PR #2): the
+//     JSON decoder rejected it, no file was ever read, and the zero-coverage gate
+//     correctly refused to publish the result.
 func parseAgentAction(raw string) (*AgentAction, error) {
+	if action := parseXMLAgentAction(raw); action != nil {
+		return action, nil
+	}
+
 	trimmed := strings.TrimSpace(raw)
 	start := strings.Index(trimmed, "{")
 	if start < 0 {
@@ -528,6 +541,87 @@ func parseAgentAction(raw string) (*AgentAction, error) {
 		return nil, err
 	}
 	return &action, nil
+}
+
+// xmlInvokePattern captures "<invoke name="TOOL">body</invoke>" blocks, which is
+// how several OpenAI-compatible function-calling dialects render a tool call.
+var xmlInvokePattern = regexp.MustCompile(`(?is)<invoke\s+name\s*=\s*"([^"]+)"\s*>(.*?)</invoke>`)
+
+// xmlParameterPattern captures "<parameter name="KEY">VALUE</parameter>" pairs.
+var xmlParameterPattern = regexp.MustCompile(`(?is)<parameter\s+name\s*=\s*"([^"]+)"\s*>(.*?)</parameter>`)
+
+// xmlToolAliases maps the function names used by other dialects onto this
+// protocol's action names.
+var xmlToolAliases = map[string]string{
+	"read_file":    "read_file",
+	"read":         "read_file",
+	"cat":          "read_file",
+	"view_file":    "read_file",
+	"list_files":   "list_files",
+	"list":         "list_files",
+	"ls":           "list_files",
+	"search_files": "search_files",
+	"search":       "search_files",
+	"grep":         "search_files",
+	"answer":       "answer",
+	"submit":       "answer",
+}
+
+// parseXMLAgentAction extracts the first usable tool call from XML markup, or
+// returns nil when the reply carries none.
+func parseXMLAgentAction(raw string) *AgentAction {
+	for _, match := range xmlInvokePattern.FindAllStringSubmatch(raw, -1) {
+		tool := strings.ToLower(strings.TrimSpace(match[1]))
+		actionName, ok := xmlToolAliases[tool]
+		if !ok {
+			continue
+		}
+
+		params := make(map[string]string)
+		for _, pm := range xmlParameterPattern.FindAllStringSubmatch(match[2], -1) {
+			params[strings.ToLower(strings.TrimSpace(pm[1]))] = strings.TrimSpace(pm[2])
+		}
+
+		action := &AgentAction{Action: actionName}
+		switch actionName {
+		case "read_file":
+			action.Path = firstNonEmpty(params["path"], params["file"], params["file_path"], params["filename"])
+		case "list_files":
+			action.Path = firstNonEmpty(params["path"], params["dir"], params["directory"])
+		case "search_files":
+			action.Query = firstNonEmpty(params["query"], params["pattern"], params["text"], params["term"])
+			action.Pattern = action.Query
+		case "answer":
+			action.Summary = params["summary"]
+			if score := params["score"]; score != "" {
+				if n, err := strconv.Atoi(score); err == nil {
+					action.Score = &n
+				}
+			}
+			if len(action.Summary) == 0 {
+				continue
+			}
+		}
+
+		// A tool call whose argument is missing would be rejected by the tool
+		// anyway, but skipping it here lets the loop try the next block in the
+		// same reply instead of spending a whole turn on a malformed call.
+		if actionName != "answer" && action.Path == "" && action.Query == "" {
+			continue
+		}
+		return action
+	}
+	return nil
+}
+
+// firstNonEmpty returns the first non-blank candidate.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func normalizeFilePath(p string) string {

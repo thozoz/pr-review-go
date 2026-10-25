@@ -1089,3 +1089,106 @@ func TestAgent_EmptyCompletionRetriesSameTurn(t *testing.T) {
 		t.Fatalf("FilesServed = %v, want the one examined file", res.FilesServed)
 	}
 }
+
+// Models trained on a function-calling dialect emit XML tool-call markup instead
+// of this protocol's JSON. Live thozoz/aura-web PR #2: the JSON decoder rejected
+// every turn, no file was ever read, and the review was correctly refused as
+// zero-coverage even though the model was behaving sensibly.
+func TestParseAgentAction_XMLToolCalls(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		action  string
+		path    string
+		query   string
+		summary string
+	}{
+		{
+			name:   "read_file with path parameter",
+			raw:    "<tool_calls>\n<invoke name=\"read_file\">\n<parameter name=\"path\">internal/site/search.go</parameter>\n</invoke>\n</tool_calls>",
+			action: "read_file",
+			path:   "internal/site/search.go",
+		},
+		{
+			name:   "read with file_path alias",
+			raw:    "<invoke name=\"read\"><parameter name=\"file_path\">cmd/auraweb/main.go</parameter></invoke>",
+			action: "read_file",
+			path:   "cmd/auraweb/main.go",
+		},
+		{
+			name:   "list_files with dir alias",
+			raw:    "<invoke name=\"ls\"><parameter name=\"dir\">internal/site</parameter></invoke>",
+			action: "list_files",
+			path:   "internal/site",
+		},
+		{
+			name:   "search_files with pattern alias",
+			raw:    "<invoke name=\"grep\"><parameter name=\"pattern\">searchCacheKey</parameter></invoke>",
+			action: "search_files",
+			query:  "searchCacheKey",
+		},
+		{
+			name:    "answer with summary and score",
+			raw:     "<invoke name=\"submit\"><parameter name=\"summary\">Looks correct.</parameter><parameter name=\"score\">88</parameter></invoke>",
+			action:  "answer",
+			summary: "Looks correct.",
+		},
+		{
+			name:   "prose prefix before the tool block",
+			raw:    "I'll read the modified file first.\n<tool_calls><invoke name=\"read_file\"><parameter name=\"path\">a.go</parameter></invoke></tool_calls>",
+			action: "read_file",
+			path:   "a.go",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseAgentAction(tc.raw)
+			if err != nil {
+				t.Fatalf("parseAgentAction() error = %v", err)
+			}
+			if got.Action != tc.action {
+				t.Errorf("Action = %q, want %q", got.Action, tc.action)
+			}
+			if tc.path != "" && got.Path != tc.path {
+				t.Errorf("Path = %q, want %q", got.Path, tc.path)
+			}
+			if tc.query != "" && got.Query != tc.query {
+				t.Errorf("Query = %q, want %q", got.Query, tc.query)
+			}
+			if tc.summary != "" && got.Summary != tc.summary {
+				t.Errorf("Summary = %q, want %q", got.Summary, tc.summary)
+			}
+			if tc.action == "answer" && (got.Score == nil || *got.Score != 88) {
+				t.Errorf("Score = %v, want 88", got.Score)
+			}
+		})
+	}
+}
+
+// A tool call with no usable argument is skipped in favour of a later well-formed
+// one in the same reply, rather than spending the turn on a malformed call.
+func TestParseAgentAction_XMLSkipsMalformedCall(t *testing.T) {
+	raw := `<tool_calls>
+<invoke name="read_file"></invoke>
+<invoke name="read_file"><parameter name="path">good.go</parameter></invoke>
+</tool_calls>`
+	got, err := parseAgentAction(raw)
+	if err != nil {
+		t.Fatalf("parseAgentAction() error = %v", err)
+	}
+	if got.Path != "good.go" {
+		t.Fatalf("Path = %q, want good.go (the malformed call must be skipped)", got.Path)
+	}
+}
+
+// JSON must keep working unchanged now that XML is tried first.
+func TestParseAgentAction_JSONStillParsed(t *testing.T) {
+	got, err := parseAgentAction(`{"action": "read_file", "path": "x.go"}`)
+	if err != nil {
+		t.Fatalf("parseAgentAction() error = %v", err)
+	}
+	if got.Action != "read_file" || got.Path != "x.go" {
+		t.Fatalf("got %+v, want read_file x.go", got)
+	}
+}
