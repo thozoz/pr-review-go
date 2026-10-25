@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -225,6 +227,15 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 	skippedCount := 0
 	if agentRes.Output != nil {
 		for _, f := range agentRes.Output.Findings {
+			// Models sometimes omit the file and the description, which rendered
+			// as a bare "(`:163`)" heading with an empty body (observed live on
+			// thozoz/aura-web PR #1). Recover what the inventory can tell us and
+			// refuse to publish a finding that carries no actionable text at all.
+			f = normalizeFinding(f, inv)
+			if strings.TrimSpace(f.Title) == "" && strings.TrimSpace(f.Description) == "" {
+				log.Printf("[reviewer] dropping finding with no title and no description (file=%q line=%d)", f.File, f.Line)
+				continue
+			}
 			fp := dedup.ComputeFingerprint(f.File, f.Line, f.Title, f.Severity)
 			if existingFPs[fp] {
 				skippedCount++
@@ -947,4 +958,90 @@ func FormatReportMarkdown(r *ReviewReport) string {
 	}
 
 	return sb.String()
+}
+
+// normalizeFinding repairs findings that would otherwise render as an
+// unusable "(`:163`)" heading with an empty body.
+//
+// Observed live on thozoz/aura-web PR #1: the model emitted correct titles and
+// line numbers but left `file` and `description` empty, so the published review
+// contained headings that pointed nowhere and explained nothing. When the file
+// can be recovered from the inventory (a unique file whose hunks cover the
+// reported line, or an inventory path mentioned in the title) it is filled in;
+// otherwise a stable placeholder keeps the heading readable. Nothing else is
+// invented — a finding with no title AND no description is dropped by the
+// caller instead.
+func normalizeFinding(f Finding, inv *diff.ChangeInventory) Finding {
+	f.File = strings.TrimSpace(f.File)
+	f.Title = strings.TrimSpace(f.Title)
+	f.Description = strings.TrimSpace(f.Description)
+	f.Severity = strings.ToUpper(strings.TrimSpace(f.Severity))
+
+	if f.Severity == "" {
+		f.Severity = "WARNING"
+	}
+
+	if f.File == "" {
+		f.File = inferFindingFile(f, inv)
+	}
+	if f.File == "" {
+		f.File = "(unspecified file)"
+	}
+	return f
+}
+
+// inferFindingFile tries to attribute a fileless finding to a file in the change
+// inventory, using only evidence already present in the finding itself.
+func inferFindingFile(f Finding, inv *diff.ChangeInventory) string {
+	if inv == nil || len(inv.Files) == 0 {
+		return ""
+	}
+
+	// 1. The title or description may name the file outright.
+	haystack := f.Title + "\n" + f.Description
+	var named []string
+	for _, file := range inv.Files {
+		if file == nil || file.Path == "" {
+			continue
+		}
+		base := filepath.Base(file.Path)
+		if strings.Contains(haystack, file.Path) || (base != "" && strings.Contains(haystack, base)) {
+			named = append(named, file.Path)
+		}
+	}
+	if len(named) == 1 {
+		return named[0]
+	}
+
+	// 2. A reported line contained by exactly one file's hunk range.
+	if f.Line > 0 {
+		var covering []string
+		for _, file := range inv.Files {
+			if file == nil {
+				continue
+			}
+			for _, h := range file.Hunks {
+				if f.Line >= h.NewStart && f.Line < h.NewStart+h.NewCount {
+					covering = append(covering, file.Path)
+					break
+				}
+			}
+		}
+		if len(covering) == 1 {
+			return covering[0]
+		}
+	}
+
+	// 3. Comments about missing imports etc. most often belong to a Go source
+	// file, but only when the inventory contains exactly one.
+	var goFiles []string
+	for _, file := range inv.Files {
+		if file != nil && strings.HasSuffix(file.Path, ".go") {
+			goFiles = append(goFiles, file.Path)
+		}
+	}
+	if len(goFiles) == 1 {
+		return goFiles[0]
+	}
+	return ""
 }

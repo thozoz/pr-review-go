@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/diff"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
@@ -1431,5 +1432,68 @@ new mode 100755
 	}
 	if report.HeadSHA != headSHA {
 		t.Errorf("expected report head SHA %s, got %s", headSHA, report.HeadSHA)
+	}
+}
+
+// Live regression: models emitted findings with correct titles and line numbers
+// but an empty `file` and empty `description`, which rendered as a heading that
+// pointed nowhere and explained nothing (thozoz/aura-web PR #1).
+func TestNormalizeFinding_RepairsMissingFileAndDescription(t *testing.T) {
+	inv := &diff.ChangeInventory{
+		Files: []*diff.FileDiff{
+			{Path: "internal/site/search.go", Hunks: []*diff.Hunk{{NewStart: 140, NewCount: 40}}},
+			{Path: "internal/site/rss.go", Hunks: []*diff.Hunk{{NewStart: 1, NewCount: 30}}},
+		},
+	}
+
+	cases := []struct {
+		name     string
+		in       Finding
+		wantFile string
+	}{
+		{
+			name:     "line covered by exactly one file",
+			in:       Finding{Line: 163, Severity: "critical", Title: "slice bounds"},
+			wantFile: "internal/site/search.go",
+		},
+		{
+			name:     "file named in title",
+			in:       Finding{Line: 0, Title: "panic in internal/site/rss.go"},
+			wantFile: "internal/site/rss.go",
+		},
+		{
+			name:     "nothing recoverable gets a placeholder",
+			in:       Finding{Line: 99999, Title: "vague concern"},
+			wantFile: "(unspecified file)",
+		},
+		{
+			name:     "explicit file is preserved",
+			in:       Finding{File: "web/static/site.css", Line: 10, Title: "contrast"},
+			wantFile: "web/static/site.css",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeFinding(tc.in, inv)
+			if got.File != tc.wantFile {
+				t.Errorf("File = %q, want %q", got.File, tc.wantFile)
+			}
+			if got.Severity != "CRITICAL" && tc.in.Severity == "critical" {
+				t.Errorf("Severity = %q, want uppercased CRITICAL", got.Severity)
+			}
+			if got.Severity == "" {
+				t.Error("Severity must never be empty")
+			}
+		})
+	}
+}
+
+// A finding carrying neither a title nor a description must be dropped rather
+// than published as an empty heading.
+func TestNormalizeFinding_EmptyFindingIsDroppable(t *testing.T) {
+	got := normalizeFinding(Finding{Line: 5}, nil)
+	if strings.TrimSpace(got.Title) != "" || strings.TrimSpace(got.Description) != "" {
+		t.Fatalf("expected an empty finding to stay empty so the caller drops it, got %+v", got)
 	}
 }
