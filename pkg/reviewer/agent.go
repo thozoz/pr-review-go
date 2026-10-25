@@ -8,6 +8,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
 	"github.com/thozoz/pr-review-go/pkg/diff"
@@ -140,6 +141,8 @@ func (a *ReviewerAgent) Run(
 		}
 
 		turnsUsed++
+		turnStarted := time.Now()
+		log.Printf("[reviewer] turn %d/%d start (history %d bytes, %d files served)", turnsUsed, maxTurns, len(history), len(filesServed))
 		rawResponse, err := a.llm.ChatCompletion(ctx, systemPrompt, history)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
@@ -162,6 +165,8 @@ func (a *ReviewerAgent) Run(
 			return nil, fmt.Errorf("llm call failed (turn %d/%d, history %d bytes, %d files served): %w",
 				turnsUsed, maxTurns, len(history), len(filesServed), err)
 		}
+
+		log.Printf("[reviewer] turn %d/%d done in %s (%d response bytes)", turnsUsed, maxTurns, time.Since(turnStarted).Round(time.Second), len(rawResponse))
 
 		action, parseErr := parseAgentAction(rawResponse)
 		if parseErr != nil {
