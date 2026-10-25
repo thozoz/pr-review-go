@@ -376,6 +376,15 @@ func (c *Client) ChatCompletion(ctx context.Context, systemPrompt, userPrompt st
 			return result, nil
 		}
 		lastErr = err
+		// An empty completion is a provider fault that a different backend may
+		// not share, so it is as retryable-elsewhere as a 429/5xx. Without this,
+		// one flaky model took the whole job down even though LLM_FALLBACK_MODELS
+		// was configured (observed live: agy/gemini-3.8-flash-high returning
+		// finish_reason=stop with no content while evren/deepseek-v4.1-flash
+		// answered the same prompt fine).
+		if errors.Is(err, ErrEmptyAssistantContent) {
+			continue
+		}
 		var statusErr *fallbackHTTPError
 		if !errors.As(err, &statusErr) || (statusErr.status != 429 && statusErr.status < 500) {
 			return "", err
