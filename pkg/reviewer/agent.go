@@ -428,6 +428,8 @@ AVAILABLE ACTIONS:
    Format: {"action": "search_files", "query": "text"}
 4. "answer": Conclude your review with score, summary, and findings. Only deliver your answer after reading the modified files with action='read_file'.
    Format: {"action": "answer", "score": 85, "summary": "...", "findings": [...]}
+   Each finding uses this shape: {"file":"path/to/file.go","line":42,"severity":"CRITICAL","title":"Concrete defect","description":"Evidence, triggering conditions, and impact","suggestion":"A safe correction"}.
+   Use the exact repository-relative file path and source line supported by the inspected code. Severity is CRITICAL, WARNING, or NOTE. Do not invent locations or unseen behavior. Findings may be an empty array.
 
 RULES & RESTRICTIONS:
 - You have up to %d iterative tool turns to inspect changed files, related tests, and callers.

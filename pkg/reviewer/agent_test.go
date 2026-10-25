@@ -50,6 +50,11 @@ func TestAgentPrompts_IndependentConcernCategories(t *testing.T) {
 				"Finding one severe defect is not a reason to stop early or to cap the number of findings",
 				"You have up to 10 iterative tool turns",
 				"Do not guess unseen behavior or crawl unrelated files",
+				`{"file":"path/to/file.go","line":42,"severity":"CRITICAL","title":"Concrete defect","description":"Evidence, triggering conditions, and impact","suggestion":"A safe correction"}`,
+				"exact repository-relative file path and source line supported by the inspected code",
+				"Severity is CRITICAL, WARNING, or NOTE",
+				"Do not invent locations or unseen behavior",
+				"Findings may be an empty array",
 			} {
 				if !strings.Contains(system, want) {
 					t.Errorf("agent system prompt missing %q", want)
