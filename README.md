@@ -102,6 +102,34 @@ apt-get install -y bubblewrap   # Debian 12/13; tested bubblewrap 0.12.0-1~deb13
 That is the entire installation story for the working rank. It additionally needs
 unprivileged user namespaces, which `unshare -Urn true` verifies. Nothing else requires root.
 
+#### Go toolchain: set `GOROOT` explicitly on the execution host
+
+The `bwrap-ro` rank pins the *running process's* Go toolchain into the sandbox, because a
+build or `go test` inside the sandbox must find a compiler that the host trusts. That path
+comes from `runtime.GOROOT()`, which falls back to the **build machine's** absolute Go path
+whenever the environment does not override it. A binary compiled on a developer machine and
+shipped to a host with a different filesystem layout therefore points at a directory that
+does not exist, and every direct-mode verification degrades to `StatusUnavailable` with zero
+commands executed — the review still succeeds, but nothing is compiled or tested.
+
+Deployments must therefore name the toolchain explicitly. Omitting this is the single most
+common cause of "verification silently did nothing" in direct mode:
+
+```bash
+# /etc/pr-review-go/env (or any env file read before start)
+GOROOT=/opt/go          # the Go root on THIS host; must contain bin/go and src/
+```
+
+Verify it points at a real toolchain before starting the service:
+
+```bash
+test -x "$GOROOT/bin/go" && test -d "$GOROOT/src" && "$GOROOT/bin/go" env GOROOT
+```
+
+`-trimpath` is **not** a substitute: it makes `runtime.GOROOT()` resolve to an empty string,
+which fails the same check from the other direction. Do not build release binaries with
+`-trimpath` while relying on direct-mode Go verification.
+
 #### `landlock` — install nothing
 
 No user namespaces, subuid/subgid, cgroups or daemon are required; the ruleset is applied
@@ -262,6 +290,7 @@ export SANDBOX_CONCURRENCY=1
 ```
 
 When running in server mode:
+- **Webhook secret must match the GitHub App's own secret**: deliveries are validated against `WEBHOOK_SECRET`, so a mismatch rejects every event with `401 invalid signature` while the service otherwise looks healthy. A repo-level webhook is not involved when the bot is installed as a GitHub App — the secret on the App configuration page and the value in the environment file must be aligned (or rotated together) and the service restarted. A failing mismatch is visible in the log as `[webhook] HMAC validation failed`.
 - **Durable bbolt Ledger & Bounded Retention**: Webhooks commit delivery receipts and job bundles atomically to `jobs.db` before returning HTTP 200. Bounded maintenance reclaims expired terminal records without evicting active work. Saturated queues return HTTP 503 (`Retry-After: 30`).
 - **Per-PR FIFO Serialization**: Work is serialized per pull request; distinct PRs process in parallel across fixed workers.
 - **Automatic Review Coalescing**: Subsequent commits during an active review coalesce into a single follow-up review of the latest commit; outdated reports are discarded before publication.
@@ -272,7 +301,9 @@ When running in server mode:
 Incoming webhook triggers:
 - `pull_request`: `opened` -> auto-labels + code review
 - `pull_request`: `synchronize` -> coalesced incremental review
-- Comment `/review` -> triggers code review; project build/tests remain disabled
+- Comment `/review` -> triggers code review, including project build/test verification when
+  the sandbox is available (see the `GOROOT` requirement above; an unavailable sandbox is
+  reported as such in the review body rather than silently skipped)
 - Comment `/approve` -> publishes an APPROVE review from the bot identity, bound to the exact head SHA at execution time. Command-triggered only; automatic reviews stay COMMENT. One decision per head commit: a duplicate command for the same head is rejected with a warning comment, and a new commit requires a fresh command (the old record stays on the old commit in the GitHub UI). Whether the approval satisfies required reviews depends on repo branch protection; stale-approval dismissal on new commits ("Dismiss stale pull request approvals when new commits are pushed") is a repo setting the bot cannot control.
 - Comment `/request_changes` -> publishes a REQUEST_CHANGES review under the same exact-head, one-decision-per-head, and bot-identity rules as `/approve`.
 - Comment `/improve` -> posts an unavailable notice; no suggestions are generated
