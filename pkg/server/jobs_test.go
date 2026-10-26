@@ -3654,3 +3654,42 @@ func TestIssueComment_AllJobKindsPopulateHeadSHA(t *testing.T) {
 		})
 	}
 }
+
+// A review that fails because its own job timeout expired must still be able
+// to write its terminal state. Writing on the expired context silently fails
+// and leaves the PR stuck on "Review running..." (observed live: job-00000109
+// on aura-web PR #8 failed with context deadline exceeded and published
+// nothing).
+func TestTerminalWriteContextSurvivesExpiredJobContext(t *testing.T) {
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := expired.Err(); err == nil {
+		t.Fatal("precondition: expected the parent context to be done")
+	}
+
+	writeCtx, writeCancel := terminalWriteContext(expired)
+	defer writeCancel()
+
+	if err := writeCtx.Err(); err != nil {
+		t.Fatalf("terminal write context must survive parent cancellation, got %v", err)
+	}
+	if _, ok := writeCtx.Deadline(); !ok {
+		t.Fatal("terminal write context must stay bounded by a deadline")
+	}
+
+	// The guarantee is only useful if a write on it actually proceeds.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-writeCtx.Done():
+		case <-time.After(250 * time.Millisecond):
+			close(done)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal write context cancelled early")
+	}
+}
