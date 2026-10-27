@@ -30,8 +30,11 @@ index 123..456 100644
 
 	markdown := FormatReportMarkdown(report)
 
-	if !strings.Contains(markdown, "Looks ready to merge!") {
-		t.Fatalf("expected full coverage with zero findings to say 'Looks ready to merge!', got:\n%s", markdown)
+	if !strings.Contains(markdown, "No supported defects were identified in the supplied changes.") {
+		t.Fatalf("expected full coverage with zero findings to state only supported-defect absence, got:\n%s", markdown)
+	}
+	if strings.Contains(markdown, "Looks ready to merge") {
+		t.Fatalf("coverage of delivered diff must not certify merge readiness, got:\n%s", markdown)
 	}
 	if strings.Contains(markdown, "Partial Review Warning") {
 		t.Fatalf("expected no partial review warning on full coverage, got:\n%s", markdown)
@@ -260,8 +263,8 @@ func TestReport_LegacyReportWithoutLedger(t *testing.T) {
 
 	markdown := FormatReportMarkdown(report)
 
-	if !strings.Contains(markdown, "Looks ready to merge!") {
-		t.Fatalf("expected legacy review with no ledger and zero findings to say 'Looks ready to merge!', got:\n%s", markdown)
+	if !strings.Contains(markdown, "No supported defects were identified in the supplied changes.") {
+		t.Fatalf("expected legacy review with no ledger and zero findings to state only supported-defect absence, got:\n%s", markdown)
 	}
 	if strings.Contains(markdown, "Review Coverage") {
 		t.Fatalf("expected no Review Coverage section when ledger is nil, got:\n%s", markdown)

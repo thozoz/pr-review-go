@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1295,9 +1296,9 @@ func TestReviewerPromptsHandleConfinementDenied(t *testing.T) {
 	}
 }
 
-// REV-GATE-02: a review that examined zero code hunks must never be published;
-// executeAgentReview fails closed with ErrZeroCoverage so the job is marked failed.
-func TestReviewPRAtHead_ZeroCoverageGateFailsJob(t *testing.T) {
+// Diff-first: a valid diff is delivered in the initial prompt, so an immediate
+// answer without any read_file is accepted even when no snapshot exists.
+func TestReviewPRAtHead_DiffFirstNoReadSucceeds(t *testing.T) {
 	const (
 		baseSHA = "1111111111111111111111111111111111111111"
 		headSHA = "2222222222222222222222222222222222222222"
@@ -1311,7 +1312,7 @@ func TestReviewPRAtHead_ZeroCoverageGateFailsJob(t *testing.T) {
 			Choices: []llm.ChatChoice{{
 				Message: llm.ChatMessage{
 					Role:    "assistant",
-					Content: `{"action": "answer", "score": 33, "summary": "Never read anything.", "findings": [{"file": "main.go", "line": 2, "severity": "CRITICAL", "title": "Fabricated defect", "description": "Hallucinated from filenames."}]}`,
+					Content: `{"action": "answer", "score": 33, "summary": "Reviewed from the delivered diff.", "findings": []}`,
 				},
 				FinishReason: "stop",
 			}},
@@ -1325,7 +1326,7 @@ func TestReviewPRAtHead_ZeroCoverageGateFailsJob(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 104,
-				"title":  "Zero coverage PR",
+				"title":  "Diff-first PR",
 				"body":   "Body",
 				"head":   map[string]any{"sha": headSHA, "ref": "feat"},
 				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
@@ -1364,17 +1365,148 @@ func TestReviewPRAtHead_ZeroCoverageGateFailsJob(t *testing.T) {
 	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
 
 	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 104, headSHA)
-	if err == nil {
-		t.Fatalf("expected zero-coverage failure, got report: %+v", report)
+	if err != nil {
+		t.Fatalf("a delivered valid diff must be reviewable without a snapshot, got: %v", err)
 	}
-	if !errors.Is(err, ErrZeroCoverage) {
-		t.Fatalf("expected error wrapping ErrZeroCoverage, got: %v", err)
+	if report == nil {
+		t.Fatal("expected a report")
 	}
-	if !strings.Contains(err.Error(), "LLM_ZERO_COVERAGE") {
-		t.Errorf("expected actionable LLM_ZERO_COVERAGE error, got: %v", err)
+	cov := report.GetCoverage()
+	if cov == nil || cov.ExaminedCount != 1 || cov.TotalHunks != 1 {
+		t.Fatalf("coverage = %+v, want the delivered hunk examined", cov)
 	}
-	if llmCalls == 0 {
-		t.Errorf("expected the agent to have run before the gate rejected publication")
+	if llmCalls != 1 {
+		t.Errorf("llmCalls = %d, want 1 (an immediate answer without reads)", llmCalls)
+	}
+}
+
+// With sandbox execution disabled the snapshot is still prepared for the
+// optional read-only tools, but no untrusted build/test command runs.
+func TestReviewPRAtHead_SandboxDisabledKeepsReadOnlySnapshotTools(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	snapDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(snapDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snapDir, "reference.go"), []byte("package main\n\nconst answer = 42\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var llmCalls int32
+	var mu sync.Mutex
+	var prompts []string
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		for _, msg := range req.Messages {
+			if msg.Role == "user" {
+				prompts = append(prompts, msg.Content)
+			}
+		}
+		mu.Unlock()
+
+		content := `{"action": "read_file", "path": "reference.go"}`
+		if atomic.AddInt32(&llmCalls, 1) > 1 {
+			content = `{"action": "answer", "score": 90, "summary": "Context inspected.", "findings": []}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{Choices: []llm.ChatChoice{{
+			Message:      llm.ChatMessage{Role: "assistant", Content: content},
+			FinishReason: "stop",
+		}}})
+	}))
+	defer llmServer.Close()
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/106"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 106,
+				"title":  "Read-only snapshot",
+				"body":   "Body",
+				"head":   map[string]any{"sha": headSHA, "ref": "feat"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,3 @@\n package main\n+func main() {}\n"))
+		case strings.Contains(r.URL.Path, "/issues/106/comments"), strings.Contains(r.URL.Path, "/pulls/106/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := sandbox.NewRunner(0)
+	runner.SourceProvider = &mockSourceProvider{snapshot: &sandbox.Snapshot{CommitSHA: headSHA, SourceDir: snapDir}}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false, // Read-only inspection only; no execution.
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, runner)
+
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 106, headSHA)
+	if err != nil {
+		t.Fatalf("review failed: %v", err)
+	}
+	if report.VerificationSummary != "Sandbox verification skipped." {
+		t.Fatalf("verification summary = %q, want the honest skipped summary", report.VerificationSummary)
+	}
+	if report.GetCoverage() == nil || report.GetCoverage().ExaminedCount != 1 {
+		t.Fatalf("coverage = %+v, want the delivered diff hunk examined", report.GetCoverage())
+	}
+	if atomic.LoadInt32(&llmCalls) != 2 {
+		t.Errorf("llmCalls = %d, want 2 (read then answer)", llmCalls)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(prompts) < 2 || !strings.Contains(prompts[1], "const answer = 42") {
+		t.Errorf("read-only snapshot tool must serve files while sandbox execution is disabled, prompts = %v", prompts)
+	}
+}
+
+// checkAgentCoverage is the fail-closed publication guard. Diff delivery makes
+// the zero-examined state unreachable through the engine for a valid diff, so
+// the contract is pinned directly against the ledger.
+func TestCheckAgentCoverageFailsClosed(t *testing.T) {
+	inv := diff.Parse("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+func main() {}\n")
+	ledger := diff.NewCoverageLedger(inv)
+	if err := checkAgentCoverage(ledger); !errors.Is(err, ErrZeroCoverage) {
+		t.Fatalf("undelivered examinable hunk must fail closed, got %v", err)
+	}
+
+	ledger.MarkExamined("main.go#H1")
+	if err := checkAgentCoverage(ledger); err != nil {
+		t.Fatalf("delivered hunk must pass the gate, got %v", err)
+	}
+
+	if err := checkAgentCoverage(nil); err != nil {
+		t.Fatalf("nil ledger must not panic or fail, got %v", err)
+	}
+
+	nonCode := diff.Parse("diff --git a/logo.png b/logo.png\nnew file mode 100644\nBinary files /dev/null and b/logo.png differ\n")
+	if err := checkAgentCoverage(diff.NewCoverageLedger(nonCode)); err != nil {
+		t.Fatalf("non-code PR must bypass the zero-coverage gate, got %v", err)
 	}
 }
 

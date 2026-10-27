@@ -114,6 +114,21 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	return e.executeReview(ctx, pr, diff)
 }
 
+// checkAgentCoverage is the fail-closed publication guard (REV-GATE-02): a
+// ledger with examinable code hunks but no examined hunk cannot ground any
+// finding, so the job fails instead of publishing an ungrounded review.
+// Diff-first delivery marks every delivered hunk examined; this guard therefore
+// only fires if delivery itself produced no reviewable evidence.
+func checkAgentCoverage(ledger *diff.CoverageLedger) error {
+	if ledger == nil {
+		return nil
+	}
+	if examinable := ledger.ExaminableCount(); examinable > 0 && ledger.ExaminedCount() == 0 {
+		return fmt.Errorf("%w: examined 0 of %d examinable hunks", ErrZeroCoverage, examinable)
+	}
+	return nil
+}
+
 func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, rawDiff string, networkFetch, trustedReverified bool) (*ReviewReport, error) {
 	owner := pr.Owner
 	repo := pr.Repo
@@ -146,13 +161,18 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 	}
 	defer cleanOnce()
 
-	if e.cfg.EnableSandbox && e.sandbox != nil {
-		snapshot, snapCleanup, err := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
-		if err == nil {
+	// A snapshot serves two independent purposes: read-only inspection of the
+	// PR's files, and optional build/test verification. The read-only tools are
+	// valuable even when sandbox execution is disabled, so the snapshot is
+	// prepared whenever a runner exists; only RunSnapshotWithNetwork executes
+	// untrusted commands, and that stays gated on EnableSandbox.
+	if e.sandbox != nil {
+		snapshot, snapCleanup, prepErr := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+		if prepErr == nil {
 			snap = snapshot
 			cleanup = snapCleanup
 
-			// Validate snapshot before exploration and verification
+			// Validate snapshot identity before either inspection or verification.
 			if err := snap.Validate(); err != nil {
 				cleanOnce()
 				return nil, fmt.Errorf("snapshot validation failed: %w", err)
@@ -162,36 +182,42 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 				return nil, fmt.Errorf("snapshot commit SHA %s does not match PR head SHA %s", snap.CommitSHA, pr.HeadSHA)
 			}
 
-			// Run sandbox verification
-			verReport, err := e.sandbox.RunSnapshotWithNetwork(ctx, snap, networkFetch, trustedReverified)
-			if err == nil {
-				verificationStatus = verReport.Status
-				verificationReason = verReport.Reason
-				verificationSummary = verReport.Summary
-				if verReport.Status == sandbox.StatusPassed {
-					sandboxVerified = true
-				} else {
-					sandboxVerified = false
-					if verReport.Reason != "" {
-						verificationSummary = fmt.Sprintf("[%s] %s: %s", verReport.Status, verReport.Summary, verReport.Reason)
-					}
-				}
-				for _, res := range verReport.Results {
-					if !res.Passed {
+			if e.cfg.EnableSandbox {
+				// Run sandbox verification
+				verReport, verErr := e.sandbox.RunSnapshotWithNetwork(ctx, snap, networkFetch, trustedReverified)
+				if verErr == nil {
+					verificationStatus = verReport.Status
+					verificationReason = verReport.Reason
+					verificationSummary = verReport.Summary
+					if verReport.Status == sandbox.StatusPassed {
+						sandboxVerified = true
+					} else {
 						sandboxVerified = false
-						verificationSummary += fmt.Sprintf("\nCommand `%s` failed (exit %d):\n```\n%s%s\n```",
-							res.Command, res.ExitCode, res.Stdout, res.Stderr)
+						if verReport.Reason != "" {
+							verificationSummary = fmt.Sprintf("[%s] %s: %s", verReport.Status, verReport.Summary, verReport.Reason)
+						}
 					}
+					for _, res := range verReport.Results {
+						if !res.Passed {
+							sandboxVerified = false
+							verificationSummary += fmt.Sprintf("\nCommand `%s` failed (exit %d):\n```\n%s%s\n```",
+								res.Command, res.ExitCode, res.Stdout, res.Stderr)
+						}
+					}
+				} else {
+					verificationStatus = sandbox.StatusUnavailable
+					verificationReason = verErr.Error()
+					verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", verErr)
 				}
-			} else {
-				verificationStatus = sandbox.StatusUnavailable
-				verificationReason = err.Error()
-				verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
 			}
-		} else {
+		} else if e.cfg.EnableSandbox {
 			verificationStatus = sandbox.StatusUnavailable
-			verificationReason = err.Error()
-			verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
+			verificationReason = prepErr.Error()
+			verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", prepErr)
+		} else {
+			// No snapshot means no optional context tools, but the delivered diff
+			// is still reviewable. Keep the honest skipped-verification summary.
+			log.Printf("[reviewer] snapshot unavailable for read-only context tools: %v", prepErr)
 		}
 	}
 
@@ -205,10 +231,8 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 
 	// REV-GATE-02: fail closed when the agent examined zero code hunks, so an
 	// ungrounded review is never published (the job transitions to failed).
-	if ledger != nil {
-		if examinable := ledger.ExaminableCount(); examinable > 0 && ledger.ExaminedCount() == 0 {
-			return nil, fmt.Errorf("%w: examined 0 of %d examinable hunks", ErrZeroCoverage, examinable)
-		}
+	if err := checkAgentCoverage(ledger); err != nil {
+		return nil, err
 	}
 
 	// Deduplicate findings against existing comments
@@ -775,6 +799,8 @@ func FormatReportMarkdown(r *ReviewReport) string {
 			sb.WriteString(fmt.Sprintf("- **Status:** Full (%d/%d hunks examined)\n",
 				cov.ExaminedCount, cov.TotalHunks))
 		}
+		// Coverage is evidence accounting, not a correctness or inspection claim.
+		sb.WriteString("- **Basis:** Coverage counts the diff hunks supplied to the reviewer. It is not proof that whole files were inspected or that the code is correct.\n")
 
 		const maxItems = 25
 
@@ -957,7 +983,9 @@ func FormatReportMarkdown(r *ReviewReport) string {
 			if isPartial {
 				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected in examined files. (Review was partial; unexamined changes have not been verified and are not cleared for merge.)\n\n")
 			} else {
-				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected. Looks ready to merge!\n\n")
+				// Coverage records diff hunks supplied to the reviewer, not proof
+				// of full-file inspection, so it can never certify merge readiness.
+				sb.WriteString("### 🎯 Findings\nNo supported defects were identified in the supplied changes. This is not proof that the change is correct or ready to merge.\n\n")
 			}
 		}
 	} else {
