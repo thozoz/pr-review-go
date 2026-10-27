@@ -1533,6 +1533,76 @@ func TestParseAgentAction_DeepSeekDSML(t *testing.T) {
 	}
 }
 
+// Live aura-web PR #10 emitted the DSML delimiter with repeated fullwidth pipes
+// on each side (two bars around the DSML word) inside a tool-calls wrapper, and
+// every such reply was rejected, wasting the turn. The literal DSML word must
+// identify the marker regardless of how many pipes surround it.
+func TestParseAgentAction_RepeatedBarDSML(t *testing.T) {
+	p := "｜"
+	// Two bars on each side, matching the live encoding.
+	bar := p + p
+	pre := "<" + bar + "DSML" + bar
+	end := "</" + bar + "DSML" + bar
+	tag := func(name, attrs, body string) string {
+		return pre + " " + name + attrs + ">" + body + end + " " + name + ">"
+	}
+	param := func(attrs, value string) string { return tag("parameter", attrs, value) }
+	invoke := func(attrs, body string) string { return tag("invoke", attrs, body) }
+	wrapper := func(kind, body string) string { return tag(kind, "", body) }
+
+	single := invoke(` name="read_file"`, param(` name="path" string="true"`, "internal/api/common.go"))
+	if got, err := parseAgentAction(single); err != nil || got.Path != "internal/api/common.go" {
+		t.Fatalf("two-bar DSML read_file must parse: action=%+v error=%v", got, err)
+	}
+
+	raw := wrapper("calls", invoke(` name="read_file"`, param(` name="path" string="true"`, "internal/state/state.go"))+
+		invoke(` name="read_file"`, param(` name="path" string="true"`, "internal/state/store.go")))
+	actions, err := parseAgentActions(raw)
+	if err != nil {
+		t.Fatalf("two-bar DSML inside a calls wrapper must parse: %v", err)
+	}
+	if len(actions) != 2 || actions[0].Path != "internal/state/state.go" || actions[1].Path != "internal/state/store.go" {
+		t.Fatalf("got %+v, want the two wrapped reads in order", actions)
+	}
+
+	if got, err := parseAgentAction(invoke(` name="list_files"`, param(` name="path"`, "internal/site"))); err != nil ||
+		got.Action != "list_files" || got.Path != "internal/site" {
+		t.Fatalf("two-bar DSML list_files must parse: action=%+v error=%v", got, err)
+	}
+
+	// Finding evidence survives the repeated-bar spelling too.
+	answer := invoke(` name="answer"`, param(` name="summary"`, "One defect.")+
+		param(` name="score"`, "40")+
+		param(` name="findings"`, `[{"file":"a.go","line":3,"severity":"WARNING","title":"Unsafe input","description":"Untrusted input reaches output."}]`))
+	if got, err := parseAgentAction(answer); err != nil || got.Action != "answer" || len(got.Findings) != 1 || got.Findings[0].Title != "Unsafe input" {
+		t.Fatalf("two-bar DSML answer must preserve findings: action=%+v error=%v", got, err)
+	}
+}
+
+// Pipes without the DSML word are malformed markup, not a dialect: a bare run
+// of fullwidth pipes must stay unrecognized instead of being guessed at.
+func TestParseAgentAction_MalformedRepeatedBarsRejected(t *testing.T) {
+	p := "｜"
+	raw := "<" + p + p + p + " calls> <" + p + p + p + ` invoke name="list_files"> <` + p + p + p +
+		` parameter name="path" string="true">internal/site</` + p + p + p + "> </" + p + p + p + "> </" +
+		p + p + p + " invoke> </" + p + p + p + " calls>"
+	if actions, err := parseAgentActions(raw); err == nil {
+		t.Fatalf("pipe-only markup without the DSML word must not parse, got %+v", actions)
+	}
+}
+
+// Mixing JSON with repeated-bar DSML stays ambiguous and is rejected whole;
+// neither half is executed or silently dropped.
+func TestParseAgentActions_RepeatedBarDSMLMixedWithJSONRejected(t *testing.T) {
+	p := "｜"
+	bar := p + p
+	xmlRead := "<" + bar + "DSML" + bar + ` invoke name="read_file"><` + bar + "DSML" + bar +
+		` parameter name="path">a.go</` + bar + "DSML" + bar + " parameter></" + bar + "DSML" + bar + " invoke>"
+	if _, err := parseAgentActions(`{"action":"read_file","path":"b.go"}` + xmlRead); !errors.Is(err, ErrAmbiguousAgentReply) {
+		t.Fatalf("JSON mixed with two-bar DSML must be ambiguous, got %v", err)
+	}
+}
+
 // A reply may legitimately batch several reads; they must all be extracted, in
 // the order the model wrote them, across plain and prefixed tags.
 func TestParseAgentActions_MultipleInOrder(t *testing.T) {

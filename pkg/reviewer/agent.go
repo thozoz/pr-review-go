@@ -892,9 +892,13 @@ func parseJSONAgentActions(raw string) []*AgentAction {
 	return actions
 }
 
-// dsmlPrefix matches the optional DeepSeek DSML marker before a tag name, as in
-// the fullwidth-pipe form. Plain tags keep matching with the group absent.
-const dsmlPrefix = `(?:[｜|]DSML[｜|]\s+)?`
+// dsmlPrefix matches the optional DeepSeek DSML marker before a tag name. Live
+// models sometimes emit the delimiter with repeated fullwidth pipes on each
+// side (two bars around the DSML word instead of one); one to four pipes are
+// accepted because the literal DSML word, not the pipe count, identifies a real
+// marker. A run of pipes without DSML stays unrecognized. Plain tags match with
+// the group absent.
+const dsmlPrefix = `(?:[｜|]{1,4}DSML[｜|]{1,4}\s+)?`
 
 // xmlInvokePattern captures an invoke block and its raw attribute list.
 var xmlInvokePattern = regexp.MustCompile(`(?is)<` + dsmlPrefix + `invoke\b([^>]*)>(.*?)</` + dsmlPrefix + `invoke\s*>`)
