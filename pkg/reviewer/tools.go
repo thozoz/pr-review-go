@@ -16,13 +16,13 @@ import (
 
 // SnapshotTools provides confined read-only access to a repository snapshot.
 type SnapshotTools struct {
-	mu                sync.Mutex
-	workDir           string
-	maxReadBytes      int64
-	maxToolBytes      int64
-	maxSearchMatches  int
-	bytesConsumed     int64
-	budgetExhausted   bool
+	mu               sync.Mutex
+	workDir          string
+	maxReadBytes     int64
+	maxToolBytes     int64
+	maxSearchMatches int
+	bytesConsumed    int64
+	budgetExhausted  bool
 }
 
 // NewSnapshotTools creates a new tool handler confined to workDir.
@@ -113,75 +113,80 @@ func (st *SnapshotTools) debitAndBound(rawOutput string) string {
 
 // ReadFile reads a file confined to the snapshot root.
 func (st *SnapshotTools) ReadFile(userPath string) (string, error) {
+	content, _, err := st.readFile(userPath)
+	return content, err
+}
+
+// readFile also reports whether EOF was reached and every byte was delivered.
+func (st *SnapshotTools) readFile(userPath string) (string, bool, error) {
 	if userPath == "" {
-		return "", fmt.Errorf("empty path")
+		return "", false, fmt.Errorf("empty path")
 	}
 
 	if strings.ContainsRune(userPath, 0) {
-		return "", fmt.Errorf("invalid path: contains null byte")
+		return "", false, fmt.Errorf("invalid path: contains null byte")
 	}
 	if filepath.IsAbs(userPath) || filepath.VolumeName(userPath) != "" ||
 		strings.HasPrefix(userPath, "/") || strings.HasPrefix(userPath, "\\") ||
 		(len(userPath) >= 2 && ((userPath[0] >= 'a' && userPath[0] <= 'z') || (userPath[0] >= 'A' && userPath[0] <= 'Z')) && userPath[1] == ':') {
-		return "", fmt.Errorf("absolute paths are not permitted")
+		return "", false, fmt.Errorf("absolute paths are not permitted")
 	}
 
 	cleanRel := filepath.Clean(userPath)
 	slashRel := filepath.ToSlash(cleanRel)
 	if slashRel == "." {
-		return "", fmt.Errorf("cannot read directory as file")
+		return "", false, fmt.Errorf("cannot read directory as file")
 	}
 	if slashRel == ".." || strings.HasPrefix(slashRel, "../") {
-		return "", fmt.Errorf("path outside workspace")
+		return "", false, fmt.Errorf("path outside workspace")
 	}
 	if isGitPath(slashRel) {
-		return "", fmt.Errorf(".git paths are restricted")
+		return "", false, fmt.Errorf(".git paths are restricted")
 	}
 
 	root, err := os.OpenRoot(st.workDir)
 	if err != nil {
-		return "", fmt.Errorf("failed to open workspace: %w", err)
+		return "", false, fmt.Errorf("failed to open workspace: %w", err)
 	}
 	defer root.Close()
 
 	f, err := root.Open(cleanRel)
 	if err != nil {
 		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
-			return "", err
+			return "", false, err
 		}
-		return "", fmt.Errorf("access denied (%w)", err)
+		return "", false, fmt.Errorf("access denied (%w)", err)
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
-		return "", fmt.Errorf("failed to stat file: %w", err)
+		return "", false, fmt.Errorf("failed to stat file: %w", err)
 	}
 	if fi.IsDir() {
-		return "", fmt.Errorf("cannot read directory as file")
+		return "", false, fmt.Errorf("cannot read directory as file")
 	}
 	if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("access denied: not a regular file")
+		return "", false, fmt.Errorf("access denied: not a regular file")
 	}
 
 	if err := verifyFileHandle(f, st.workDir); err != nil {
-		return "", fmt.Errorf("access denied: %w", err)
+		return "", false, fmt.Errorf("access denied: %w", err)
 	}
 
 	limited := io.LimitReader(f, st.maxReadBytes+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
-		return "", fmt.Errorf("error reading file: %w", err)
+		return "", false, fmt.Errorf("error reading file: %w", err)
 	}
 
-	var output string
-	if int64(len(data)) > st.maxReadBytes {
+	complete := int64(len(data)) <= st.maxReadBytes
+	output := string(data)
+	if !complete {
 		output = string(data[:st.maxReadBytes]) + fmt.Sprintf("\n...[file truncated, exceeded %d bytes]...", st.maxReadBytes)
-	} else {
-		output = string(data)
 	}
-
-	return st.debitAndBound(output), nil
+	bounded := st.debitAndBound(output)
+	return bounded, complete && bounded == output, nil
 }
 
 // ListFiles lists up to 100 directory entries confined to the snapshot root.

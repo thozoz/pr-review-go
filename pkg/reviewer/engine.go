@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -112,6 +114,21 @@ func (e *Engine) ReviewPR(ctx context.Context, owner, repo string, number int) (
 	return e.executeReview(ctx, pr, diff)
 }
 
+// checkAgentCoverage is the fail-closed publication guard (REV-GATE-02): a
+// ledger with examinable code hunks but no examined hunk cannot ground any
+// finding, so the job fails instead of publishing an ungrounded review.
+// Diff-first delivery marks every delivered hunk examined; this guard therefore
+// only fires if delivery itself produced no reviewable evidence.
+func checkAgentCoverage(ledger *diff.CoverageLedger) error {
+	if ledger == nil {
+		return nil
+	}
+	if examinable := ledger.ExaminableCount(); examinable > 0 && ledger.ExaminedCount() == 0 {
+		return fmt.Errorf("%w: examined 0 of %d examinable hunks", ErrZeroCoverage, examinable)
+	}
+	return nil
+}
+
 func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, rawDiff string, networkFetch, trustedReverified bool) (*ReviewReport, error) {
 	owner := pr.Owner
 	repo := pr.Repo
@@ -144,13 +161,18 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 	}
 	defer cleanOnce()
 
-	if e.cfg.EnableSandbox && e.sandbox != nil {
-		snapshot, snapCleanup, err := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
-		if err == nil {
+	// A snapshot serves two independent purposes: read-only inspection of the
+	// PR's files, and optional build/test verification. The read-only tools are
+	// valuable even when sandbox execution is disabled, so the snapshot is
+	// prepared whenever a runner exists; only RunSnapshotWithNetwork executes
+	// untrusted commands, and that stays gated on EnableSandbox.
+	if e.sandbox != nil {
+		snapshot, snapCleanup, prepErr := e.sandbox.PrepareSnapshot(ctx, pr.CloneURL, pr.HeadRef, pr.HeadSHA)
+		if prepErr == nil {
 			snap = snapshot
 			cleanup = snapCleanup
 
-			// Validate snapshot before exploration and verification
+			// Validate snapshot identity before either inspection or verification.
 			if err := snap.Validate(); err != nil {
 				cleanOnce()
 				return nil, fmt.Errorf("snapshot validation failed: %w", err)
@@ -160,36 +182,42 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 				return nil, fmt.Errorf("snapshot commit SHA %s does not match PR head SHA %s", snap.CommitSHA, pr.HeadSHA)
 			}
 
-			// Run sandbox verification
-			verReport, err := e.sandbox.RunSnapshotWithNetwork(ctx, snap, networkFetch, trustedReverified)
-			if err == nil {
-				verificationStatus = verReport.Status
-				verificationReason = verReport.Reason
-				verificationSummary = verReport.Summary
-				if verReport.Status == sandbox.StatusPassed {
-					sandboxVerified = true
-				} else {
-					sandboxVerified = false
-					if verReport.Reason != "" {
-						verificationSummary = fmt.Sprintf("[%s] %s: %s", verReport.Status, verReport.Summary, verReport.Reason)
-					}
-				}
-				for _, res := range verReport.Results {
-					if !res.Passed {
+			if e.cfg.EnableSandbox {
+				// Run sandbox verification
+				verReport, verErr := e.sandbox.RunSnapshotWithNetwork(ctx, snap, networkFetch, trustedReverified)
+				if verErr == nil {
+					verificationStatus = verReport.Status
+					verificationReason = verReport.Reason
+					verificationSummary = verReport.Summary
+					if verReport.Status == sandbox.StatusPassed {
+						sandboxVerified = true
+					} else {
 						sandboxVerified = false
-						verificationSummary += fmt.Sprintf("\nCommand `%s` failed (exit %d):\n```\n%s%s\n```",
-							res.Command, res.ExitCode, res.Stdout, res.Stderr)
+						if verReport.Reason != "" {
+							verificationSummary = fmt.Sprintf("[%s] %s: %s", verReport.Status, verReport.Summary, verReport.Reason)
+						}
 					}
+					for _, res := range verReport.Results {
+						if !res.Passed {
+							sandboxVerified = false
+							verificationSummary += fmt.Sprintf("\nCommand `%s` failed (exit %d):\n```\n%s%s\n```",
+								res.Command, res.ExitCode, res.Stdout, res.Stderr)
+						}
+					}
+				} else {
+					verificationStatus = sandbox.StatusUnavailable
+					verificationReason = verErr.Error()
+					verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", verErr)
 				}
-			} else {
-				verificationStatus = sandbox.StatusUnavailable
-				verificationReason = err.Error()
-				verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
 			}
-		} else {
+		} else if e.cfg.EnableSandbox {
 			verificationStatus = sandbox.StatusUnavailable
-			verificationReason = err.Error()
-			verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", err)
+			verificationReason = prepErr.Error()
+			verificationSummary = fmt.Sprintf("Sandbox verification unavailable: %v", prepErr)
+		} else {
+			// No snapshot means no optional context tools, but the delivered diff
+			// is still reviewable. Keep the honest skipped-verification summary.
+			log.Printf("[reviewer] snapshot unavailable for read-only context tools: %v", prepErr)
 		}
 	}
 
@@ -198,6 +226,12 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 	agentRes, err := agent.Run(ctx, pr, inv, ledger, snap, verificationSummary, verificationStatus, generalComments, threads)
 	cleanOnce() // Clean up snapshot and permit immediately after loop finishes
 	if err != nil {
+		return nil, err
+	}
+
+	// REV-GATE-02: fail closed when the agent examined zero code hunks, so an
+	// ungrounded review is never published (the job transitions to failed).
+	if err := checkAgentCoverage(ledger); err != nil {
 		return nil, err
 	}
 
@@ -217,6 +251,15 @@ func (e *Engine) executeAgentReview(ctx context.Context, pr *github.PRDetails, r
 	skippedCount := 0
 	if agentRes.Output != nil {
 		for _, f := range agentRes.Output.Findings {
+			// Models sometimes omit the file and the description, which rendered
+			// as a bare "(`:163`)" heading with an empty body (observed live on
+			// thozoz/aura-web PR #1). Recover what the inventory can tell us and
+			// refuse to publish a finding that carries no actionable text at all.
+			f = normalizeFinding(f, inv)
+			if strings.TrimSpace(f.Title) == "" && strings.TrimSpace(f.Description) == "" {
+				log.Printf("[reviewer] dropping finding with no title and no description (file=%q line=%d)", f.File, f.Line)
+				continue
+			}
 			fp := dedup.ComputeFingerprint(f.File, f.Line, f.Title, f.Severity)
 			if existingFPs[fp] {
 				skippedCount++
@@ -403,7 +446,33 @@ func parseVerificationStatus(status any) sandbox.VerificationStatus {
 	}
 }
 
+// reviewChecklistRule reminds the model to check independent concerns after a
+// severe finding, without requiring extra model calls or a findings quota.
+const reviewChecklistRule = `- Consider each applicable category across the changed files, reporting only defects you can support with evidence (an empty findings list is a valid outcome):
+  1. Security & Input Validation: untrusted input, injection (SQL, command, template), XSS, path traversal, auth/authz bypass, sensitive data exposure.
+  2. Concurrency & State: race conditions, deadlocks, atomicity, goroutine lifecycle, synchronization.
+  3. Logic & Reliability: nil dereferences, off-by-one errors, resource/connection leaks, unhandled errors.
+  4. API & Contract: breaking changes, schema mismatches, parameter validation, performance regressions.
+- One severe finding does not end the review: check the remaining applicable categories before answering.
+- For each changed input/output path, trace untrusted data through its transformations to the consuming operation; verify validation or escaping for that operation's context rather than assuming one protection makes neighboring paths safe.`
+
+// withReviewChecklist injects the shared checklist right after the CRITICAL
+// RULES heading so every verification status gets it without duplicating text.
+func withReviewChecklist(prompt string) string {
+	const anchor = "\nCRITICAL RULES:\n"
+	i := strings.Index(prompt, anchor)
+	if i < 0 {
+		return prompt + "\n" + reviewChecklistRule
+	}
+	at := i + len(anchor)
+	return prompt[:at] + reviewChecklistRule + "\n" + prompt[at:]
+}
+
 func buildSystemPrompt(status any) string {
+	return withReviewChecklist(buildStatusSystemPrompt(status))
+}
+
+func buildStatusSystemPrompt(status any) string {
 	st := parseVerificationStatus(status)
 	switch st {
 	case sandbox.StatusPassed:
@@ -431,7 +500,7 @@ Your role is to analyze Pull Requests by combining three critical signals:
 NOTE: Real live sandbox verification was executed and encountered failures. Do not claim or assume tests passed.
 
 CRITICAL RULES:
-- Never hallucinate false bugs. Live sandbox verification proved real failure (compilation or unit tests). Accurately focus on verified build/test defects.
+- Never hallucinate false bugs. Live sandbox verification proved real failure (compilation or unit tests). Analyze the verified build/test defects, then keep inspecting the changed files for independently supported security, input-validation and logic defects instead of stopping at the first failure.
 - Do not claim builds or tests passed when live sandbox verification reported failure.
 - If an existing discussion thread shows a concern was already acknowledged, discussed, or dismissed by the author/reviewer, DO NOT repeat it as a new issue.
 - If a reviewer previously requested a fix in a comment thread, verify whether the diff actually satisfies that request.
@@ -708,6 +777,13 @@ func FormatReportMarkdown(r *ReviewReport) string {
 
 	cov := r.GetCoverage()
 	isPartial := cov != nil && cov.State == CoverageStatePartial
+	// Defense-in-depth (REV-GATE-02): a report with zero examined hunks can
+	// only carry ungrounded findings, so they are never rendered.
+	zeroCoverage := cov != nil && cov.TotalHunks > 0 && cov.ExaminedCount == 0
+
+	if zeroCoverage {
+		sb.WriteString(fmt.Sprintf("> 🚫 **Zero Review Coverage Warning:** No hunks were examined (0 of %d hunks examined). Findings cannot be verified and are not published.\n\n", cov.TotalHunks))
+	}
 
 	if isPartial {
 		sb.WriteString(fmt.Sprintf("> ⚠️ **Partial Review Warning:** Review coverage is incomplete (%d of %d hunks examined, %d skipped). Unexamined changes have not been verified and are not cleared for merge.\n\n",
@@ -723,6 +799,8 @@ func FormatReportMarkdown(r *ReviewReport) string {
 			sb.WriteString(fmt.Sprintf("- **Status:** Full (%d/%d hunks examined)\n",
 				cov.ExaminedCount, cov.TotalHunks))
 		}
+		// Coverage is evidence accounting, not a correctness or inspection claim.
+		sb.WriteString("- **Basis:** Coverage counts the diff hunks supplied to the reviewer. It is not proof that whole files were inspected or that the code is correct.\n")
 
 		const maxItems = 25
 
@@ -800,7 +878,15 @@ func FormatReportMarkdown(r *ReviewReport) string {
 	}
 
 	hasClassified := r.Classification != nil || len(r.PersistingFindings) > 0 || len(r.FixedFindings) > 0 || len(r.NewFindings) > 0
-	if hasClassified {
+
+	hasUngroundedFindings := len(r.Findings) > 0 || len(r.PersistingFindings) > 0 || len(r.NewFindings) > 0
+	if r.Classification != nil {
+		hasUngroundedFindings = hasUngroundedFindings || len(r.Classification.Persisting) > 0 || len(r.Classification.New) > 0
+	}
+
+	if zeroCoverage && hasUngroundedFindings {
+		sb.WriteString(fmt.Sprintf("### 🎯 Findings\n⚠️ **Findings Suppressed:** The review agent did not examine any modified files (0 of %d hunks examined). Findings are suppressed to prevent fabricated or hallucinated feedback. (LLM_ZERO_COVERAGE)\n\n", cov.TotalHunks))
+	} else if hasClassified {
 		var persisting []PersistingFinding
 		var fixed []FixedFinding
 		var newFindings []Finding
@@ -897,7 +983,9 @@ func FormatReportMarkdown(r *ReviewReport) string {
 			if isPartial {
 				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected in examined files. (Review was partial; unexamined changes have not been verified and are not cleared for merge.)\n\n")
 			} else {
-				sb.WriteString("### 🎯 Findings\nNo critical bugs or defects detected. Looks ready to merge!\n\n")
+				// Coverage records diff hunks supplied to the reviewer, not proof
+				// of full-file inspection, so it can never certify merge readiness.
+				sb.WriteString("### 🎯 Findings\nNo supported defects were identified in the supplied changes. This is not proof that the change is correct or ready to merge.\n\n")
 			}
 		}
 	} else {
@@ -924,4 +1012,90 @@ func FormatReportMarkdown(r *ReviewReport) string {
 	}
 
 	return sb.String()
+}
+
+// normalizeFinding repairs findings that would otherwise render as an
+// unusable "(`:163`)" heading with an empty body.
+//
+// Observed live on thozoz/aura-web PR #1: the model emitted correct titles and
+// line numbers but left `file` and `description` empty, so the published review
+// contained headings that pointed nowhere and explained nothing. When the file
+// can be recovered from the inventory (a unique file whose hunks cover the
+// reported line, or an inventory path mentioned in the title) it is filled in;
+// otherwise a stable placeholder keeps the heading readable. Nothing else is
+// invented — a finding with no title AND no description is dropped by the
+// caller instead.
+func normalizeFinding(f Finding, inv *diff.ChangeInventory) Finding {
+	f.File = strings.TrimSpace(f.File)
+	f.Title = strings.TrimSpace(f.Title)
+	f.Description = strings.TrimSpace(f.Description)
+	f.Severity = strings.ToUpper(strings.TrimSpace(f.Severity))
+
+	if f.Severity == "" {
+		f.Severity = "WARNING"
+	}
+
+	if f.File == "" {
+		f.File = inferFindingFile(f, inv)
+	}
+	if f.File == "" {
+		f.File = "(unspecified file)"
+	}
+	return f
+}
+
+// inferFindingFile tries to attribute a fileless finding to a file in the change
+// inventory, using only evidence already present in the finding itself.
+func inferFindingFile(f Finding, inv *diff.ChangeInventory) string {
+	if inv == nil || len(inv.Files) == 0 {
+		return ""
+	}
+
+	// 1. The title or description may name the file outright.
+	haystack := f.Title + "\n" + f.Description
+	var named []string
+	for _, file := range inv.Files {
+		if file == nil || file.Path == "" {
+			continue
+		}
+		base := filepath.Base(file.Path)
+		if strings.Contains(haystack, file.Path) || (base != "" && strings.Contains(haystack, base)) {
+			named = append(named, file.Path)
+		}
+	}
+	if len(named) == 1 {
+		return named[0]
+	}
+
+	// 2. A reported line contained by exactly one file's hunk range.
+	if f.Line > 0 {
+		var covering []string
+		for _, file := range inv.Files {
+			if file == nil {
+				continue
+			}
+			for _, h := range file.Hunks {
+				if f.Line >= h.NewStart && f.Line < h.NewStart+h.NewCount {
+					covering = append(covering, file.Path)
+					break
+				}
+			}
+		}
+		if len(covering) == 1 {
+			return covering[0]
+		}
+	}
+
+	// 3. Comments about missing imports etc. most often belong to a Go source
+	// file, but only when the inventory contains exactly one.
+	var goFiles []string
+	for _, file := range inv.Files {
+		if file != nil && strings.HasSuffix(file.Path, ".go") {
+			goFiles = append(goFiles, file.Path)
+		}
+	}
+	if len(goFiles) == 1 {
+		return goFiles[0]
+	}
+	return ""
 }

@@ -3,6 +3,7 @@ package reviewer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,11 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/thozoz/pr-review-go/pkg/config"
+	"github.com/thozoz/pr-review-go/pkg/diff"
 	"github.com/thozoz/pr-review-go/pkg/github"
 	"github.com/thozoz/pr-review-go/pkg/llm"
 	"github.com/thozoz/pr-review-go/pkg/sandbox"
@@ -480,6 +483,35 @@ func TestPromptAndReportFormattingForAllVerificationStatuses(t *testing.T) {
 			sysPrompt := buildSystemPrompt(tc.status)
 			if !strings.Contains(sysPrompt, tc.expectedSys) {
 				t.Errorf("system prompt for status %q missing expected substring %q", tc.status, tc.expectedSys)
+			}
+
+			for _, want := range []string{
+				"Consider each applicable category across the changed files",
+				"reporting only defects you can support with evidence",
+				"an empty findings list is a valid outcome",
+				"Security & Input Validation", "injection", "XSS", "path traversal",
+				"Concurrency & State", "race conditions",
+				"Logic & Reliability", "API & Contract", "performance regressions",
+				"One severe finding does not end the review",
+				"trace untrusted data through its transformations to the consuming operation",
+				"verify validation or escaping for that operation's context",
+				"rather than assuming one protection makes neighboring paths safe",
+				"Focus strictly on real defects",
+			} {
+				if !strings.Contains(sysPrompt, want) {
+					t.Errorf("system prompt for status %q missing checklist contract %q", tc.status, want)
+				}
+			}
+			if strings.Count(sysPrompt, "Security & Input Validation") != 1 {
+				t.Error("system prompt must contain the shared checklist exactly once")
+			}
+			if tc.status == sandbox.StatusBuildFailed || tc.status == sandbox.StatusTestFailed {
+				if strings.Contains(sysPrompt, "Accurately focus on verified build/test defects.") {
+					t.Error("failed verification must not narrow inspection to build/test defects")
+				}
+				if !strings.Contains(sysPrompt, "keep inspecting the changed files for independently supported security, input-validation and logic defects") {
+					t.Error("failed verification must preserve independent defect inspection")
+				}
 			}
 
 			userPrompt := buildUserPrompt(pr, "", nil, nil, "STATUS: "+string(tc.status), tc.status)
@@ -1261,5 +1293,368 @@ func TestReviewerPromptsHandleConfinementDenied(t *testing.T) {
 	user := buildUserPrompt(&github.PRDetails{Title: "t", Author: "a", BaseRef: "main", HeadRef: "f"}, "", nil, nil, "STATUS", sandbox.StatusConfinementDenied)
 	if !strings.Contains(user, "Confinement Denied") {
 		t.Errorf("user prompt heading must name the denial: %q", user)
+	}
+}
+
+// Diff-first: a valid diff is delivered in the initial prompt, so an immediate
+// answer without any read_file is accepted even when no snapshot exists.
+func TestReviewPRAtHead_DiffFirstNoReadSucceeds(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	llmCalls := 0
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{{
+				Message: llm.ChatMessage{
+					Role:    "assistant",
+					Content: `{"action": "answer", "score": 33, "summary": "Reviewed from the delivered diff.", "findings": []}`,
+				},
+				FinishReason: "stop",
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/104"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 104,
+				"title":  "Diff-first PR",
+				"body":   "Body",
+				"head":   map[string]any{"sha": headSHA, "ref": "feat"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,3 @@\n package main\n+func main() {}\n"))
+		case strings.Contains(r.URL.Path, "/issues/104/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pulls/104/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false,
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 104, headSHA)
+	if err != nil {
+		t.Fatalf("a delivered valid diff must be reviewable without a snapshot, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected a report")
+	}
+	cov := report.GetCoverage()
+	if cov == nil || cov.ExaminedCount != 1 || cov.TotalHunks != 1 {
+		t.Fatalf("coverage = %+v, want the delivered hunk examined", cov)
+	}
+	if llmCalls != 1 {
+		t.Errorf("llmCalls = %d, want 1 (an immediate answer without reads)", llmCalls)
+	}
+}
+
+// With sandbox execution disabled the snapshot is still prepared for the
+// optional read-only tools, but no untrusted build/test command runs.
+func TestReviewPRAtHead_SandboxDisabledKeepsReadOnlySnapshotTools(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	snapDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(snapDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snapDir, "reference.go"), []byte("package main\n\nconst answer = 42\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var llmCalls int32
+	var mu sync.Mutex
+	var prompts []string
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		for _, msg := range req.Messages {
+			if msg.Role == "user" {
+				prompts = append(prompts, msg.Content)
+			}
+		}
+		mu.Unlock()
+
+		content := `{"action": "read_file", "path": "reference.go"}`
+		if atomic.AddInt32(&llmCalls, 1) > 1 {
+			content = `{"action": "answer", "score": 90, "summary": "Context inspected.", "findings": []}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{Choices: []llm.ChatChoice{{
+			Message:      llm.ChatMessage{Role: "assistant", Content: content},
+			FinishReason: "stop",
+		}}})
+	}))
+	defer llmServer.Close()
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/106"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 106,
+				"title":  "Read-only snapshot",
+				"body":   "Body",
+				"head":   map[string]any{"sha": headSHA, "ref": "feat"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,3 @@\n package main\n+func main() {}\n"))
+		case strings.Contains(r.URL.Path, "/issues/106/comments"), strings.Contains(r.URL.Path, "/pulls/106/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner := sandbox.NewRunner(0)
+	runner.SourceProvider = &mockSourceProvider{snapshot: &sandbox.Snapshot{CommitSHA: headSHA, SourceDir: snapDir}}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false, // Read-only inspection only; no execution.
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, runner)
+
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 106, headSHA)
+	if err != nil {
+		t.Fatalf("review failed: %v", err)
+	}
+	if report.VerificationSummary != "Sandbox verification skipped." {
+		t.Fatalf("verification summary = %q, want the honest skipped summary", report.VerificationSummary)
+	}
+	if report.GetCoverage() == nil || report.GetCoverage().ExaminedCount != 1 {
+		t.Fatalf("coverage = %+v, want the delivered diff hunk examined", report.GetCoverage())
+	}
+	if atomic.LoadInt32(&llmCalls) != 2 {
+		t.Errorf("llmCalls = %d, want 2 (read then answer)", llmCalls)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(prompts) < 2 || !strings.Contains(prompts[1], "const answer = 42") {
+		t.Errorf("read-only snapshot tool must serve files while sandbox execution is disabled, prompts = %v", prompts)
+	}
+}
+
+// checkAgentCoverage is the fail-closed publication guard. Diff delivery makes
+// the zero-examined state unreachable through the engine for a valid diff, so
+// the contract is pinned directly against the ledger.
+func TestCheckAgentCoverageFailsClosed(t *testing.T) {
+	inv := diff.Parse("diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+func main() {}\n")
+	ledger := diff.NewCoverageLedger(inv)
+	if err := checkAgentCoverage(ledger); !errors.Is(err, ErrZeroCoverage) {
+		t.Fatalf("undelivered examinable hunk must fail closed, got %v", err)
+	}
+
+	ledger.MarkExamined("main.go#H1")
+	if err := checkAgentCoverage(ledger); err != nil {
+		t.Fatalf("delivered hunk must pass the gate, got %v", err)
+	}
+
+	if err := checkAgentCoverage(nil); err != nil {
+		t.Fatalf("nil ledger must not panic or fail, got %v", err)
+	}
+
+	nonCode := diff.Parse("diff --git a/logo.png b/logo.png\nnew file mode 100644\nBinary files /dev/null and b/logo.png differ\n")
+	if err := checkAgentCoverage(diff.NewCoverageLedger(nonCode)); err != nil {
+		t.Fatalf("non-code PR must bypass the zero-coverage gate, got %v", err)
+	}
+}
+
+// REV-GATE-02: binary/mode-only-only PRs have zero examinable hunks and must
+// not be blocked by the zero-coverage gate.
+func TestReviewPRAtHead_NonCodePRBypassesZeroCoverageGate(t *testing.T) {
+	const (
+		baseSHA = "1111111111111111111111111111111111111111"
+		headSHA = "2222222222222222222222222222222222222222"
+	)
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(llm.ChatResponse{
+			Choices: []llm.ChatChoice{{
+				Message: llm.ChatMessage{
+					Role:    "assistant",
+					Content: `{"action": "answer", "score": 90, "summary": "Only binary and mode changes.", "findings": []}`,
+				},
+				FinishReason: "stop",
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	rawDiff := `diff --git a/logo.png b/logo.png
+new file mode 100644
+Binary files /dev/null and b/logo.png differ
+diff --git a/run.sh b/run.sh
+old mode 100644
+new mode 100755
+`
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls/105"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 105,
+				"title":  "Non-code PR",
+				"body":   "Body",
+				"head":   map[string]any{"sha": headSHA, "ref": "feat"},
+				"base":   map[string]any{"sha": baseSHA, "ref": "main"},
+				"user":   map[string]any{"login": "dev"},
+			})
+		case strings.Contains(r.URL.Path, "/compare/"):
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte(rawDiff))
+		case strings.Contains(r.URL.Path, "/issues/105/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case strings.Contains(r.URL.Path, "/pulls/105/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ghServer.Close()
+
+	ghClient, err := github.NewTestClient(ghServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		EffortLevel:   "lite",
+		EnableSandbox: false,
+		LLMBaseURL:    llmServer.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "test-model",
+	}
+	llmClient := llm.NewClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llmClient.SetHTTPClient(newFixtureClient(llmServer.URL))
+
+	eng := NewEngineWithClients(cfg, ghClient, llmClient, nil)
+
+	report, err := eng.ReviewPRAtHead(context.Background(), "owner", "repo", 105, headSHA)
+	if err != nil {
+		t.Fatalf("non-code PR must not be blocked by the zero-coverage gate, got: %v", err)
+	}
+	if report == nil {
+		t.Fatal("expected a report for a non-code PR")
+	}
+	if report.HeadSHA != headSHA {
+		t.Errorf("expected report head SHA %s, got %s", headSHA, report.HeadSHA)
+	}
+}
+
+// Live regression: models emitted findings with correct titles and line numbers
+// but an empty `file` and empty `description`, which rendered as a heading that
+// pointed nowhere and explained nothing (thozoz/aura-web PR #1).
+func TestNormalizeFinding_RepairsMissingFileAndDescription(t *testing.T) {
+	inv := &diff.ChangeInventory{
+		Files: []*diff.FileDiff{
+			{Path: "internal/site/search.go", Hunks: []*diff.Hunk{{NewStart: 140, NewCount: 40}}},
+			{Path: "internal/site/rss.go", Hunks: []*diff.Hunk{{NewStart: 1, NewCount: 30}}},
+		},
+	}
+
+	cases := []struct {
+		name     string
+		in       Finding
+		wantFile string
+	}{
+		{
+			name:     "line covered by exactly one file",
+			in:       Finding{Line: 163, Severity: "critical", Title: "slice bounds"},
+			wantFile: "internal/site/search.go",
+		},
+		{
+			name:     "file named in title",
+			in:       Finding{Line: 0, Title: "panic in internal/site/rss.go"},
+			wantFile: "internal/site/rss.go",
+		},
+		{
+			name:     "nothing recoverable gets a placeholder",
+			in:       Finding{Line: 99999, Title: "vague concern"},
+			wantFile: "(unspecified file)",
+		},
+		{
+			name:     "explicit file is preserved",
+			in:       Finding{File: "web/static/site.css", Line: 10, Title: "contrast"},
+			wantFile: "web/static/site.css",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeFinding(tc.in, inv)
+			if got.File != tc.wantFile {
+				t.Errorf("File = %q, want %q", got.File, tc.wantFile)
+			}
+			if got.Severity != "CRITICAL" && tc.in.Severity == "critical" {
+				t.Errorf("Severity = %q, want uppercased CRITICAL", got.Severity)
+			}
+			if got.Severity == "" {
+				t.Error("Severity must never be empty")
+			}
+		})
+	}
+}
+
+// A finding carrying neither a title nor a description must be dropped rather
+// than published as an empty heading.
+func TestNormalizeFinding_EmptyFindingIsDroppable(t *testing.T) {
+	got := normalizeFinding(Finding{Line: 5}, nil)
+	if strings.TrimSpace(got.Title) != "" || strings.TrimSpace(got.Description) != "" {
+		t.Fatalf("expected an empty finding to stay empty so the caller drops it, got %+v", got)
 	}
 }

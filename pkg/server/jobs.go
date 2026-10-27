@@ -54,11 +54,17 @@ func (e *ServerJobExecutor) ExecuteJob(ctx context.Context, job *Job) error {
 	var timeout time.Duration
 	switch job.Kind {
 	case "review":
-		timeout = 10 * time.Minute
+		// A gated review runs snapshot preparation plus sandbox verification,
+		// then a multi-turn read-only agent loop whose turns can each take tens
+		// of seconds on a reasoning model. 10 minutes left no headroom for the
+		// empty-completion fallback path, so jobs died with "context deadline
+		// exceeded" while still making progress (observed live on
+		// thozoz/aura-web PR #1).
+		timeout = 20 * time.Minute
 	case "edit":
 		// Edit jobs hold the per-PR slot for the whole gated pipeline
-		// (snapshot, LLM edit loop, verify, push); 10 minutes matches review.
-		timeout = 10 * time.Minute
+		// (snapshot, LLM edit loop, verify, push); matches review.
+		timeout = 20 * time.Minute
 	case "labels", "summary", "improve":
 		timeout = 2 * time.Minute
 	case "describe", "changelog", "docs", "approve", "request_changes":
@@ -330,14 +336,20 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 		if wait, ok := budgetWait(err); ok {
 			return e.deferForExhaustedBudget(ctx, job, wait, fmt.Sprintf("retry wait exceeds worker budget: %v", err))
 		}
+		// The usual reason to land here is that ctx itself expired (the job
+		// timeout is what failed the review), so a terminal status write or
+		// ledger update on ctx fails instantly and the PR is left showing a
+		// stale "Review running..." comment forever.
+		failCtx, failCancel := terminalWriteContext(ctx)
+		defer failCancel()
 		if job.StatusCommentID > 0 {
-			_, _ = pub.PublishStatus(ctx, job, fmt.Sprintf("❌ Review failed: %v", err))
+			_, _ = pub.PublishStatus(failCtx, job, fmt.Sprintf("❌ Review failed: %v", err))
 		}
 		job.Status = "failed"
 		job.Error = err.Error()
 		now := time.Now().UTC()
 		job.FinishedAt = &now
-		_ = e.updateJob(ctx, job)
+		_ = e.updateJob(failCtx, job)
 		return err
 	}
 
@@ -436,6 +448,16 @@ func (e *ServerJobExecutor) executeReviewJob(ctx context.Context, job *Job) erro
 // publishStatus publishes a status transition. Durable-ledger failures abort the
 // job (nonterminal, preserved for recovery); remote-only status failures are
 // logged since the comment is cosmetic and the saved intent keeps it recoverable.
+// terminalWriteContext detaches a terminal job write (failure status comment,
+// ledger update) from the job's own cancellation. The most common reason a
+// review fails is that its job timeout expired, and every write on that
+// cancelled context fails instantly, which used to leave the PR showing a
+// stale "Review running..." comment forever. The 30s bound keeps shutdown
+// responsive.
+func terminalWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+}
+
 func (e *ServerJobExecutor) publishStatus(ctx context.Context, pub *Publication, job *Job, text string) error {
 	text = appendNetworkFetchLine(text, job.NetworkFetch)
 	id, err := pub.PublishStatus(ctx, job, text)

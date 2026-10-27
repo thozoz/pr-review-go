@@ -843,6 +843,22 @@ func (l *CoverageLedger) ExaminedCount() int {
 	return count
 }
 
+// ExaminableCount returns the number of entries that represent real code hunks
+// subject to examination. Binary files, mode-only changes, empty files, and
+// omission records are not examinable. An entry stays examinable after it is
+// examined, so this count is stable across marking.
+func (l *CoverageLedger) ExaminableCount() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	count := 0
+	for _, e := range l.entries {
+		if e.Status == "examined" || (e.Status == "skipped" && e.Reason == "not examined") {
+			count++
+		}
+	}
+	return count
+}
+
 // SkippedCount returns the number of skipped entries.
 func (l *CoverageLedger) SkippedCount() int {
 	l.mu.RLock()

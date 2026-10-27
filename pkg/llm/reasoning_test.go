@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // chatRequestBody is the subset of the outgoing payload these tests assert on.
@@ -155,7 +156,11 @@ func TestChatCompletionEmptyContentWithoutReasoning(t *testing.T) {
 	}
 }
 
-func TestChatCompletionEmptyContentWithReasoningButStopDoesNotRetry(t *testing.T) {
+// Empty content with reasoning and finish_reason="stop" must NOT double the
+// budget: measured live, the retry only made the model think longer (7.5 minutes
+// at 32768 for a prompt answered in 3 seconds at 16384) and burned the whole job
+// deadline. It fails fast instead so the caller can try the next model.
+func TestChatCompletionReasoningOnlyWithStopFailsFast(t *testing.T) {
 	var attempts int32
 	var requests []chatRequestBody
 	ts := newReasoningServer(t, &attempts, &requests, func(_ int32, w http.ResponseWriter) {
@@ -164,6 +169,7 @@ func TestChatCompletionEmptyContentWithReasoningButStopDoesNotRetry(t *testing.T
 	defer ts.Close()
 
 	client := NewClient(ts.URL, "key", "reasoning-model")
+	client.SetMaxTokens(4096)
 
 	_, err := client.ChatCompletion(context.Background(), "system", "user")
 	var emptyErr *EmptyAssistantContentError
@@ -173,8 +179,72 @@ func TestChatCompletionEmptyContentWithReasoningButStopDoesNotRetry(t *testing.T
 	if !emptyErr.HasReasoning {
 		t.Error("HasReasoning = false, want true")
 	}
+	if emptyErr.Retried {
+		t.Error("Retried = true, want false: doubling the budget for finish_reason=stop only prolongs thinking")
+	}
 	if attempts != 1 {
-		t.Fatalf("provider attempts = %d, want 1 (retry requires finish_reason=length)", attempts)
+		t.Fatalf("provider attempts = %d, want 1 (no budget-doubling retry)", attempts)
+	}
+}
+
+// finish_reason="length" with reasoning IS genuine truncation: the budget was
+// consumed while thinking, so exactly one doubled-budget retry is made.
+func TestChatCompletionReasoningTruncatedRetriesDoubled(t *testing.T) {
+	var attempts int32
+	var requests []chatRequestBody
+	ts := newReasoningServer(t, &attempts, &requests, func(attempt int32, w http.ResponseWriter) {
+		if attempt == 1 {
+			writeChatResponse(w, nil, "length", "Thinking hard...")
+			return
+		}
+		writeChatResponse(w, "Recovered answer", "stop", "Thought process")
+	})
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "key", "reasoning-model")
+	client.SetMaxTokens(4096)
+
+	got, err := client.ChatCompletion(context.Background(), "system", "user")
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v, want the truncated turn to recover", err)
+	}
+	if got != "Recovered answer" {
+		t.Fatalf("ChatCompletion() = %q, want %q", got, "Recovered answer")
+	}
+	if attempts != 2 {
+		t.Fatalf("provider attempts = %d, want 2", attempts)
+	}
+	if requests[1].MaxTokens == nil || *requests[1].MaxTokens != 8192 {
+		t.Fatalf("retry request max_tokens = %v, want doubled 8192", requests[1].MaxTokens)
+	}
+}
+
+// If the doubled-budget retry is still truncated, the typed error records that a
+// retry already happened.
+func TestChatCompletionReasoningTruncatedAfterRetryTyped(t *testing.T) {
+	var attempts int32
+	var requests []chatRequestBody
+	ts := newReasoningServer(t, &attempts, &requests, func(_ int32, w http.ResponseWriter) {
+		writeChatResponse(w, nil, "length", "Still thinking")
+	})
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "key", "reasoning-model")
+	client.SetMaxTokens(4096)
+
+	_, err := client.ChatCompletion(context.Background(), "system", "user")
+	var emptyErr *EmptyAssistantContentError
+	if !errors.As(err, &emptyErr) {
+		t.Fatalf("errors.As(*EmptyAssistantContentError) = false; err = %v", err)
+	}
+	if !emptyErr.Retried {
+		t.Error("Retried = false, want true")
+	}
+	if emptyErr.MaxTokensAttempted != 8192 {
+		t.Errorf("MaxTokensAttempted = %d, want 8192", emptyErr.MaxTokensAttempted)
+	}
+	if attempts != 2 {
+		t.Fatalf("provider attempts = %d, want 2 (exactly one retry)", attempts)
 	}
 }
 
@@ -259,6 +329,28 @@ func TestMaxTokensFromEnv(t *testing.T) {
 			t.Setenv("LLM_MAX_TOKENS", tc.raw)
 			if got := maxTokensFromEnv(); got != tc.want {
 				t.Fatalf("maxTokensFromEnv() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRequestTimeoutFromEnv(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", DefaultLLMRequestTimeout},
+		{"180", 180 * time.Second},
+		{"  120  ", 120 * time.Second},
+		{"abc", DefaultLLMRequestTimeout},
+		{"0", DefaultLLMRequestTimeout},
+		{"-30", DefaultLLMRequestTimeout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Setenv("LLM_REQUEST_TIMEOUT", tc.raw)
+			if got := requestTimeoutFromEnv(); got != tc.want {
+				t.Fatalf("requestTimeoutFromEnv() = %v, want %v", got, tc.want)
 			}
 		})
 	}

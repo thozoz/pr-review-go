@@ -214,6 +214,70 @@ func TestCoverageLedgerStartsSkippedAndTracksExamined(t *testing.T) {
 	}
 }
 
+func TestCoverageLedger_ExaminableCount(t *testing.T) {
+	t.Run("code hunks are examinable and count stays stable", func(t *testing.T) {
+		inv := Parse(sampleUnifiedDiff())
+		ledger := NewCoverageLedger(inv)
+
+		if got := ledger.ExaminableCount(); got != 3 {
+			t.Fatalf("expected 3 examinable hunks, got %d", got)
+		}
+		if got := ledger.ExaminedCount(); got != 0 {
+			t.Fatalf("expected 0 examined hunks at start, got %d", got)
+		}
+
+		ledger.MarkFileExamined("pkg/foo/foo.go")
+		if got := ledger.ExaminableCount(); got != 3 {
+			t.Errorf("marking files examined must not change examinable count, got %d", got)
+		}
+		if got := ledger.ExaminedCount(); got != 2 {
+			t.Errorf("expected 2 examined hunks after marking foo.go, got %d", got)
+		}
+	})
+
+	t.Run("non-code entries are not examinable", func(t *testing.T) {
+		inv := &ChangeInventory{
+			Files: []*FileDiff{
+				{Path: "image.png", IsBinary: true},
+				{Path: "script.sh", IsModeOnly: true, OldMode: "100644", NewMode: "100755"},
+				{Path: "renamed.go", IsRename: true, OldPath: "old.go"},
+			},
+			Omissions: []*Omission{
+				{File: "big.json", Reason: "exceeded diff size limit"},
+			},
+		}
+		ledger := NewCoverageLedger(inv)
+
+		if ledger.TotalHunks() != 4 {
+			t.Fatalf("expected 4 tracked entries, got %d", ledger.TotalHunks())
+		}
+		if got := ledger.ExaminableCount(); got != 0 {
+			t.Fatalf("binary, mode-only, empty, and omission entries must not be examinable, got %d", got)
+		}
+	})
+
+	t.Run("mixed inventory counts only code hunks", func(t *testing.T) {
+		inv := &ChangeInventory{
+			Files: []*FileDiff{
+				{Path: "image.png", IsBinary: true},
+				{Path: "main.go", Hunks: []*Hunk{{ID: "main.go#H1", File: "main.go"}}},
+			},
+			Omissions: []*Omission{
+				{File: "big.json", Reason: "exceeded diff size limit"},
+			},
+		}
+		ledger := NewCoverageLedger(inv)
+
+		if got := ledger.ExaminableCount(); got != 1 {
+			t.Fatalf("expected 1 examinable hunk, got %d", got)
+		}
+		ledger.MarkExamined("main.go#H1")
+		if got := ledger.ExaminableCount(); got != 1 {
+			t.Errorf("examined code hunk must still be examinable, got %d", got)
+		}
+	})
+}
+
 func TestAdversarialDiffCorpus(t *testing.T) {
 	tests := []struct {
 		name      string
